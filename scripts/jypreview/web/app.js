@@ -26,7 +26,6 @@ const audioNodes = new Map();
 // a media reload. The playhead clock is the wall clock, corrected by the main shot.
 const WINDOW_US = 20_000_000;    // how much timeline one request covers
 const PREFETCH_US = 3_000_000;   // start loading the next window this early
-const CATCHUP_US = 1_500_000;    // ignore media positions this far from the clock
 
 const state = {
   did: null, tid: null, tUs: 0, playing: false, rate: 1, scale: 1,
@@ -306,7 +305,7 @@ function syncAudio(tUs, playing) {
     const duration = audio.target_duration_us || audio.duration_us || 0;
     if (!(tUs >= start && tUs < start + duration)) continue;
     wanted.set(item.segment_id, { src: audio.served, volume: item.volume,
-      offset: audioOffsetUs(audio, tUs) / 1e6 });
+      speed: audio.speed || 1, offset: audioOffsetUs(audio, tUs) / 1e6 });
   }
   for (const [id, node] of audioNodes) {
     if (!wanted.has(id)) { node.pause(); node.remove(); audioNodes.delete(id); }
@@ -317,16 +316,35 @@ function syncAudio(tUs, playing) {
       node = document.createElement("audio");
       node.src = spec.src;
       node.preload = "auto";
+      node.preservesPitch = true;
+      node.mozPreservesPitch = true;
+      node.webkitPreservesPitch = true;
       audioNodes.set(id, node);
       document.body.appendChild(node);
     }
     node.volume = state.sound ? Math.max(0, Math.min(spec.volume ?? 1, 1)) : 0;
-    if (playing && node.paused) {
-      if (Math.abs((node.currentTime || 0) - spec.offset) > 0.3) node.currentTime = spec.offset;
-      node.play().catch(() => {});
-    } else if (!playing) {
+    const drift = (node.currentTime || 0) - spec.offset;
+    if (playing) {
+      if (node.paused) {
+        if (Math.abs(drift) > 0.3) node.currentTime = spec.offset;
+        node.playbackRate = spec.speed;
+        node.play().catch(() => {});
+      } else if (!node.seeking) {
+        // The playhead is authoritative now, so nothing else pulls sound back into line:
+        // nudge the rate for ordinary drift and reserve a seek for a real discontinuity.
+        if (Math.abs(drift) > 0.3) {
+          node.currentTime = spec.offset;
+          node.playbackRate = spec.speed;
+        } else {
+          const correction = Math.min(0.15, Math.max(0.01, Math.abs(drift) * 0.6));
+          node.playbackRate = Math.max(0.25, Math.min(4,
+            drift < 0 ? spec.speed * (1 + correction) : spec.speed * (1 - correction)));
+        }
+      }
+    } else {
       if (!node.paused) node.pause();
-      if (Math.abs((node.currentTime || 0) - spec.offset) > 0.05) {
+      node.playbackRate = spec.speed;
+      if (Math.abs(drift) > 0.05) {
         try { node.currentTime = spec.offset; } catch (error) { void error; }
       }
     }
@@ -507,28 +525,13 @@ function seek(tUs, exact = true) {
   else fetchFrame(state.tUs, exact);
 }
 
-// Where the playhead is, given how far the main shot has run. Nested layers count in the
-// compound clip's own seconds, so the value is mapped back out through the chain.
-function invertThrough(time, value) {
-  return (value - (time.source_start_us || 0)) / (time.speed || 1) + (time.target_start_us || 0);
-}
-
-function correctClock() {
-  const primary = view.primaryAt(state.tUs);
-  state.primary = primary;
-  if (!primary) return;
-  const video = primary.entry.video;
-  const time = primary.layer.time || {};
-  if (!video || video.paused || !Number.isFinite(video.duration)) return;
-  const speed = time.speed || 1;
-  const local = (video.currentTime * 1e6 - (time.source_start_us || 0)) / speed;
-  if (!(local >= 0 && local < Math.max(time.target_duration_us || 0, 0))) return;
-  // `local` is measured inside the clip; the playhead lives on the outer timeline.
-  let implied = local + (time.target_start_us || 0);
-  for (let index = primary.entry.chain.length - 1; index >= 0; index -= 1) {
-    implied = invertThrough(primary.entry.chain[index], implied);
-  }
-  if (Math.abs(implied - state.tUs) < CATCHUP_US) state.tUs = Math.max(0, implied);
+// The main shot is the reference for *who is audible* and for the properties panel, but it
+// is never the clock. Every implementation studied (FreeCut's Clock, Remotion's Player,
+// OpenCut's PlaybackManager) keeps the playhead authoritative and treats element time as an
+// observation only — the moment a decoder gets to write the playhead, a stalled clip drags
+// the timeline backwards and the overlays rewind with it.
+function trackPrimary() {
+  state.primary = view.primaryAt(state.tUs);
 }
 
 let previous = performance.now();
@@ -536,8 +539,10 @@ function loop(now) {
   const delta = Math.min(now - previous, 250);
   previous = now;
   if (state.playing && !state.buffering) {
-    state.tUs = Math.max(0, Math.min(state.tUs + delta * 1000 * state.rate, state.durationUs));
-    correctClock();
+    const next = state.tUs + delta * 1000 * state.rate;
+    // Monotonic by construction: the only way the playhead moves back is an explicit seek.
+    state.tUs = Math.max(state.tUs, Math.min(next, state.durationUs));
+    trackPrimary();
     movePlayhead();
     view.evalAt(state.tUs, true);
     syncAudio(state.tUs, true);
@@ -788,7 +793,8 @@ window.__settle = () => [...document.querySelectorAll("video")].every((video) =>
 window.__state = () => ({ did: state.did, tid: state.tid, tUs: state.tUs, ready: !!window.__ready,
   playing: state.playing, buffering: state.buffering, ratio: state.ratio, scale: state.scale,
   durationUs: state.durationUs, span: state.span, window: state.windowRange,
-  pool: view.pool.size, visible: view.flat.filter((entry) => entry.visible).length,
+  pool: view.pool.size, armed: [...view.pool.values()].filter(e => e.armed).length,
+  visible: view.flat.filter((entry) => entry.visible).length,
   flat: view.flat.length, loads: view.loadLog || [],
   primary: state.primary ? { id: state.primary.entry.id, kind: state.primary.layer.kind,
     nested: state.primary.entry.depth > 0 } : null });

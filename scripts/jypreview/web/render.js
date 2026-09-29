@@ -12,9 +12,19 @@
 import { textGroup } from "./text.js";
 
 export const DRIFT_S = 0.12;        // resync a video only once it drifts further than this
-const SEEK_GAP_MS = 180;            // minimum gap between forced seeks of a paused layer
 const MAX_POOL = 240;               // hard cap on pooled nodes
 const LIVE_LIMIT = 5;               // videos allowed to decode at the same time
+// A <video> only starts fetching when it is given a src, so the src is withheld until the
+// clip is near the playhead. Mounting every clip in a 20 s window with an eager src asked
+// 17-82 elements to range-request one HTTP/1.1 origin at once (Chromium allows ~6
+// connections per host), and the clip that had to play queued behind clips nobody could
+// see. Sliding the horizon staggers the fetches instead of firing them all at window load.
+const WARM_AHEAD_US = 2_000_000;    // start loading a clip this far before it is on screen
+const WARM_AFTER_US = 2_000_000;    // keep it loaded this long after, so scrubbing back is free
+const SEEK_TOLERANCE_S = 0.05;      // closer than this is not worth a seek
+const DISCONTINUITY_S = 0.5;        // beyond this a nudge cannot catch up: seek
+const NUDGE_CAP = 0.15;             // max playbackRate correction from one drift hit
+const END_CLAMPS = 0.05;            // stop short: decoders stall on the very last sample
 
 /** Media position (µs) for a layer whose timeline time is `timelineUs` (µs).
  *  Mirrors `model/timing.source_time_us`; nested layers carry the *inner* timeline's
@@ -276,13 +286,33 @@ export class Stage {
       const video = document.createElement("video");
       video.muted = true;
       video.playsInline = true;
-      video.preload = "metadata";
-      video.src = media.path_served;
+      // Rate nudging must not change pitch.
+      video.preservesPitch = true;
+      video.mozPreservesPitch = true;
+      video.webkitPreservesPitch = true;
+      // No src yet: `arm()` gives it one once the clip approaches the playhead.
+      video.preload = "auto";
       entry.root.appendChild(video);
       entry.video = video;
       entry.mediaKind = "video";
+      entry.src = media.path_served;
+      entry.armed = null;
     }
     this.resetTransform(entry);
+  }
+
+  /** Give the element its source once its clip is close enough to be worth fetching.
+   *  Returns true when the element now has a resource it can decode. */
+  arm(entry, tUs) {
+    if (!entry.video || !entry.src) return !!entry.video;
+    if (entry.armed === entry.src) return true;
+    const time = entry.layer.time || {};
+    const start = time.target_start_us || 0;
+    const end = start + (time.target_duration_us || 0);
+    if (tUs < start - WARM_AHEAD_US || tUs > end + WARM_AFTER_US) return false;
+    entry.video.src = entry.src;
+    entry.armed = entry.src;
+    return true;
   }
 
   /** Evaluate the layer's own local time, walking the compound-clip chain.
@@ -342,7 +372,14 @@ export class Stage {
       }
     }
 
-    const videos = visible.filter((item) => item.entry.video);
+    // Fetch only what the sliding horizon covers. This runs before anything reads
+    // `readyState`, so a clip that is about to start has been loading for up to
+    // WARM_AHEAD_US by the time the cut arrives.
+    for (const entry of this.flat) {
+      if (entry.mediaKind === "video") this.arm(entry, tUs);
+    }
+
+    const videos = visible.filter((item) => item.entry.video && item.entry.armed);
     this.primaryId = videos.length ? videos[0].entry.id : null;
     const live = new Set();
     if (playing) {
@@ -378,25 +415,47 @@ export class Stage {
   }
 
   /** A visible video plays from its trimmed in-point; a hidden one is parked.
-   *  Position is corrected by drift, never by a per-frame seek: assigning `currentTime`
-   *  on every rAF makes the browser drop every seek but the last, which is exactly why
-   *  upper tracks used to sit still. */
+   *
+   *  Continuous drift is corrected with `playbackRate`, not with a seek. Every seek can
+   *  restart a keyframe/GOP decode, and the measured failure was one clip taking 15
+   *  `currentTime` writes in 22 s — each one stalling the pipeline it was chasing. A hard
+   *  seek is reserved for a real discontinuity: a cut, a scrub, a window swap.
+   *
+   *  Reverse is a property of the timeline, never of the element: `mediaTimeAt` already
+   *  walks the source backwards, so a reversed clip is stepped by seek. HTMLMediaElement
+   *  has no negative rate. */
   driveVideo(entry, at, running, timelineRolling) {
     const video = entry.video;
     const time = entry.layer.time || {};
     const speed = time.speed || 1;
-    const wanted = at.media / 1e6;
-    const rate = Math.max(0.25, Math.min(speed, 4));
-    if (video.playbackRate !== rate) video.playbackRate = rate;
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    // Decoders stall or hand back an empty frame on the very last sample.
+    const wanted = Math.min(at.media / 1e6, duration ? duration - END_CLAMPS : Infinity);
+    const base = Math.max(0.25, Math.min(speed, 4));
+    const now = performance.now();
 
-    if (running) {
-      if (video.preload !== "auto") {
-        video.preload = "auto";
-        try { video.load(); } catch (error) { void error; }
-      }
-      const drift = Math.abs((video.currentTime || 0) - wanted);
-      if (drift > DRIFT_S || (video.paused && drift > 0.05)) {
-        try { video.currentTime = wanted; } catch (error) { void error; }
+    // A target further away than the clock could have carried since last frame is a
+    // discontinuity, not drift.
+    const elapsed = entry.lastWantedAt ? (now - entry.lastWantedAt) / 1000 : 0;
+    const jumped = entry.lastWanted === undefined
+      || Math.abs(wanted - entry.lastWanted) > Math.max(DISCONTINUITY_S, elapsed * base * 2);
+    entry.lastWanted = wanted;
+    entry.lastWantedAt = now;
+
+    // A seek that never got its `seeked` back would otherwise wedge the element forever.
+    if (entry.seekInFlight && now - (entry.seekStarted || 0) > 1500) entry.seekInFlight = false;
+
+    if (running && !time.reverse) {
+      if (video.readyState < 2) { this.seekTo(entry, video, wanted); return; }
+      const drift = (video.currentTime || 0) - wanted;      // < 0: behind the timeline
+      if (jumped || Math.abs(drift) > DRIFT_S) {
+        this.seekTo(entry, video, wanted);
+        video.playbackRate = base;
+      } else {
+        const correction = Math.min(NUDGE_CAP, Math.max(0.02, Math.abs(drift) * 0.2));
+        const rate = Math.max(0.25, Math.min(4,
+          drift < 0 ? base * (1 + correction) : base * (1 - correction)));
+        if (Math.abs(video.playbackRate - rate) > 0.01) video.playbackRate = rate;
       }
       video.muted = !(this.primaryId === entry.id && this.soundOn);
       if (video.paused) {
@@ -418,16 +477,45 @@ export class Stage {
     }
 
     if (!video.paused) video.pause();
+    video.playbackRate = base;
     const drift = Math.abs((video.currentTime || 0) - wanted);
-    if (drift <= DRIFT_S) return;
-    if (timelineRolling) {
-      // Over the decoder budget while the timeline is rolling: refresh at a human cadence
-      // instead of fighting the browser's seek queue.
-      const now = performance.now();
-      if (now - (entry.lastSeek || 0) < SEEK_GAP_MS) return;
-      entry.lastSeek = now;
+    if (drift <= (jumped ? 0 : SEEK_TOLERANCE_S)) return;
+    if (timelineRolling && !time.reverse) {
+      // Over the decoder budget while the timeline rolls: hold the frame that is already
+      // there rather than queueing seeks behind the clips that are actually playing.
+      return;
     }
-    try { video.currentTime = wanted; } catch (error) { void error; }
+    this.seekTo(entry, video, wanted);
+  }
+
+  /** One seek in flight per element. A target that arrives while the browser is still
+   *  seeking is remembered and replayed on `seeked`, instead of being assigned on top of
+   *  the running seek — which the browser silently drops, leaving a stale frame. */
+  seekTo(entry, video, seconds) {
+    if (video.readyState < 1) return;      // nothing to seek into yet; preload is still fetching
+    if (video.seeking || entry.seekInFlight) {
+      entry.pendingSeek = seconds;
+      return;
+    }
+    if (Math.abs((video.currentTime || 0) - seconds) < 0.005) return;
+    entry.seekInFlight = true;
+    entry.seekStarted = performance.now();
+    entry.pendingSeek = null;
+    const done = () => {
+      entry.seekInFlight = false;
+      if (entry.pendingSeek !== null && entry.pendingSeek !== undefined) {
+        const next = entry.pendingSeek;
+        entry.pendingSeek = null;
+        this.seekTo(entry, video, next);
+      }
+    };
+    video.addEventListener("seeked", done, { once: true });
+    try {
+      video.currentTime = seconds;
+    } catch (error) {
+      video.removeEventListener("seeked", done);
+      entry.seekInFlight = false;
+    }
   }
 
   /** Free nodes the playhead has left behind, then cap the pool.
