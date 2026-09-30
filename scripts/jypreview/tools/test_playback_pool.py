@@ -24,9 +24,11 @@ for _key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROX
     os.environ.pop(_key, None)
 
 
-BASE = "http://127.0.0.1:8765"
-DRAFT = "<草稿 id>"
-TIMELINE = "timeline-primary"
+# Overridable so a verification run can target a throwaway server instead of the
+# long-lived one, and so the fixture can name any draft.
+BASE = os.environ.get("JY_PREVIEW_TEST_BASE", "http://127.0.0.1:8765")
+DRAFT = os.environ.get("JY_PREVIEW_TEST_DRAFT", "<草稿 id>")
+TIMELINE = os.environ.get("JY_PREVIEW_TEST_TIMELINE", "timeline-primary")
 
 
 def get(path: str, **query):

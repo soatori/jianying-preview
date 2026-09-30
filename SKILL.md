@@ -160,6 +160,30 @@ python <SKILL_ROOT>/scripts/preview.py selfcheck --milestone all   # M0/M1/M2 �
 python -m jypreview.tools.audit_playback "<草稿>" --seconds 24     # 需要 serve：真机播放逐帧比对
 ```
 
+### 回归工具（`jypreview/tools/` 下，都是 `def main()` 独立脚本，不是 pytest）
+
+```bash
+node <SKILL_ROOT>/scripts/jypreview/tools/test_playback_kernel.mjs  # 免服务：播放内核纯逻辑
+python -m jypreview.tools.test_lifecycle           # /api/health
+python -m jypreview.tools.test_preview_kernel      # 文字动画确实改了 DOM、close 清空池
+python -m jypreview.tools.test_playback_state      # 播放状态机
+python -m jypreview.tools.test_playback_pool       # 图层池窗口 IR
+python -m jypreview.tools.test_native_preview      # GStreamer 原生链路
+python -m jypreview.tools.test_gstreamer_ir        # 需在隔离 GStreamer Python 里跑
+python -m jypreview.tools.test_gstreamer_backend   # 同上，需 gstreamer-bundle
+```
+
+除 `test_playback_kernel.mjs` 外都要 `serve` 在跑。target 全部走环境变量，默认指向常驻服务与
+占位草稿名，**换成自己库里的值才跑得通**：`JY_PREVIEW_TEST_BASE`（默认
+`http://127.0.0.1:8765`）、`JY_PREVIEW_TEST_DRAFT`、`JY_PREVIEW_TEST_TIMELINE`、
+`JY_PREVIEW_TEST_LAYER`。验播放与 selfcheck **必须串行**，并行会互相干扰缓存。
+
+```bash
+python -m jypreview.tools.restart_server   # DETACHED_PROCESS 重启，服务活过本次 shell
+```
+
+`serve --persistent` 只关租约、**不脱离 shell**，要让服务长驻用上面这个；端口取 `JY_PREVIEW_PORT`。
+
 ## Resources
 
 - `references/ir-schema.md` — FrameDescriptor 全字段契约（谁算什么、单位、降级规则）
