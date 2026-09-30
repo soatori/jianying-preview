@@ -189,19 +189,56 @@ function useEditorHooks(session: EditorSession | null, project: EditorProject | 
       errors: [...errors.current],
     });
     hook.__editorScene = () => (session ? serializeScene(session.sceneAt()) : null);
+    hook.__editorSeams = () => (project ? seamsOf(project) : []);
+    hook.__editorSeek = (tUs: number) => {
+      session?.seekTo(Number(tUs));
+      return session?.clock.tUs ?? 0;
+    };
+    hook.__editorPlay = () => session?.play();
+    hook.__editorPause = () => session?.pause();
+    hook.__editorClose = () => session?.destroy();
     return () => {
       alive.current = false;
       window.removeEventListener("error", onError);
       window.removeEventListener("unhandledrejection", onRejected);
-      delete hook.__editorSnapshot;
-      delete hook.__editorScene;
+      for (const name of EDITOR_HOOKS) delete hook[name];
     };
   }, [session, project]);
 }
 
+const EDITOR_HOOKS = ["__editorSnapshot", "__editorScene", "__editorSeams", "__editorSeek",
+  "__editorPlay", "__editorPause", "__editorClose"] as const;
+
 interface EditorWindow {
+  [key: string]: unknown;
   __editorSnapshot?: () => Record<string, unknown>;
   __editorScene?: () => Record<string, unknown> | null;
+  __editorSeams?: () => Record<string, unknown>[];
+  __editorSeek?: (tUs: number) => number;
+}
+
+/** Where one clip's half-open span ends and the next begins -- the boundaries that
+ *  a resolver can disagree about, so acceptance walks them. */
+function seamsOf(project: EditorProject): Record<string, unknown>[] {
+  const hidden = new Set(project.tracks.filter((track) => !track.visible).map((track) => track.id));
+  const byTrack = new Map<string, typeof project.clips>();
+  for (const clip of project.clips) {
+    if (!clip.visible || hidden.has(clip.track_id) || clip.kind === "audio") continue;
+    const list = byTrack.get(clip.track_id) ?? [];
+    list.push(clip);
+    byTrack.set(clip.track_id, list);
+  }
+  const seams: Record<string, unknown>[] = [];
+  for (const list of byTrack.values()) {
+    const ordered = [...list].sort((a, b) => a.target_start_us - b.target_start_us);
+    for (let index = 1; index < ordered.length; index += 1) {
+      const previous = ordered[index - 1]!;
+      const next = ordered[index]!;
+      if (next.target_start_us !== previous.target_end_us) continue;
+      seams.push({ end_us: next.target_start_us, leaving: previous.clip_id, entering: next.clip_id });
+    }
+  }
+  return seams.sort((a, b) => Number(a.end_us) - Number(b.end_us)).slice(0, 40);
 }
 
 function serializeScene(scene: Scene): Record<string, unknown> {
