@@ -52,6 +52,7 @@ function shell(session: ShellProps["session"], extra: Partial<ShellProps> = {}) 
     onOpen: extra.onOpen ?? vi.fn(),
     onPickTimeline: extra.onPickTimeline ?? vi.fn(),
     onRetry: extra.onRetry ?? vi.fn(),
+    chrome: extra.chrome ?? true,
   };
   return { ...render(<AppShell {...props} />), props };
 }
@@ -157,6 +158,16 @@ describe("AppShell states", () => {
       expect(forbidden.some((word) => name.includes(word))).toBe(false);
     }
     expect(container.querySelectorAll("video[controls], audio[controls]")).toHaveLength(0);
+    session.destroy();
+  });
+
+  it("drops every panel when the capture channel asks for the stage alone", async () => {
+    const { session } = await readySession();
+    const { container } = shell(session, { chrome: false });
+    expect(screen.getByTestId("stage")).toBeTruthy();
+    expect(screen.queryByTestId("timeline-panel")).toBeNull();
+    expect(screen.queryByTestId("playback-controls")).toBeNull();
+    expect(container.textContent).not.toContain("只读时间线");
     session.destroy();
   });
 

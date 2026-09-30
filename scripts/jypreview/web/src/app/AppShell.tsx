@@ -26,6 +26,8 @@ export interface AppShellProps {
   onOpen: (draft: string, timeline?: string) => void;
   onPickTimeline: (timeline: string) => void;
   onRetry: () => void;
+  /** false renders only the stage, which is what the PNG verification channel captures. */
+  chrome?: boolean;
 }
 
 const ERROR_TITLE: Record<string, string> = {
@@ -39,6 +41,7 @@ const ERROR_TITLE: Record<string, string> = {
 
 export function AppShell(props: AppShellProps) {
   const { session, state, error, drafts, draft, onOpen, onPickTimeline, onRetry } = props;
+  const chrome = props.chrome ?? true;
   const [scene, setScene] = useState<Scene | null>(session ? session.sceneAt() : null);
   const [status, setStatus] = useState<PlaybackStatus>(session?.status() ?? "stopped");
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
@@ -104,6 +107,14 @@ export function AppShell(props: AppShellProps) {
           {state === "loading" ? <p>读取中…</p> : <p>打开草稿以预览时间线</p>}
         </div>
         <DraftPicker drafts={drafts} value={draft} loading={state === "loading"} onOpen={onOpen} />
+      </div>
+    );
+  }
+
+  if (!chrome && scene) {
+    return (
+      <div className="jy-app jy-app-stage-only" data-testid="stage-only">
+        <PreviewStage project={project} scene={scene} status={status} />
       </div>
     );
   }
@@ -195,6 +206,26 @@ function useEditorHooks(session: EditorSession | null, project: EditorProject | 
       return session?.clock.tUs ?? 0;
     };
     hook.__editorPlay = () => session?.play();
+    // The shot/audit channel predates this UI and waits on these names, so the editor
+    // answers to them instead of every capture script being rewritten.
+    hook.__ready = Boolean(project);
+    hook.__settle = () => [...document.querySelectorAll<HTMLVideoElement>("video, audio")]
+      .every((node) => node.readyState >= 2 || Boolean(node.error) || node.preload === "none");
+    hook.__state = () => ({
+      did: project?.draft.id ?? "",
+      tid: project?.timeline.id ?? "",
+      tUs: session?.clock.tUs ?? 0,
+      durationUs: project?.duration_us ?? 0,
+      ready: Boolean(project),
+      playing: session?.status() === "playing",
+      loading: { kind: "idle" },
+      mode: "editor",
+    });
+    hook.__play = (on: boolean) => {
+      if (on) session?.play();
+      else session?.pause();
+      return session?.status() === "playing";
+    };
     hook.__editorPause = () => session?.pause();
     hook.__editorClose = () => session?.destroy();
     return () => {
@@ -207,7 +238,8 @@ function useEditorHooks(session: EditorSession | null, project: EditorProject | 
 }
 
 const EDITOR_HOOKS = ["__editorSnapshot", "__editorScene", "__editorSeams", "__editorSeek",
-  "__editorPlay", "__editorPause", "__editorClose"] as const;
+  "__editorPlay", "__editorPause", "__editorClose", "__ready", "__settle", "__state",
+  "__play"] as const;
 
 interface EditorWindow {
   [key: string]: unknown;
@@ -231,12 +263,15 @@ function seamsOf(project: EditorProject): Record<string, unknown>[] {
   const seams: Record<string, unknown>[] = [];
   for (const list of byTrack.values()) {
     const ordered = [...list].sort((a, b) => a.target_start_us - b.target_start_us);
-    for (let index = 1; index < ordered.length; index += 1) {
-      const previous = ordered[index - 1]!;
-      const next = ordered[index]!;
-      if (next.target_start_us !== previous.target_end_us) continue;
-      seams.push({ end_us: next.target_start_us, leaving: previous.clip_id, entering: next.clip_id });
-    }
+    ordered.forEach((previous, index) => {
+      const next = ordered[index + 1];
+      const touching = next && next.target_start_us === previous.target_end_us;
+      seams.push({
+        end_us: previous.target_end_us,
+        leaving: previous.clip_id,
+        entering: touching ? next!.clip_id : null,
+      });
+    });
   }
   return seams.sort((a, b) => Number(a.end_us) - Number(b.end_us)).slice(0, 40);
 }

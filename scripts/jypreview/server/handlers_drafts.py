@@ -4,58 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from pathlib import Path
 
 from aiohttp import web
 
 from ..corpus import classify
-from ._http import (DIST_DIR, JSON, WEB_DIR, error_payload, offload, selector,
-                    session_of, static_file, static_response)
-
-
-def _ui_build() -> str:
-    """Token that changes whenever any UI asset changes, so an edit is never hidden by cache."""
-    newest = 0
-    try:
-        for entry in WEB_DIR.rglob("*"):
-            if entry.is_file():
-                newest = max(newest, int(entry.stat().st_mtime))
-    except OSError:
-        pass
-    return format(newest, "x")
-
-
-IMPORT_RE = re.compile(r"""(?P<head>from\s+|import\s+)(?P<q>["'])(?P<spec>\./[^"']+)(?P=q)""")
-
-
-async def web_asset(request: web.Request) -> web.Response:
-    """Serve a UI file, stamping every relative import with the build token.
-
-    Browsers cache ES modules by URL, so a token on app.js alone leaves ./render.js pinned to a
-    stale copy; rewriting the specifiers invalidates the whole graph in one go.
-    """
-    rel = (request.match_info.get("path") or "").replace("\\", "/").lstrip("/")
-    if _bundle_ready() and rel.startswith("src/"):
-        return error_payload("editor_source_not_served",
-                             "the built bundle is served from /web/dist; the TypeScript "
-                             "sources are not the application", status=404)
-    target = static_file(rel, WEB_DIR)
-    if target is None:
-        return error_payload("not_found", f"no such ui file: {rel}", status=404)
-    suffix = target.suffix.lower()
-    if suffix in (".js", ".css", ".html"):
-        token = _ui_build()
-        text = IMPORT_RE.sub(lambda m: f"{m.group('head')}{m.group('q')}{m.group('spec')}"
-                                      f"?v={token}{m.group('q')}", target.read_text(encoding="utf-8"))
-        kind = {"js": "text/javascript", "css": "text/css", "html": "text/html"}[suffix.lstrip(".")]
-        return web.Response(text=text, content_type=kind, charset="utf-8",
-                            headers={"Cache-Control": "no-cache"})
-    return web.Response(body=target.read_bytes(), headers={"Cache-Control": "no-cache"})
-
-
-def _bundle_ready() -> bool:
-    return (DIST_DIR / "editor.html").is_file()
+from ._http import (DIST_DIR, JSON, error_payload, offload, selector, session_of,
+                    static_file, static_response)
 
 
 async def editor_index(request: web.Request) -> web.Response:
@@ -78,13 +33,7 @@ async def editor_asset(request: web.Request) -> web.Response:
 
 
 async def index(request: web.Request) -> web.Response:
-    path = WEB_DIR / "index.html"
-    if not path.is_file():
-        return error_payload("ui_missing", f"{path} not found", status=500)
-    token = _ui_build()
-    html = path.read_text(encoding="utf-8").replace('/web/app.js"', f'/web/app.js?v={token}"') \
-        .replace('/web/stage.css"', f'/web/stage.css?v={token}"')
-    return web.Response(text=html, content_type="text/html", charset="utf-8")
+    return await editor_index(request)
 
 
 async def list_drafts(request: web.Request) -> web.Response:

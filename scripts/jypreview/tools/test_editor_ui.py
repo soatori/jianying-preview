@@ -241,7 +241,7 @@ def check_boundaries_are_half_open(state: dict) -> list[str]:
         acceptance.evaluate(f"window.__editorSeek({end})")
         time.sleep(0.15)
         after = [item["clip_id"] for item in acceptance.evaluate("window.__editorScene()")["clips"]]
-        leaving, entering = str(seam["leaving"]), str(seam["entering"])
+        leaving, entering = seam["leaving"], seam["entering"]
         if leaving and leaving not in before:
             raise AssertionError(f"t={end - 1}: {leaving} should still be on screen ({before})")
         if leaving and leaving in after:

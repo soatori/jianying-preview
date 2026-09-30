@@ -38,6 +38,7 @@ function render(): void {
         onRetry={() => {
           void open(view.draft);
         }}
+        chrome={params.get("chrome") !== "0"}
       />
     </StrictMode>,
   );
