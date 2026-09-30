@@ -10,3 +10,7 @@ __pycache__/
 
 # Tool state that is not part of the skill.
 .workbuddy/
+
+# Frontend toolchain artefacts (npm install / vite build).
+node_modules/
+dist/
