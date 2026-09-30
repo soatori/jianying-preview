@@ -1,0 +1,6 @@
+# The previewer runs on what the jianying-editor skill already needs.
+# aiohttp is the only third-party import that is not stdlib; it is already
+# installed on this machine (3.14.x) and provides byte-range /media serving.
+aiohttp>=3.9
+# Optional but used for real font metrics when available (ships with the editor skill):
+pillow>=10

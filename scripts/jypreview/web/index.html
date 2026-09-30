@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>剪映草稿预览器</title>
+<link rel="stylesheet" href="/web/stage.css">
+<link id="fontcss" rel="stylesheet" href="">
+</head>
+<body>
+<header>
+  <strong>剪映草稿预览</strong>
+  <button id="pick" title="用系统文件夹选择器打开草稿">打开草稿</button>
+  <select id="timelines" size="1" disabled></select>
+  <button id="reload" disabled title="重新解密并读取当前草稿">刷新</button>
+  <span id="clock">未打开草稿</span>
+  <span id="framerate"></span>
+</header>
+
+<main>
+  <section class="stage-wrap">
+    <div id="stage" class="stage">
+      <svg id="overlay" class="overlay"></svg>
+      <div id="loading" class="loading" hidden role="status" aria-live="polite"></div>
+    </div>
+    <div class="transport">
+      <button id="play" class="iconbtn primary" title="播放" aria-label="播放">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path class="play" d="M8 5.2l11.5 6.8L8 18.8z" fill="currentColor"/>
+          <path class="pause" d="M8.4 5.4h3.1v13.2H8.4zM12.9 5.4h3.1v13.2h-3.1z" fill="currentColor"/>
+        </svg>
+      </button>
+      <input id="scrub" type="range" min="0" max="1000" value="0" step="1" disabled>
+      <button id="sound" class="iconbtn" title="声音：开" aria-label="声音：开" aria-pressed="true">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path class="body" d="M4 9.5h3.2L12.5 5v14L7.2 14.5H4z" fill="currentColor"/>
+          <path class="wave" d="M15.6 8.7a4.8 4.8 0 0 1 0 6.6M18.2 6.3a8.2 8.2 0 0 1 0 11.4"
+            fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          <path class="slash" d="M3.5 3.5l17 17" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <span class="ratiobox">
+        <span class="zl">画幅</span>
+        <select id="ratio" title="按选中的比例重算画面（含字号），用于看跨画幅效果"></select>
+      </span>
+      <span class="zoombox" id="zoombox">
+        <button id="zoombtn" class="iconbtn" title="缩放" aria-label="缩放" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="10.6" cy="10.6" r="6.3" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M15.3 15.3l4.4 4.4" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>
+            <path d="M7.9 10.6h5.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            <path class="vbar" d="M10.6 7.9v5.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <span class="zoompop" id="zoompop">
+          <input id="zoomrange" type="range" min="5" max="400" step="5" value="100" title="拖动缩放">
+          <span id="zoompct" class="zv"></span>
+          <button id="zoomfit" class="ghost" title="恢复适应窗口">适应</button>
+        </span>
+      </span>
+    </div>
+    <div id="lanes" class="lanes"></div>
+  </section>
+
+  <aside>
+    <section class="props">
+      <h3 class="fold" tabindex="0" role="button" aria-expanded="true" data-fold="props">
+        <span class="caret">▾</span>属性
+      </h3>
+      <div id="props" class="props-body"></div>
+    </section>
+    <section class="info">
+      <h3 class="fold" tabindex="0" role="button" aria-expanded="true" data-fold="info">
+        <span class="caret">▾</span>信息
+      </h3>
+      <div id="info" class="info-body"></div>
+      <ul id="warnings" class="warnings"></ul>
+    </section>
+  </aside>
+</main>
+
+<script type="module" src="/web/app.js"></script>
+</body>
+</html>
