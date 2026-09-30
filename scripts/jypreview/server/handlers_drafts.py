@@ -10,7 +10,8 @@ from pathlib import Path
 from aiohttp import web
 
 from ..corpus import classify
-from ._http import JSON, WEB_DIR, error_payload, offload, selector, session_of
+from ._http import (DIST_DIR, JSON, WEB_DIR, error_payload, offload, selector,
+                    session_of, static_file, static_response)
 
 
 def _ui_build() -> str:
@@ -35,9 +36,12 @@ async def web_asset(request: web.Request) -> web.Response:
     stale copy; rewriting the specifiers invalidates the whole graph in one go.
     """
     rel = (request.match_info.get("path") or "").replace("\\", "/").lstrip("/")
-    root = WEB_DIR.resolve()
-    target = (root / rel).resolve()
-    if not str(target).startswith(str(root) + "\\") or not target.is_file():
+    if _bundle_ready() and rel.startswith("src/"):
+        return error_payload("editor_source_not_served",
+                             "the built bundle is served from /web/dist; the TypeScript "
+                             "sources are not the application", status=404)
+    target = static_file(rel, WEB_DIR)
+    if target is None:
         return error_payload("not_found", f"no such ui file: {rel}", status=404)
     suffix = target.suffix.lower()
     if suffix in (".js", ".css", ".html"):
@@ -48,6 +52,29 @@ async def web_asset(request: web.Request) -> web.Response:
         return web.Response(text=text, content_type=kind, charset="utf-8",
                             headers={"Cache-Control": "no-cache"})
     return web.Response(body=target.read_bytes(), headers={"Cache-Control": "no-cache"})
+
+
+def _bundle_ready() -> bool:
+    return (DIST_DIR / "editor.html").is_file()
+
+
+async def editor_index(request: web.Request) -> web.Response:
+    """The built editor. Never a fallback to source: an unbuilt bundle is a build step away."""
+    target = static_file("editor.html", DIST_DIR)
+    if target is None:
+        return error_payload("editor_not_built",
+                             f"no built editor at {DIST_DIR / 'editor.html'}; run npm run build",
+                             status=500, dist=str(DIST_DIR))
+    return web.Response(text=target.read_text(encoding="utf-8"), content_type="text/html",
+                        charset="utf-8", headers={"Cache-Control": "no-cache"})
+
+
+async def editor_asset(request: web.Request) -> web.Response:
+    rel = (request.match_info.get("path") or "").replace("\\", "/").lstrip("/")
+    target = static_file(rel, DIST_DIR)
+    if target is None:
+        return error_payload("not_found", f"no such asset: {rel}", status=404)
+    return static_response(target, DIST_DIR)
 
 
 async def index(request: web.Request) -> web.Response:

@@ -41,3 +41,51 @@ def selector(request: web.Request) -> str:
 
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+DIST_DIR = WEB_DIR / "dist"
+
+STATIC_TYPES = {
+    ".js": ("text/javascript", True),
+    ".mjs": ("text/javascript", True),
+    ".css": ("text/css", True),
+    ".html": ("text/html", True),
+    ".json": ("application/json", False),
+    ".map": ("application/json", False),
+    ".svg": ("image/svg+xml", False),
+    ".png": ("image/png", False),
+    ".jpg": ("image/jpeg", False),
+    ".woff2": ("font/woff2", False),
+    ".woff": ("font/woff", False),
+    ".ttf": ("font/ttf", False),
+}
+
+
+def static_file(rel: str, root: Path = WEB_DIR) -> Path | None:
+    """Resolve a UI asset inside ``root``; anything that escapes it is not served.
+
+    Vite emits hashed filenames under ``dist/assets``, so those are the only paths
+    allowed to be cached forever.
+    """
+    cleaned = str(rel or "").replace("\\", "/").lstrip("/")
+    if not cleaned or "\x00" in cleaned or ":" in cleaned:
+        return None
+    target = (root / cleaned).resolve()
+    if not target.is_relative_to(root.resolve()) or not target.is_file():
+        return None
+    return target
+
+
+def static_response(target: Path, root: Path = WEB_DIR) -> web.Response:
+    kind, textual = STATIC_TYPES.get(target.suffix.lower(), (None, False))
+    headers = {"Cache-Control": "public, max-age=31536000, immutable"
+               if _is_hashed(target, root) else "no-cache"}
+    if kind is None:
+        return web.Response(body=target.read_bytes(), headers=headers)
+    if textual:
+        return web.Response(text=target.read_text(encoding="utf-8"), content_type=kind,
+                            charset="utf-8", headers=headers)
+    return web.Response(body=target.read_bytes(), content_type=kind, headers=headers)
+
+
+def _is_hashed(target: Path, root: Path) -> bool:
+    parts = target.relative_to(root).parts
+    return "assets" in parts and any("-" in name and "." in name for name in parts[-1:])
