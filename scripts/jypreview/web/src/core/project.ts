@@ -105,6 +105,11 @@ export interface Clip {
   css: CssBox | null;
   text: Record<string, unknown> | null;
   nest: Record<string, unknown> | null;
+  labels: Record<string, unknown>[];
+  animation: Record<string, unknown> | null;
+  transition: Record<string, unknown> | null;
+  canvas_fill: Record<string, unknown> | null;
+  position: number;
   [key: string]: unknown;
 }
 
@@ -347,6 +352,11 @@ function parseClip(raw: unknown, index: number, trackIds: Set<string>): Clip {
     speed,
     reverse: boolField(raw, "reverse", where, false),
     warnings: warnings.map(String),
+    labels: arrayField(raw, "labels", where).filter(isRecord) as Record<string, unknown>[],
+    animation: isRecord(raw.animation) ? (raw.animation as Record<string, unknown>) : null,
+    transition: isRecord(raw.transition) ? (raw.transition as Record<string, unknown>) : null,
+    canvas_fill: isRecord(raw.canvas_fill) ? (raw.canvas_fill as Record<string, unknown>) : null,
+    position: intField(raw, "position", where, "clip_field_not_integer", 0),
   } as Clip;
 }
 
