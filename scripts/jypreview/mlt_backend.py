@@ -841,7 +841,16 @@ class PlaybackController:
         self._duration_frames = 0
 
     def _capture(self, mlt_frame) -> None:
-        """Worker-side stamp from a tractor pull (seek/open, consumer stopped)."""
+        """Worker-side stamp from a tractor pull (seek/open, consumer stopped).
+
+        While the consumer runs, pulls arrive on its own audio-clock thread:
+        stamping there would force a full-frame render per frame on the master
+        clock and starve the audio queue, so playback frames are stamped only
+        by the consumer-frame-show listener instead.
+        """
+        consumer = self._consumer
+        if consumer is not None and not consumer.is_stopped():
+            return
         self._stamp(mlt_frame.get_position(),
                     bytes(mlt_frame.get_image(self._mlt.mlt_image_rgba,
                                               self._width, self._height)))
