@@ -221,6 +221,9 @@ async function reorderedDispatch() {
   const seen = calls.filter((call) => call.url.includes("/api/backend/seek")).map(queryOf);
   assert.deepEqual(seen.map((query) => query.get("request_id")), ["1", "2", "3"]);
   assert.deepEqual(seen.map((query) => query.get("t_us")), ["10000000", "20000000", "30000000"]);
+  assert.ok(seen.every((query) => query.get("draft") === "draft-x"
+      && query.get("timeline") === "timeline-1"),
+  "post-open handle requests must carry the draft and timeline selectors");
   assert.equal(client.issued, 3);
 
   // Responses arrive in the order 3, 1, 2.

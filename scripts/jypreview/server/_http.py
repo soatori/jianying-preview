@@ -13,9 +13,9 @@ def json_dumps(value) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
-def JSON(payload) -> web.Response:
+def JSON(payload, headers: dict | None = None) -> web.Response:
     return web.json_response({"ok": True, "code": "ok", "reason": "", "data": payload},
-                             dumps=json_dumps)
+                             dumps=json_dumps, headers=headers)
 
 
 def error_payload(code: str, reason: str, status: int = 400, **data) -> web.Response:

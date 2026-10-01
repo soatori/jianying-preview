@@ -141,7 +141,10 @@ export class MltPlaybackClient {
 
   #url(path, params) {
     const query = new URLSearchParams();
-    for (const [key, value] of Object.entries(params)) {
+    // Handle requests must carry the selectors that scope this playback key;
+    // per-request params win over the open-time defaults.
+    for (const [key, value] of Object.entries(
+        { draft: this.draft, timeline: this.timeline, ...params })) {
       if (value !== null && value !== undefined) query.set(key, String(value));
     }
     return `${this.baseUrl}${path}?${query}`;
@@ -254,6 +257,12 @@ export class MltPlaybackClient {
       const duration = num(body.duration_us);
       if (duration !== null && duration > 0) this.durationUs = duration;
       if (body.error) this.error = String(body.error);
+    }
+    // The server keys the handle by the RESOLVED did/timeline, so prefer the
+    // echoed values over whatever selector open() was called with.
+    if (data && typeof data === "object") {
+      if (data.did) this.draft = data.did;
+      if (data.timeline) this.timeline = data.timeline;
     }
     return { applied: true, stale: false, playbackId: this.playbackId };
   }

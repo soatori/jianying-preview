@@ -103,7 +103,9 @@ async def open_backend(request: web.Request) -> web.Response:
     if previous:
         await previous.close()
     backends[key] = handle
-    return JSON({"key": key, "timeline": tid, "snapshot": state})
+    # Echo the resolved selectors so the client can keep every later handle
+    # request on the same key even when open() was given a raw name.
+    return JSON({"did": view.did, "key": key, "timeline": tid, "snapshot": state})
 
 
 async def _open_handle(request: web.Request) -> web.Response | PlaybackHandle:
@@ -134,7 +136,15 @@ async def render(request: web.Request) -> web.Response:
     # render never issues a seek of its own.
     state = await handle.call("snapshot")
     if state["phase"] == "ended":
-        return JSON({"ended": True, "snapshot": state})
+        # No frame is pulled at ended, so the settled snapshot authors the
+        # envelope headers (the accepted identity for this request id).
+        headers = {"X-Backend": "mlt",
+                   "X-Playback-ID": state["playback_id"],
+                   "X-Playback-Generation": str(state["generation"]),
+                   "X-Seek-Request-ID": str(state["seek_request_id"]),
+                   "X-Project-Frame": str(state["frame_index"]),
+                   "X-Project-PTS-US": str(state["t_us"])}
+        return JSON({"ended": True, "snapshot": state}, headers=headers)
     if state["error"]:
         return error_payload("mlt_render_failed", state["error"], status=500)
     try:
@@ -243,11 +253,22 @@ async def snapshot(request: web.Request) -> web.Response:
 
 
 async def close_backend(request: web.Request) -> web.Response:
+    backends = request.app["playback_backends"]
+    if not (request.query.get("draft") or request.query.get("timeline")):
+        # With no selector to scope a key, the playback_id IS the close identity:
+        # exact match only, so a stale/unknown id closes nothing (404).
+        playback_id = request.query.get("playback_id") or ""
+        key = next((k for k, h in backends.items() if h.playback_id == playback_id), None)
+        if key is None:
+            raise web.HTTPNotFound(text="playback backend is not open")
+        popped = backends.pop(key)
+        await popped.close()
+        return JSON({"closed": True, "key": key})
     handle = await _open_handle(request)
     if isinstance(handle, web.Response):
         return handle
     key = _key(request.query.get("draft") or "", request.query.get("timeline") or "")
-    popped = request.app["playback_backends"].pop(key, None)
+    popped = backends.pop(key, None)
     if popped:
         await popped.close()
     return JSON({"closed": popped is not None, "key": key})
