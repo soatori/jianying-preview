@@ -27,20 +27,28 @@ import argparse
 import contextlib
 import json
 import os
-from pathlib import Path
 import platform
 import random
 import struct
 import sys
 import time
-from typing import Any
 import wave
+from pathlib import Path
+from typing import Any
 
 import jypreview.mlt_backend as mlt_backend
 from jypreview.mlt_backend import MltCompiler, PlaybackController
 from jypreview.model.timeline import (
-    AudioSpec, Clip, EffectSpec, FrameRate, MediaRef, TextPayload, TimelineModel,
-    TimeRange, Track, Transition,
+    AudioSpec,
+    Clip,
+    EffectSpec,
+    FrameRate,
+    MediaRef,
+    TextPayload,
+    TimelineModel,
+    TimeRange,
+    Track,
+    Transition,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -274,27 +282,19 @@ def _run_phases(model: TimelineModel, report: dict[str, Any]) -> None:
             failures.append(f"rewind landed on frame {rewound['frame_index']}")
             return
 
-        # Exact consumer render stream: during play only the consumer calls
-        # get_frame, so hooking the controller's capture records every rendered
-        # video frame (polling the slot alone could miss frames).
-        rendered: list[tuple[float, int]] = []
-        tractor: Any = controller._compiled.tractor if controller._compiled else None
-        base_capture = tractor.capture
-
-        def capture_hook(mlt_frame: Any) -> None:
-            rendered.append((time.perf_counter(), mlt_frame.get_position()))
-            base_capture(mlt_frame)
-
-        tractor.capture = capture_hook
-
+        # Live frame stream: during play the consumer's frame-show listener
+        # stamps the controller's frame slot, which pull_frame() returns (the
+        # tractor.capture seam fires only on Python-side pulls and stays dead
+        # while the consumer pulls natively).  Poll it on a bounded cadence —
+        # observed frames dwell ~250 ms of wall time here, far above the 50 ms
+        # poll, so distinct-frame gaps are real drops, not sampling misses.
         if controller.play()["phase"] not in ("buffering", "playing"):
             failures.append("play did not enter buffering/playing")
             return
         window_s = CONTINUOUS_MS / 1000.0
         t_start = time.perf_counter()
-        consumed = 0
-        previous_pos: int | None = None
-        last_render_wall = t_start
+        last_observed: int | None = None
+        next_poll = t_start
         drops = 0
         monotonicity_failures = 0
         clock_failures = 0
@@ -308,7 +308,6 @@ def _run_phases(model: TimelineModel, report: dict[str, Any]) -> None:
         frame_samples: list[dict[str, Any]] = []
         clock_samples: list[dict[str, Any]] = []
         while time.perf_counter() - t_start < window_s:
-            controller.pull_frame(20)
             snap = controller.snapshot()
             phase = snap["phase"]
             if phase == "error":
@@ -316,22 +315,28 @@ def _run_phases(model: TimelineModel, report: dict[str, Any]) -> None:
                 break
             if phase == "ended":
                 break
-            while len(rendered) > consumed:
-                wall, pos = rendered[consumed]
-                consumed += 1
-                if previous_pos is not None:
-                    if pos < previous_pos:
-                        monotonicity_failures += 1
-                    elif pos > previous_pos + 1:
-                        drops += pos - previous_pos - 1
-                previous_pos = pos
-                last_render_wall = wall
-                frame_samples.append({
-                    "wall_ms": round((wall - t_start) * 1000, 1),
-                    "frame_index": pos,
-                    "pts_us": FPS.sample_us(pos),
-                })
             clock_us = snap["t_us"]
+            now = time.perf_counter()
+            live = None
+            if now >= next_poll:
+                next_poll = now + 0.05
+                live = controller.pull_frame(20)
+            if live is not None and live.frame_index != last_observed:
+                # A distinct presented frame.  Gaps between consecutive
+                # observations are frames the consumer never presented; the
+                # run-up before the first observation is not counted (nothing
+                # before it was sampled).
+                if last_observed is not None:
+                    if live.frame_index < last_observed:
+                        monotonicity_failures += 1
+                    elif live.frame_index > last_observed + 1:
+                        drops += live.frame_index - last_observed - 1
+                last_observed = live.frame_index
+                frame_samples.append({
+                    "wall_ms": round((now - t_start) * 1000, 1),
+                    "frame_index": live.frame_index,
+                    "pts_us": live.pts_us,
+                })
             if first_clock_us is None:
                 first_clock_us = clock_us
             last_clock_us = clock_us
@@ -339,12 +344,12 @@ def _run_phases(model: TimelineModel, report: dict[str, Any]) -> None:
                 clock_failures += 1
             previous_clock = max(previous_clock, clock_us)
             elapsed_ms = (time.perf_counter() - t_start) * 1000
-            if phase == "playing" and previous_pos is not None \
-                    and time.perf_counter() - last_render_wall < 0.04:
-                # Pair only fresh renders: audio-mastered consumer clock vs the
-                # latest rendered video frame (sampling error <= 1 frame).
+            if live is not None and phase == "playing":
+                # Pair both sides only where both exist: the presented video
+                # frame read this iteration vs the audio-mastered consumer
+                # clock from the same iteration (sub-millisecond apart).
                 clock_frame = model.frame_rate.quantize(clock_us)[0]
-                delta = abs(clock_frame - previous_pos)
+                delta = abs(clock_frame - live.frame_index)
                 max_av_delta = max(max_av_delta, delta)
                 av_pairs += 1
             if not clock_samples or elapsed_ms - clock_samples[-1]["wall_ms"] >= 500:
@@ -368,11 +373,11 @@ def _run_phases(model: TimelineModel, report: dict[str, Any]) -> None:
             "frames_observed": frames,
             "expected_frames": expected,
             "frame_stream_observed": frame_stream_observed,
-            "frame_source": ("controller capture hook — fires only when Python pulls frames; "
-                             "static during consumer play until the Task 4 continuous-frame "
-                             "fix lands, so drops/PTS from the stream read null then"),
+            "frame_source": ("live frame-show slot via controller.pull_frame() polled "
+                             "every 50 ms during play; drops = gaps between distinct "
+                             "presented frame indices (startup run-up excluded)"),
             "dropped_frames": drops if frame_stream_observed else None,
-            "output_fps": output_fps_clock,
+            "output_fps": output_fps_frames,
             "output_fps_clock": output_fps_clock,
             "output_fps_frames": output_fps_frames,
             "clock_span_us": clock_span_us,
@@ -380,8 +385,10 @@ def _run_phases(model: TimelineModel, report: dict[str, Any]) -> None:
             "clock_monotonicity_failures": clock_failures,
             "max_internal_av_delta_frames": max_av_delta if av_pairs else None,
             "av_pairs": av_pairs,
-            "av_method": ("audio-mastered consumer clock polled each loop vs the freshest "
-                          "consumer-rendered video frame; pairing requires a render <40 ms old"),
+            "av_method": ("presented video frame from the live frame-show slot vs the "
+                          "audio-mastered consumer clock, both read in the same 5 ms "
+                          "loop iteration; pairs form only while playing with a frame "
+                          "observed (frame stream dead -> no pairs, max stays null)"),
             "frame_samples": frame_samples,
             "clock_samples": clock_samples,
         }
@@ -467,11 +474,13 @@ def main(argv: list[str] | None = None) -> int:
               f"target mismatches {seeks['target_mismatches']}")
     if continuous:
         dropped = continuous["dropped_frames"]
-        print(f"continuous {CONTINUOUS_MS // 1000}s: clock output FPS "
-              f"{continuous['output_fps_clock']} "
-              f"(content {round(continuous['clock_span_us'] / 1e6, 1)}s), "
+        print(f"continuous {CONTINUOUS_MS // 1000}s: output FPS "
+              f"{continuous['output_fps']} "
+              f"({continuous['frames_observed']} distinct frames, "
+              f"clock FPS {continuous['output_fps_clock']}, "
+              f"content {round(continuous['clock_span_us'] / 1e6, 1)}s), "
               f"frame stream {continuous['frames_observed']}/{continuous['expected_frames']} "
-              f"({'observed' if continuous['frame_stream_observed'] else 'static during play: Task 4 continuous-frame fix pending'}), "
+              f"({'observed' if continuous['frame_stream_observed'] else 'static: no frames observed'}), "
               f"dropped {dropped if dropped is not None else 'unobservable'}, "
               f"regressions {continuous['monotonicity_failures']}"
               f"+{continuous['clock_monotonicity_failures']}, "
