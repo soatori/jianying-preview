@@ -287,7 +287,12 @@ export class MltPlaybackClient {
   async #closeBestEffort(playbackId) {
     if (!playbackId) return;
     try {
-      await fetch(this.#url("/api/backend/close", { playback_id: playbackId }), { method: "POST" });
+      // The selectors may already be the NEW selection (open() resets identity
+      // first), which would resolve the wrong playback key server-side (404/409)
+      // and leak this handle. Null them so #url's filter emits playback_id only,
+      // hitting the server's exact-id close path.
+      await fetch(this.#url("/api/backend/close",
+        { playback_id: playbackId, draft: null, timeline: null }), { method: "POST" });
     } catch (error) { void error; }
   }
 
