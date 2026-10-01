@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import traceback
+from contextlib import suppress
 from pathlib import Path
 
 from aiohttp import web
@@ -54,7 +55,7 @@ def create_app(config: Config, session: PreviewSession | None = None,
     app["hub"] = EventHub()
     app["watcher"] = Watcher(config, app["hub"], app["session"])
     app["browser"] = BrowserSession(Path(config.user_state_dir) / "browser")
-    app["native_backends"] = {}
+    app["playback_backends"] = {}
     app["frames_built"] = 0
 
     async def revalidate_ui(request, response):
@@ -183,10 +184,8 @@ async def run(config: Config, open_browser: bool = True,
             app["browser"].stop()
         except Exception:
             pass
-        for backend in list(app["native_backends"].values()):
-            try:
+        for backend in list(app["playback_backends"].values()):
+            with suppress(Exception):
                 await backend.close()
-            except Exception:
-                pass
-        app["native_backends"].clear()
+        app["playback_backends"].clear()
         await runner.cleanup()

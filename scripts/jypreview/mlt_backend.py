@@ -1,8 +1,14 @@
-"""Compile immutable timeline values into an owned MLT audio/video graph."""
+"""Compile immutable timeline values into an owned MLT graph and drive playback."""
 
-from dataclasses import dataclass, field
 import ctypes
+import queue
+import threading
+import time
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass, field
 from math import log10
+from typing import Any
 
 from .model.content import DEFAULT_RI
 from .model.timeline import FrameRate, TimelineModel, Transform
@@ -46,6 +52,7 @@ class CompiledTimeline:
 _repository = None
 _tractor_class = None
 _cache_purge = None
+_sink_name = None
 
 
 def _purge_audio_caches(graph, position):
@@ -85,6 +92,7 @@ def _tractor(mlt, profile):
                 self._audio_decoders = []
                 self._last_audio_positions = {}
                 self._audio_frame = None
+                self.capture = None
 
             def get_frame(self, *args):
                 position = self.position()
@@ -94,6 +102,8 @@ def _tractor(mlt, profile):
                            for decoder, positions in self._audio_decoders if position in positions}
                 # Retain the last lazy frame until the next serialized pull observes PCM consumption.
                 self._audio_frame = (frame, sources)
+                if self.capture is not None:
+                    self.capture(frame)
                 return frame
 
         _tractor_class = Graph
@@ -440,3 +450,339 @@ class MltCompiler:
         except Exception:
             compiled.close()
             raise
+
+
+class PlaybackController:
+    """Serialized MLT transport with per-seek generation frame identity.
+
+    One worker thread owns all state; the MLT audio consumer is the master
+    clock and only worker-initiated renders stamp frame identity.
+    """
+
+    def __init__(self) -> None:
+        self._commands: queue.Queue = queue.Queue()
+        self._phase = "idle"
+        self._playback_id = ""
+        self._seek_request_id = 0
+        self._generation = 0
+        self._frame_index = 0
+        self._t_us = 0
+        self._duration_us = 0
+        self._duration_frames = 0
+        self._error: str | None = None
+        self._open = False
+        self._intent = False
+        self._pending: int | None = None
+        self._fps: FrameRate | None = None
+        self._frame_slot: RenderedFrame | None = None
+        self._compiled: CompiledTimeline | None = None
+        self._consumer: Any = None
+        self._mlt = None
+        self._width = self._height = 0
+        threading.Thread(target=self._run, name="jypreview-playback", daemon=True).start()
+
+    # -- public API -----------------------------------------------------
+
+    def open(self, model: TimelineModel) -> dict[str, Any]:
+        return self._submit(self._h_open, model)
+
+    def play(self) -> dict[str, Any]:
+        return self._submit(self._h_play)
+
+    def pause(self) -> dict[str, Any]:
+        return self._submit(self._h_pause)
+
+    def seek(self, t_us: int, *, playback_id: str, request_id: int) -> dict[str, Any]:
+        return self._submit(self._h_seek, t_us, playback_id, request_id)
+
+    def snapshot(self) -> dict[str, Any]:
+        return self._submit(self._h_snapshot)
+
+    def close(self) -> None:
+        self._submit(self._h_close)
+
+    def pull_frame(self, timeout_ms: int = 100) -> RenderedFrame | None:
+        _, intent = self._submit(self._h_prepare_pull)
+        end = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+        if intent:
+            while self._phase == "buffering" and time.monotonic() < end:
+                time.sleep(0.005)
+        while True:
+            frame = self._frame_slot
+            if frame is not None:
+                return frame
+            if time.monotonic() >= end:
+                return None
+            time.sleep(0.005)
+
+    # -- worker plumbing ------------------------------------------------
+
+    def _run(self) -> None:
+        while True:
+            try:
+                self._tick()
+            except Exception as exc:
+                self._fail(exc)
+            try:
+                handler, args, reply = self._commands.get(timeout=0.01)
+            except queue.Empty:
+                continue
+            try:
+                result = handler(*args)
+            except ValueError as exc:
+                # Command validation never mutates state; keep the snapshot intact.
+                reply.put(("err", exc))
+            except Exception as exc:
+                self._fail(exc)
+                reply.put(("err", exc))
+            else:
+                reply.put(("ok", result))
+
+    def _submit(self, handler, *args):
+        reply: queue.Queue = queue.Queue(maxsize=1)
+        self._commands.put((handler, args, reply))
+        kind, payload = reply.get()
+        if kind == "err":
+            raise payload
+        return payload
+
+    def _snapshot(self) -> dict[str, Any]:
+        return {"backend": "mlt", "phase": self._phase,
+                "playback_id": self._playback_id,
+                "seek_request_id": self._seek_request_id,
+                "generation": self._generation,
+                "frame_index": self._frame_index, "t_us": self._t_us,
+                "duration_us": self._duration_us,
+                "playing": self._phase == "playing",
+                "error": self._error, "open": self._open}
+
+    # -- command handlers -----------------------------------------------
+
+    def _h_open(self, model: TimelineModel) -> dict[str, Any]:
+        if not isinstance(model, TimelineModel):
+            raise ValueError("PlaybackController requires TimelineModel")
+        self._shutdown()
+        compiled = MltCompiler().compile(model)
+        tractor: Any = compiled.tractor
+        if tractor is None:
+            raise BackendUnavailable("Timeline has no frames to play")
+        consumer = self._make_consumer(MltCompiler._runtime(), compiled)
+        self._mlt = MltCompiler._runtime()
+        self._width, self._height = model.canvas
+        self._fps = model.frame_rate
+        self._duration_us = model.duration_us
+        self._duration_frames = compiled.duration_frames
+        self._playback_id = uuid.uuid4().hex
+        self._seek_request_id = 0
+        self._generation = 0
+        self._frame_index = 0
+        self._t_us = 0
+        self._error = None
+        self._intent = False
+        self._pending = None
+        self._frame_slot = None
+        self._compiled = compiled
+        self._consumer = consumer
+        self._open = True
+        self._phase = "ready"
+        tractor.capture = self._capture
+        if tractor.seek(0) != 0:
+            raise RuntimeError("MLT seek to the first frame failed")
+        tractor.get_frame()
+        return self._snapshot()
+
+    def _h_close(self) -> None:
+        self._shutdown()
+
+    def _h_snapshot(self) -> dict[str, Any]:
+        self._tick()
+        self._settle()
+        return self._snapshot()
+
+    def _h_prepare_pull(self) -> tuple[str, bool]:
+        if not self._open:
+            raise ValueError("playback controller is not open")
+        self._tick()
+        self._settle()
+        return self._phase, self._intent
+
+    def _h_play(self) -> dict[str, Any]:
+        self._require_commandable()
+        self._settle()
+        self._intent = True
+        if self._consumer is not None and self._consumer.is_stopped() \
+                and self._consumer.start() != 0:
+            raise RuntimeError("MLT consumer failed to start playback")
+        self._phase = "buffering"
+        return self._snapshot()
+
+    def _h_pause(self) -> dict[str, Any]:
+        self._require_commandable()
+        self._settle()
+        self._intent = False
+        if self._consumer is not None and not self._consumer.is_stopped():
+            self._consumer.stop()
+        self._phase = "paused"
+        return self._snapshot()
+
+    def _h_seek(self, t_us, playback_id, request_id) -> dict[str, Any]:
+        self._require_commandable()
+        if playback_id != self._playback_id:
+            raise ValueError("stale playback_id")
+        if isinstance(request_id, bool) or not isinstance(request_id, int) or request_id <= 0:
+            raise ValueError("request_id must be a positive integer")
+        if request_id <= self._seek_request_id:
+            # Older or repeated requests are idempotent: return current state untouched.
+            return self._snapshot()
+        try:
+            target = int(t_us)
+        except (TypeError, ValueError):
+            raise ValueError("t_us must be an integer microsecond position") from None
+        # Quiesce the consumer before mutating identity so no frame can stamp late.
+        if self._consumer is not None and not self._consumer.is_stopped():
+            self._consumer.stop()
+        self._generation += 1
+        self._seek_request_id = request_id
+        self._frame_slot = None
+        frame, sample = self._fps.quantize(max(0, target))
+        if frame >= self._duration_frames:
+            self._pending = None
+            self._intent = False
+            self._phase = "ended"
+            self._frame_index = frame
+            self._t_us = sample
+        else:
+            self._pending = max(0, target)
+            self._phase = "seeking"
+        return self._snapshot()
+
+    def _require_commandable(self) -> None:
+        if not self._open or self._phase == "idle":
+            raise ValueError("playback controller is not open")
+        if self._phase == "error":
+            raise ValueError(f"playback failed: {self._error}")
+
+    # -- worker-side mechanics ------------------------------------------
+
+    def _tick(self) -> None:
+        if not self._open or self._phase not in ("buffering", "playing"):
+            return
+        if self._consumer is None:
+            return
+        pos = self._consumer.position()
+        if pos >= self._duration_frames - 1:
+            self._end_of_stream()
+            return
+        if self._phase == "playing" and self._consumer.is_stopped():
+            self._fail(RuntimeError("MLT consumer stopped unexpectedly"))
+            return
+        if self._phase == "buffering" and pos > self._frame_index:
+            self._phase = "playing"
+        sample = self._fps.sample_us(pos)
+        if sample >= self._t_us:
+            self._t_us = sample
+            self._frame_index = pos
+
+    def _settle(self) -> None:
+        if self._pending is None or self._phase != "seeking":
+            return
+        target = self._pending
+        self._pending = None
+        compiled, fps, consumer = self._compiled, self._fps, self._consumer
+        if compiled is None or fps is None or consumer is None:
+            raise RuntimeError("playback state is incomplete")
+        frame, sample = fps.quantize(max(0, target))
+        tractor: Any = compiled.tractor
+        if tractor.seek(frame) != 0:
+            raise RuntimeError(f"MLT seek to frame {frame} failed")
+        tractor.get_frame()  # capture stamps the slot with current identity
+        self._frame_index = frame
+        self._t_us = sample
+        self._phase = "buffering" if self._intent else "ready"
+        if self._intent and consumer.is_stopped() and consumer.start() != 0:
+            raise RuntimeError("MLT consumer failed to resume after seek")
+
+    def _end_of_stream(self) -> None:
+        self._intent = False
+        self._phase = "ended"
+        self._frame_slot = None
+        if self._consumer is not None and not self._consumer.is_stopped():
+            self._consumer.stop()
+
+    def _fail(self, exc) -> None:
+        self._phase = "error"
+        self._error = str(exc) or exc.__class__.__name__
+        self._intent = False
+        self._frame_slot = None
+        if self._consumer is not None:
+            with suppress(Exception):
+                self._consumer.stop()
+
+    def _shutdown(self) -> None:
+        if self._consumer is not None:
+            with suppress(Exception):
+                self._consumer.stop()
+        if self._compiled is not None:
+            tractor: Any = self._compiled.tractor
+            if tractor is not None:
+                tractor.capture = None
+            self._compiled.close()
+        self._consumer = None
+        self._compiled = None
+        self._mlt = None
+        self._frame_slot = None
+        self._pending = None
+        self._intent = False
+        self._open = False
+        self._phase = "idle"
+        self._error = None
+        self._playback_id = ""
+        self._seek_request_id = 0
+        self._generation = 0
+        self._frame_index = 0
+        self._t_us = 0
+        self._duration_us = 0
+        self._duration_frames = 0
+
+    def _capture(self, mlt_frame) -> None:
+        if not self._open or not self._playback_id:
+            return
+        pos = mlt_frame.get_position()
+        rgba = bytes(mlt_frame.get_image(self._mlt.mlt_image_rgba,
+                                         self._width, self._height))
+        self._frame_slot = RenderedFrame(
+            self._playback_id, self._generation, self._seek_request_id,
+            pos, self._fps.sample_us(pos), self._width, self._height, rgba)
+
+    def _make_consumer(self, mlt, compiled):
+        global _sink_name
+        order = [_sink_name] if _sink_name else []
+        order += [name for name in ("sdl2_audio", "rtaudio", "null") if name not in order]
+        for name in order:
+            consumer = mlt.Consumer(compiled.profile, name)
+            if not consumer.is_valid():
+                continue
+            consumer.set("real_time", 1)
+            consumer.set("loop", 0)
+            if consumer.connect(compiled.tractor) != 0:
+                continue
+            if self._drives(consumer):
+                _sink_name = name
+                return consumer
+        raise BackendUnavailable("No MLT consumer can drive the timeline clock")
+
+    @staticmethod
+    def _drives(consumer) -> bool:
+        """Prove the sink advances the project clock before committing to it."""
+        if consumer.start() != 0:
+            return False
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if consumer.position() >= 2:
+                consumer.stop()
+                return True
+            if consumer.is_stopped():
+                return False
+            time.sleep(0.02)
+        consumer.stop()
+        return False
