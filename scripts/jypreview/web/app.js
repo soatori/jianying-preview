@@ -1,9 +1,6 @@
 import { Stage } from "./render.js";
 import { renderInfo, renderProps, fmtUs } from "./props.js";
-import { FrameStore } from "./frame-store.js";
-import { PlaybackController } from "./playback.js";
-import { AudioScheduler } from "./media.js";
-import { BrowserPlaybackBackend } from "./backend.js";
+import { MltPlaybackClient } from "./backend.js";
 import { LoadingController } from "./loading.js";
 
 const $ = (id) => document.getElementById(id);
@@ -20,7 +17,6 @@ nativeFrame.alt = "";
 nativeFrame.hidden = true;
 canvasEl.append(nativeFrame, overlay);
 const view = new Stage(canvasEl, overlay);
-const frameStore = new FrameStore();
 const loading = new LoadingController($("loading"));
 
 const params = new URLSearchParams(location.search);
@@ -31,46 +27,19 @@ const params = new URLSearchParams(location.search);
 const deepLink = { did: params.get("draft") || "", timeline: params.get("timeline") || "",
                    t: params.get("t") };
 const leaseToken = params.get("lease") || "";
-const audioScheduler = new AudioScheduler();
-const native = { enabled: false, key: "", streamUrl: "", objectUrl: "", poll: null };
-
-// Playback runs off a *window* IR: every layer touching [t, t+WINDOW) arrives in one
-// response and stays in the DOM pool, so a cut is a CSS toggle rather than a request plus
-// a media reload. The playhead clock is the wall clock, corrected by the main shot.
-const WINDOW_US = 20_000_000;    // how much timeline one request covers
-const PREFETCH_US = 3_000_000;   // start loading the next window this early
+const mlt = new MltPlaybackClient();
+const display = { objectUrl: "", poll: null, frameChain: Promise.resolve() };
 
 const state = {
   did: null, tid: null, tUs: 0, playing: false, rate: 1, scale: 1,
   ir: null, trackmap: null, describe: null, durationUs: 0, fps: 30, frameDurUs: 33333,
   lastFetch: 0, pending: null, selected: null, autoSelected: null, lastFolder: "",
   ratio: params.get("ratio") || "draft", primary: null, span: null, sound: true, zoom: 0,
-  windowRange: null, buffering: false, phase: "idle", generation: 0,
+  // epoch guards local UI work across timeline switches; playback identity lives on mlt.
+  epoch: 0, phase: "idle", wantPlaying: false, error: null,
+  lastSeekIssue: 0, displayedPtsUs: null,
   sourceSha: null,
 };
-const playback = new PlaybackController({
-  state,
-  isPlayable: (tUs, generation) => frameStore.covers(tUs, generation),
-  renderAt: (tUs, context) => renderTimelineAt(tUs, context),
-  onNeedBuffer: (tUs, generation) => loadWindowAt(tUs).then((ir) =>
-    !!ir && frameStore.covers(tUs, generation)),
-  onTick: (tUs) => advanceTimeline(tUs),
-  onState: (snapshot) => {
-    paintPlay();
-    if (snapshot.playing) {
-      const suffix = snapshot.buffering ? " · 缓冲中…" : "";
-      $("clock").textContent = `${(snapshot.tUs / 1e6).toFixed(3)}s${suffix}`;
-    }
-  },
-  onClose: () => {
-    audioScheduler.clear();
-    frameStore.clear(state.generation);
-    view.clear();
-  },
-});
-const playbackBackend = new BrowserPlaybackBackend(playback);
-
-let windowJob = null;
 
 async function api(path, query = {}, method = "GET") {
   const url = new URL(path, location.origin);
@@ -88,85 +57,158 @@ async function api(path, query = {}, method = "GET") {
   return payload.data;
 }
 
-const nativeRequested = params.get("backend") !== "browser";
+// -- MLT playback backend ----------------------------------------------------
+// The backend snapshot clock is the only writer of the playhead. Decoder PTS
+// and HTTP arrival time are diagnostics: a stalled or reordered frame must
+// never drag timeline time backwards.
 
-function nativeQuery(extra = {}) {
-  return { draft: state.did, timeline: state.tid, ...extra };
+function syncMltState() {
+  state.tUs = mlt.tUs;
+  state.phase = mlt.phase;
+  state.playing = mlt.playing;
+  state.error = mlt.error || state.error;
+  if (mlt.durationUs > 0 && mlt.durationUs !== state.durationUs) {
+    state.durationUs = mlt.durationUs;
+    $("scrub").max = String(Math.round(state.durationUs / 1000));
+  }
+  movePlayhead();
+  paintPlay();
+  const suffix = state.phase === "buffering" ? " · 缓冲中…" : "";
+  $("clock").textContent = `${(state.tUs / 1e6).toFixed(3)}s  f${mlt.frameIndex}${suffix}`;
 }
 
-async function nativeRenderAt(tUs, markReady = true) {
-  if (!native.enabled) return false;
-  const url = new URL("/api/backend/render", location.origin);
-  for (const [key, value] of Object.entries(nativeQuery({ t_us: Math.round(tUs) }))) {
-    url.searchParams.set(key, value);
+function enterMltError(message) {
+  state.error = String(message);
+  window.__error = state.error;
+  if (state.phase !== "error") note(`播放后端失败：${state.error}`, true);
+  state.phase = "error";
+  state.playing = false;
+  state.wantPlaying = false;
+  paintPlay();
+}
+
+async function pollMltSnapshot() {
+  if (!mlt.playbackId) return;
+  try {
+    const result = await mlt.snapshot();
+    if (!result.applied) return;
+    syncMltState();
+    view.evalAt(state.tUs, state.playing);
+    state.primary = view.primaryAt(state.tUs);
+  } catch (error) {
+    enterMltError(error.message);
   }
-  const response = await fetch(url, { cache: "no-store" });
-  if (!response.ok) throw new Error(`native_render_failed: ${response.status}`);
-  const blob = await response.blob();
-  if (native.objectUrl) URL.revokeObjectURL(native.objectUrl);
-  native.objectUrl = URL.createObjectURL(blob);
-  nativeFrame.src = native.objectUrl;
+}
+
+function startMltPoll() {
+  if (display.poll) return;
+  display.poll = setInterval(pollMltSnapshot, 100);
+}
+
+function stopMltPoll() {
+  if (display.poll) clearInterval(display.poll);
+  display.poll = null;
+}
+
+function frameExpired(ptsUs) {
+  if (ptsUs === null || ptsUs === undefined) return false;
+  // A frame lagging the backend's snapshot clock by more than one project frame is expired.
+  return ptsUs < mlt.tUs - state.frameDurUs;
+}
+
+async function showMltFrame(frame) {
+  if (!mlt.accepts(frame)) return false;   // identity check before decode
+  if (frameExpired(frame.ptsUs)) return false;
+  const url = URL.createObjectURL(frame.blob);
+  const probe = new Image();
+  probe.src = url;
+  try {
+    await probe.decode();
+  } catch (error) {
+    void error;
+    URL.revokeObjectURL(url);
+    return false;
+  }
+  if (!mlt.accepts(frame)) {               // identity check before swapping the image URL
+    URL.revokeObjectURL(url);
+    return false;
+  }
+  if (display.objectUrl) URL.revokeObjectURL(display.objectUrl);
+  display.objectUrl = url;
+  nativeFrame.src = url;
   nativeFrame.hidden = false;
-  if (markReady) window.__ready = true;
-  state.tUs = Math.max(0, Math.min(Number(tUs), state.durationUs || Number(tUs)));
-  playback.syncExternal(state.tUs, "paused");
-  movePlayhead();
+  state.displayedPtsUs = frame.ptsUs ?? null;
   return true;
 }
 
-async function syncNativeSnapshot() {
-  if (!native.enabled) return;
-  try {
-    const snapshot = await api("/api/backend/snapshot", nativeQuery());
-    playback.syncExternal(snapshot.t_us || 0, snapshot.phase || "paused");
-    view.evalAt(snapshot.t_us || 0, false);
-    state.primary = view.primaryAt(snapshot.t_us || 0);
-    movePlayhead();
-  } catch (error) {
-    note(`原生后端状态读取失败：${error.message}`, true);
-  }
+function queueFrame(frame) {
+  display.frameChain = display.frameChain
+    .then(() => showMltFrame(frame))
+    .catch((error) => enterMltError(`画面解码失败：${error.message}`));
+  return display.frameChain;
 }
 
-async function closeNativeBackend() {
-  if (!native.enabled) return;
-  if (native.poll) clearInterval(native.poll);
-  native.poll = null;
-  try { await api("/api/backend/close", nativeQuery(), "POST"); } catch (error) { void error; }
-  native.enabled = false;
-  native.key = "";
+async function renderMltAt(tUs) {
+  const result = await mlt.renderAt(tUs);
+  if (result.stale || result.superseded) return false;
+  if (result.ended) {
+    syncMltState();
+    return true;
+  }
+  await queueFrame(result);
+  syncMltState();
+  // Seek while playing: resume only after the latest seek acknowledgment.
+  if (result.requestId === mlt.issued && state.wantPlaying
+      && mlt.phase !== "playing" && mlt.phase !== "ended") {
+    try {
+      await mlt.play();
+      syncMltState();
+    } catch (error) {
+      enterMltError(`播放失败：${error.message}`);
+    }
+  }
+  return true;
+}
+
+async function closeMlt() {
+  stopMltPoll();
+  state.wantPlaying = false;
+  display.frameChain = Promise.resolve();
+  try {
+    await mlt.close();
+  } catch (error) { void error; }
+  if (display.objectUrl) URL.revokeObjectURL(display.objectUrl);
+  display.objectUrl = "";
   nativeFrame.removeAttribute("src");
   nativeFrame.hidden = true;
-  if (native.objectUrl) URL.revokeObjectURL(native.objectUrl);
-  native.objectUrl = "";
   view.setNativeMode(false);
+  state.displayedPtsUs = null;
+  syncMltState();
 }
 
-async function activateNativeBackend() {
-  if (!nativeRequested || !state.did || !state.tid) return false;
-  if (native.enabled && native.key === `${state.did}:${state.tid}`) return true;
-  await closeNativeBackend();
-  const token = loading.begin("native", "正在启动 GStreamer 播放内核…", {
-    generation: state.generation, blocking: true,
+async function activateMlt() {
+  if (!state.did || !state.tid) return false;
+  const token = loading.begin("mlt", "正在启动 MLT 播放内核…", {
+    generation: state.epoch, blocking: true,
   });
   window.__ready = false;
   try {
-    const data = await api("/api/backend/open", nativeQuery({
-      realtime: 1, audio_sink: "autoaudiosink",
-    }), "POST");
-    native.enabled = true;
-    native.key = data.key;
-    native.streamUrl = new URL("/api/backend/stream", location.origin).toString()
-      + `?draft=${encodeURIComponent(state.did)}&timeline=${encodeURIComponent(state.tid)}&realtime=1`;
-    await loadWindowAt(0);
+    const opened = await mlt.open(state.did, state.tid);
+    if (opened.stale) {
+      loading.end(token);
+      return false;
+    }
     view.setNativeMode(true);
-    await nativeRenderAt(state.tUs, false);
-    native.poll = setInterval(syncNativeSnapshot, 100);
+    startMltPoll();
+    await renderMltAt(state.tUs);
+    mlt.startStream(queueFrame, (error) => enterMltError(error.message || String(error)));
     window.__ready = true;
     loading.end(token);
     return true;
   } catch (error) {
-    loading.fail(`GStreamer 播放内核不可用：${error.message}`);
-    note(`GStreamer 播放内核不可用，当前保留浏览器诊断模式：${error.message}`, true);
+    loading.fail(`MLT 播放内核不可用：${error.message}`);
+    enterMltError(`MLT 播放内核不可用：${error.message}`);
+    window.__ready = true;
     return false;
   }
 }
@@ -243,8 +285,7 @@ function fitStage() {
 async function openDraft(selector) {
   const wanted = String(selector || "").trim();
   if (!wanted) return;
-  await closeNativeBackend();
-  togglePlay(false);
+  await closeMlt();
   $("pick").disabled = true;
   clearCandidates();
   const started = Date.now();
@@ -255,10 +296,10 @@ async function openDraft(selector) {
     if (loadingToken) loading.update(`正在解密草稿… ${((Date.now() - started) / 1000).toFixed(0)}s`, loadingToken);
   }, 500);
   try {
-    playback.bumpGeneration();
-    playback.transition("loading");
+    state.epoch += 1;
+    state.phase = "loading";
     loadingToken = loading.begin("decrypt", "正在解密草稿…", {
-      generation: state.generation, blocking: true,
+      generation: state.epoch, blocking: true,
     });
     const data = await api("/api/timelines", { draft: wanted });
     state.did = data.did;
@@ -312,11 +353,11 @@ async function openDraft(selector) {
 
 async function selectTimeline(tid) {
   const loadingToken = loading.begin("timeline", "正在准备时间线…", {
-    generation: state.generation, blocking: true,
+    generation: state.epoch, blocking: true,
   });
   try {
     const result = await selectTimelineInternal(tid);
-    await activateNativeBackend();
+    await activateMlt();
     return result;
   } catch (error) {
     loading.fail(`时间线加载失败：${error.message || error}`);
@@ -328,11 +369,10 @@ async function selectTimeline(tid) {
 
 async function selectTimelineInternal(tid) {
   if (!tid || !state.did) return;
-  await closeNativeBackend();
-  togglePlay(false);
-  playback.bumpGeneration();
-  playback.transition("loading");
-  playback.setTimeline({ durationUs: 0, rate: state.rate });
+  await closeMlt();
+  state.epoch += 1;
+  state.phase = "loading";
+  state.error = null;
   state.tid = tid;
   params.set("timeline", tid);
   history.replaceState(null, "", `?${params}`);
@@ -341,53 +381,46 @@ async function selectTimelineInternal(tid) {
   state.durationUs = Math.max(state.trackmap.duration_us || 0, 1);
   state.fps = state.trackmap.fps || 30;
   state.frameDurUs = Math.round(1e6 / state.fps);
-  playback.setTimeline({ durationUs: state.durationUs, rate: state.rate });
-  state.windowRange = null;
-  state.windowIr = null;
   state.ir = null;
-  audioScheduler.clear();
-  frameStore.clear(state.generation);
   view.clear();
   $("scrub").max = String(Math.round(state.durationUs / 1000));
   drawLanes();
   await fetchFrame(0, true);
-  playback.transition("ready");
+  state.phase = "ready";
+  paintPlay();
 }
 
 // -- frames ------------------------------------------------------------------
-// Two channels share one layer pool: a point query for seeking/screenshots (exact
-// composition at t), and a window query for playback (everything that will ever be
-// needed around t, so no request is made while the timeline is rolling).
+// Point queries compose exactly at t and feed the diagnostic DOM pool: canvas
+// geometry, the properties panel, and warnings. Playback itself comes from the
+// MLT backend and never advances from these frames.
 
 async function fetchFrame(tUs, exact = false) {
   if (!state.did || !state.tid) return;
-  // While the timeline is rolling, the window IR owns the pool. A point query would
-  // replace it with the single instant and blank everything the window had staged.
-  if (state.playing) { loadWindowAt(tUs); return; }
   const now = performance.now();
   if (!exact && now - state.lastFetch < 120) return;
   state.lastFetch = now;
   window.__ready = false;
-  const generation = state.generation;
+  const epoch = state.epoch;
   const loadingToken = loading.begin("frame", exact ? "正在准备当前画面…" : "正在定位画面…", {
-    generation, blocking: true,
+    generation: epoch, blocking: true,
   });
   const pending = api("/api/frame", { draft: state.did, timeline: state.tid,
     t_us: Math.round(tUs), ratio: state.ratio === "draft" ? "" : state.ratio })
     .then((ir) => {
-      if (generation !== state.generation) return null;
+      if (epoch !== state.epoch) return null;
       applyFrame(ir);
       return ir;
     })
     .catch((error) => {
-      if (generation !== state.generation) return null;
+      if (epoch !== state.epoch) return null;
       window.__error = String(error && error.message);
       $("warnings").replaceChildren();
       note(`取帧失败：${window.__error}`, true);
     })
     .finally(() => {
       if (state.pending === pending) state.pending = null;
-      if (generation === state.generation) window.__ready = true;
+      if (epoch === state.epoch) window.__ready = true;
       loading.end(loadingToken);
     });
   state.pending = pending;
@@ -396,7 +429,6 @@ async function fetchFrame(tUs, exact = false) {
 
 function applyFrame(ir) {
   state.ir = ir;
-  if (!ir.window) frameStore.setPoint(ir, state.generation);
   state.span = timelineSpan(ir);
   view.reset(ir);
   view.load(ir);
@@ -404,75 +436,8 @@ function applyFrame(ir) {
   state.primary = view.primaryAt(state.tUs);
   fitStage();
   refreshPanels(ir);
-  syncAudio(state.tUs, state.playing);
   view.highlight(null);
   markSelectedSegment(null);
-  if (!state.playing && state.phase === "seeking") playback.transition("paused");
-}
-
-/** Load the window that starts at (or before) `fromUs` and adopt it as the playable span. */
-function loadWindowAt(fromUs) {
-  const base = Math.max(0, Math.min(Math.round(fromUs), Math.max(state.durationUs - 1_000_000, 0)));
-  if (windowJob && windowJob.generation === state.generation && base < windowJob.to) {
-    return windowJob.promise;
-  }
-  const length = Math.min(WINDOW_US, Math.max(state.durationUs - base, 1_000_000));
-  const generation = state.generation;
-  const blocking = !windowCovers(state.tUs) || state.buffering || state.phase === "loading";
-  const loadingToken = loading.begin(blocking ? "buffer" : "prefetch",
-    blocking ? "正在缓冲当前片段…" : "正在预取下一段…", { generation, blocking });
-  window.__ready = false;
-  const promise = api("/api/frame", { draft: state.did, timeline: state.tid, t_us: base,
-    window_us: length, ratio: state.ratio === "draft" ? "" : state.ratio })
-    .then((ir) => {
-      if (generation !== state.generation) return null;
-      if (!ir.window) return null;
-      state.ir = ir;
-      state.windowIr = ir;
-      frameStore.setWindow(ir, generation);
-      state.windowRange = frameStore.range(generation);
-      view.reset(ir);
-      view.load(ir);
-      view.evict(state.tUs);
-      view.evalAt(state.tUs, state.playing);
-      state.primary = view.primaryAt(state.tUs);
-      fitStage();
-      refreshPanels(ir);
-      if (state.playing && windowCovers(state.tUs)) {
-        playback.transition("playing");
-      }
-      return ir;
-    })
-    .catch((error) => {
-      if (generation !== state.generation) return null;
-      window.__error = String(error && error.message);
-      note(`取窗口失败：${error.message}`, true);
-      state.windowRange = null;
-      if (state.playing) {
-        playback.transition("error");
-      }
-      loading.fail(`窗口加载失败：${error.message}`);
-      return null;
-    })
-    .finally(() => {
-      if (windowJob && windowJob.promise === promise) windowJob = null;
-      if (generation === state.generation) window.__ready = true;
-      loading.end(loadingToken);
-    });
-  windowJob = { generation, base, to: base + length, promise };
-  return promise;
-}
-
-function windowCovers(tUs) {
-  return frameStore.covers(tUs, state.generation);
-}
-
-/** Re-arm one window ahead while playing; never blocks the frame. */
-function prefetchWindow() {
-  const range = state.windowRange;
-  if (windowJob) return;
-  if (!range) { loadWindowAt(state.tUs); return; }
-  if (state.tUs >= range[1] - PREFETCH_US) loadWindowAt(range[1]);
 }
 
 function timelineSpan(ir) {
@@ -486,27 +451,6 @@ function timelineSpan(ir) {
     end = Math.max(end, time.end_us ?? (time.target_start_us + (time.target_duration_us || 0)));
   }
   return end < start ? null : [start, end];
-}
-
-/** The controller owns the seek generation; this adapter owns only IR/DOM work. */
-async function renderTimelineAt(tUs, context) {
-  movePlayhead();
-  if (windowCovers(tUs)) {
-    view.evalAt(tUs, false);
-    state.primary = view.primaryAt(tUs);
-    syncAudio(tUs, false);
-    return { ok: true, window: true, generation: context.generation };
-  }
-  state.windowRange = null;
-  state.windowIr = null;
-  await fetchFrame(tUs, context.exact);
-  return { ok: !!state.ir, window: false, generation: context.generation };
-}
-
-// -- audio -------------------------------------------------------------------
-
-function syncAudio(tUs, playing) {
-  return audioScheduler.sync((state.ir && state.ir.audio_labels) || [], tUs, playing, state.sound);
 }
 
 
@@ -671,35 +615,18 @@ function movePlayhead() {
 }
 
 function seek(tUs, exact = true) {
-  if (native.enabled) {
-    return nativeRenderAt(tUs).catch((error) => {
-      window.__error = String(error && error.message);
-      note(`原生定位失败：${window.__error}`, true);
-      return null;
-    });
+  if (!mlt.playbackId) return Promise.resolve(null);
+  if (!exact) {
+    // ponytail: scrub drags issue one seek per 120ms; release fires the exact seek
+    const now = performance.now();
+    if (now - state.lastSeekIssue < 120) return Promise.resolve(null);
   }
-  return playback.seek(tUs, exact).catch((error) => {
-    window.__error = String(error && error.message);
-    note(`定位失败：${window.__error}`, true);
+  state.lastSeekIssue = performance.now();
+  const target = Math.max(0, Math.min(Math.round(tUs), state.durationUs || tUs));
+  return renderMltAt(target).catch((error) => {
+    enterMltError(`定位失败：${error && error.message}`);
     return null;
   });
-}
-
-// The main shot is the reference for *who is audible* and for the properties panel, but it
-// is never the clock. Every implementation studied (FreeCut's Clock, Remotion's Player,
-// OpenCut's PlaybackManager) keeps the playhead authoritative and treats element time as an
-// observation only — the moment a decoder gets to write the playhead, a stalled clip drags
-// the timeline backwards and the overlays rewind with it.
-function trackPrimary() {
-  state.primary = view.primaryAt(state.tUs);
-}
-
-function advanceTimeline(tUs) {
-  trackPrimary();
-  movePlayhead();
-  view.evalAt(tUs, true);
-  syncAudio(tUs, true);
-  prefetchWindow();
 }
 
 function paintPlay() {
@@ -713,30 +640,14 @@ function paintPlay() {
 function togglePlay(force) {
   const next = force === undefined ? !state.playing : force;
   if (next === state.playing) return;
-  if (next && !state.tid) return;   // nothing loaded yet: the button must not lie
-  if (native.enabled) {
-    const action = next ? "play" : "pause";
-    if (next) {
-      nativeFrame.src = native.streamUrl;
-      nativeFrame.hidden = false;
-    }
-    api(`/api/backend/${action}`, nativeQuery(), "POST")
-      .then((snapshot) => playback.syncExternal(snapshot.t_us || state.tUs,
-                                                 snapshot.phase || (next ? "playing" : "paused")))
-      .catch((error) => note(`原生播放失败：${error.message}`, true));
-    return;
-  }
-  if (state.playing) {
-    // This branch is intentionally based on the requested next state, not on
-    // the controller's post-call mirror.
-    playbackBackend.pause();
-    view.evalAt(state.tUs, false);
-    syncAudio(state.tUs, false);
-  } else {
-    playbackBackend.play();
-    view.evalAt(state.tUs, true);
-    syncAudio(state.tUs, true);
-  }
+  if (!state.tid || !mlt.playbackId) return;   // nothing loaded yet: the button must not lie
+  state.wantPlaying = next;
+  const request = next ? mlt.play() : mlt.pause();
+  request.then(() => {
+    syncMltState();
+    view.evalAt(state.tUs, state.playing);
+    state.primary = view.primaryAt(state.tUs);
+  }).catch((error) => enterMltError(`${next ? "播放" : "暂停"}失败：${error.message}`));
 }
 
 function refreshPanels(ir) {
@@ -777,6 +688,7 @@ let folds = {};
 try {
   folds = JSON.parse(localStorage.getItem(FOLD_KEY) || "{}") || {};
 } catch (error) {
+  void error;
   folds = {};
 }
 
@@ -842,7 +754,7 @@ $("zoomfit").onclick = () => {
 
 $("play").onclick = () => togglePlay();
 $("scrub").addEventListener("input", (event) => seek(Number(event.target.value) * 1000, false));
-$("scrub").addEventListener("change", () => seek(state.tUs, true));
+$("scrub").addEventListener("change", () => seek(Number($("scrub").value) * 1000, true));
 $("timelines").onchange = (event) => selectTimeline(event.target.value);
 
 function paintSound() {
@@ -868,7 +780,6 @@ paintPlay();
 $("sound").onclick = () => {
   state.sound = !state.sound;
   paintSound();
-  syncAudio(state.tUs, state.playing);
 };
 
 // 画幅 is the canvas ratio, not a zoom: switching it re-asks the server for geometry rebuilt
@@ -886,10 +797,7 @@ $("ratio").onchange = async (event) => {
   state.ratio = event.target.value;
   params.set("ratio", state.ratio);
   history.replaceState(null, "", `?${params}`);
-  state.windowRange = null;
-  state.windowIr = null;
   await fetchFrame(state.tUs, true);
-  if (state.playing) loadWindowAt(state.tUs);
 };
 
 $("reload").onclick = async () => {
@@ -917,7 +825,7 @@ document.addEventListener("keydown", (event) => {
 new EventSource("/api/events").addEventListener("draft.changed", (event) => {
   const data = JSON.parse(event.data || "{}");
   if (data.did && data.did === state.did) {
-    if (native.enabled || state.phase === "loading" || loading.snapshot().kind === "native") return;
+    if (mlt.playbackId || state.phase === "loading" || loading.snapshot().kind === "mlt") return;
     if (data.source_sha256 && data.source_sha256 === state.sourceSha) return;
     if (data.source_sha256) state.sourceSha = data.source_sha256;
     note("检测到草稿文件被改写，正在重新解密…");
@@ -928,11 +836,12 @@ new EventSource("/api/events").addEventListener("draft.changed", (event) => {
 window.__renderAt = async (tUs) => {
   window.__ready = false;
   try {
-    if (native.enabled) await nativeRenderAt(Number(tUs));
-    else await playbackBackend.renderAt(Number(tUs), true);
+    await renderMltAt(Number(tUs));
+  } catch (error) {
+    enterMltError(String(error && error.message));
   }
-  catch (error) { window.__error = String(error && error.message); }
   while (state.pending) await state.pending;
+  window.__ready = true;
   return state.tUs;
 };
 window.__settle = () => [...document.querySelectorAll("video")].every((video) => {
@@ -950,10 +859,12 @@ window.__settle = () => [...document.querySelectorAll("video")].every((video) =>
   return false;
 });
 window.__state = () => ({ did: state.did, tid: state.tid, tUs: state.tUs, ready: !!window.__ready,
-  playing: state.playing, buffering: state.buffering, phase: state.phase, generation: state.generation,
+  playing: state.playing, buffering: state.phase === "buffering", phase: state.phase,
+  backend: "mlt", playbackId: mlt.playbackId, seekRequestId: mlt.issued,
+  generation: mlt.generation, frameIndex: mlt.frameIndex, fps: state.fps,
+  displayedPtsUs: state.displayedPtsUs, error: state.error || null,
   pending: !!state.pending, ratio: state.ratio, scale: state.scale,
-  backend: native.enabled ? "gstreamer-ges" : "browser",
-  durationUs: state.durationUs, span: state.span, window: state.windowRange,
+  durationUs: state.durationUs, span: state.span,
   media: view.mediaStatus,
   loading: loading.snapshot(),
   pool: view.pool.size, armed: [...view.pool.values()].filter(e => e.armed).length,
@@ -965,8 +876,10 @@ window.__state = () => ({ did: state.did, tid: state.tid, tUs: state.tUs, ready:
 // What the viewer actually sees right now, read off the DOM pool rather than off the IR:
 // the honest way to assert on playback without taking a screenshot.
 window.__snapshot = () => ({
-  tUs: state.tUs, playing: state.playing, buffering: state.buffering, window: state.windowRange,
-  backend: native.enabled ? "gstreamer-ges" : "browser",
+  tUs: state.tUs, playing: state.playing, buffering: state.phase === "buffering",
+  phase: state.phase, backend: "mlt", playbackId: mlt.playbackId,
+  seekRequestId: mlt.issued, generation: mlt.generation, frameIndex: mlt.frameIndex,
+  displayedPtsUs: state.displayedPtsUs, error: state.error || null,
   media: view.mediaStatus,
   loading: loading.snapshot(),
   pool: view.pool.size,
@@ -982,8 +895,8 @@ window.__snapshot = () => ({
   })),
 });
 window.__play = (on) => { togglePlay(on === undefined ? true : !!on); return state.playing; };
-window.__backend = playbackBackend;
-window.__close = () => { void closeNativeBackend(); playbackBackend.close(); };
+window.__backend = mlt;
+window.__close = () => closeMlt();
 
 // Diagnostics: one line per pooled layer, straight out of the DOM bookkeeping.
 window.__layers = () => view.flat.map((entry) => ({
