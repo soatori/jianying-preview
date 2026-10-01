@@ -10,15 +10,39 @@ import os
 from pathlib import Path
 import sys
 import time
+import wave
 
 
 POSITIONS = (0, 15, 3, 30)
 WIDTH, HEIGHT, FPS, FREQUENCY = 300, 180, 30, 48000
+MARKER_BASE, MARKER_STEP, MARKER_FRAMES = 1000, 100, 120
 
 
 def require(ok, message):
     if not ok:
         raise RuntimeError(message)
+
+
+def write_audio_markers(path):
+    """Independent 48 kHz/stereo PCM oracle: one amplitude code per 30 FPS frame."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as output:
+        output.setparams((2, 2, FREQUENCY, 0, "NONE", "not compressed"))
+        for position in range(MARKER_FRAMES):
+            output.writeframes(array("h", [MARKER_BASE + MARKER_STEP * position]
+                                     * (2 * FREQUENCY // FPS)).tobytes())
+
+
+def marker_av_delta(video_position, mixed):
+    """Identify audio time from PCM content, independently of MLT frame metadata."""
+    audio_position = round((sum(mixed) / len(mixed) / 2 - MARKER_BASE) / MARKER_STEP)
+    require(0 <= audio_position < MARKER_FRAMES, "Audio marker frame is out of range")
+    expected = 2 * (MARKER_BASE + MARKER_STEP * audio_position)
+    error = max(abs(actual - expected) for actual in mixed)
+    require(error <= 2, f"Two-lane PCM marker sum differs from expected by {error}")
+    delta = abs(video_position - audio_position)
+    require(delta <= 1, f"Internal A/V offset is {delta} project frames (maximum 1)")
+    return audio_position, error, delta
 
 
 def loaded_audio_api():
@@ -164,7 +188,12 @@ def run_gate(args, result):
     # Three visible RGB bands prove affine scale/translation and both blend hops.
     graph = mlt.Tractor(profile)
     lanes = [producer("color", color) for color in ("#ff0000", "#00ff00", "#0000ff")]
-    audio_lanes = [producer("loader", str(Path(args.audio).resolve())) for _ in range(2)]
+    marker_path = Path(__file__).resolve().parents[3] / "temp" / "mlt-frame-markers.wav"
+    write_audio_markers(marker_path)
+    result["audio_marker_fixture"] = {"path": str(marker_path), "base": MARKER_BASE,
+                                      "step": MARKER_STEP, "frames": MARKER_FRAMES,
+                                      "samples_per_frame": FREQUENCY // FPS}
+    audio_lanes = [producer("loader", str(marker_path)) for _ in range(2)]
     for lane in lanes:
         lane.set("set.test_audio", 1)
     for lane in audio_lanes:
@@ -194,25 +223,39 @@ def run_gate(args, result):
         pixels = rgba(frame, mlt)
         video_position = frame.get_position()
         mixed = pcm(frame, get_audio, mlt)
-        audio_position = frame.get_position()
-        reference = pcm(seek_frame(audio, position), get_audio, mlt)
-        # s16 clips at the output boundary; quantization permits two LSBs.
-        error = max(abs(actual - max(-32768, min(32767, 2 * expected)))
-                    for actual, expected in zip(mixed, reference, strict=True))
-        require(error <= 2, f"Two-lane PCM sum differs from expected by {error}")
+        audio_position, error, delta = marker_av_delta(video_position, mixed)
         probes = [list(pixels[(HEIGHT // 2 * WIDTH + x) * 4:][:4])
                   for x in (WIDTH // 6, WIDTH // 2, WIDTH * 5 // 6)]
         for index, pixel in enumerate(probes):
             require(pixel[index] > 240 and all(pixel[j] < 15 for j in range(3) if j != index),
                     f"Three-layer affine blend failed: {probes}")
-        deltas.append(abs(video_position - audio_position))
+        deltas.append(delta)
         result["frame_positions"].append({"requested": position, "video": video_position,
                                            "audio": audio_position, "pcm_samples": len(mixed),
                                            "pcm_sum_max_error": error})
         result["three_layer_rgba"].append({"position": position, "bytes": len(pixels), "pixels": probes})
     result["max_internal_av_delta_frames"] = max(deltas)
-    result["internal_pts_basis"] = "RGBA and mixed PCM share the returned MLT frame position"
+    result["internal_pts_basis"] = "Video frame position versus independently encoded PCM frame marker"
     require(max(deltas) <= 1, "Internal audio/video PTS differ by more than one project frame")
+
+    # Advance the actual audio sources by two frames; the same gate must reject it.
+    shifted = [lane.cut(2, MARKER_FRAMES - 1) for lane in audio_lanes]
+    for index, lane in enumerate(shifted, 3):
+        require(graph.set_track(lane, index) == 0, "Cannot inject audio offset")
+    offset_frame = seek_frame(graph, 15)
+    rgba(offset_frame, mlt)
+    offset_pcm = pcm(offset_frame, get_audio, mlt)
+    try:
+        marker_av_delta(offset_frame.get_position(), offset_pcm)
+    except RuntimeError as exc:
+        require(str(exc) == "Internal A/V offset is 2 project frames (maximum 1)",
+                f"Offset control failed for a different reason: {exc}")
+        result["audio_offset_selfcheck"] = {"injected_frames": 2, "rejected": True,
+                                           "error": str(exc)}
+    else:
+        raise RuntimeError("Gate accepted an injected two-frame audio offset")
+    for index, lane in enumerate(audio_lanes, 3):
+        require(graph.set_track(lane, index) == 0, "Cannot restore aligned audio")
 
     for speed in (0.5, 2.0, -1.0):
         warped = producer("loader", f"timewarp:{speed}:{Path(args.video).resolve()}")
