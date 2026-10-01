@@ -28,12 +28,12 @@ const deepLink = { did: params.get("draft") || "", timeline: params.get("timelin
                    t: params.get("t") };
 const leaseToken = params.get("lease") || "";
 const mlt = new MltPlaybackClient();
-const display = { objectUrl: "", poll: null, frameChain: Promise.resolve() };
+const display = { objectUrl: "", poll: null, pollBusy: false, frameChain: Promise.resolve() };
 
 const state = {
-  did: null, tid: null, tUs: 0, playing: false, rate: 1, scale: 1,
+  did: null, tid: null, tUs: 0, playing: false, scale: 1,
   ir: null, trackmap: null, describe: null, durationUs: 0, fps: 30, frameDurUs: 33333,
-  lastFetch: 0, pending: null, selected: null, autoSelected: null, lastFolder: "",
+  lastFetch: 0, pending: null, lastFolder: "",
   ratio: params.get("ratio") || "draft", primary: null, span: null, sound: true, zoom: 0,
   // epoch guards local UI work across timeline switches; playback identity lives on mlt.
   epoch: 0, phase: "idle", wantPlaying: false, error: null,
@@ -63,6 +63,7 @@ async function api(path, query = {}, method = "GET") {
 // never drag timeline time backwards.
 
 function syncMltState() {
+  if (state.phase === "error") return;   // sticky: only a timeline re-select leaves the error phase
   state.tUs = mlt.tUs;
   state.phase = mlt.phase;
   state.playing = mlt.playing;
@@ -84,11 +85,13 @@ function enterMltError(message) {
   state.phase = "error";
   state.playing = false;
   state.wantPlaying = false;
+  stopMltPoll();          // no snapshot may clock "playing" over the error
   paintPlay();
 }
 
 async function pollMltSnapshot() {
-  if (!mlt.playbackId) return;
+  if (!mlt.playbackId || display.pollBusy) return;   // never overlap snapshot polls
+  display.pollBusy = true;
   try {
     const result = await mlt.snapshot();
     if (!result.applied) return;
@@ -97,6 +100,8 @@ async function pollMltSnapshot() {
     state.primary = view.primaryAt(state.tUs);
   } catch (error) {
     enterMltError(error.message);
+  } finally {
+    display.pollBusy = false;
   }
 }
 
@@ -651,8 +656,7 @@ function togglePlay(force) {
 }
 
 function refreshPanels(ir) {
-  const shown = state.selected ? findLayer(ir, state.selected) : null;
-  renderProps($("props"), instantCopy(shown || topVisibleLayer()), { raw: true });
+  renderProps($("props"), instantCopy(topVisibleLayer()), { raw: true });
   renderInfo($("info"), ir, state.describe, { cache: state.describe && state.describe.cache });
   $("warnings").replaceChildren(...(ir.warnings || []).map((text) => {
     const li = document.createElement("li");

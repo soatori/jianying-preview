@@ -82,6 +82,22 @@ def main() -> int:
         else:
             raise AssertionError(f"rapid seeks did not settle on the last issued request: {state}")
 
+        # Plan step 6, timestamp-aware frame drops: after the rapid seeks the
+        # displayed frame may lag the backend clock by at most one frame, and
+        # frameIndex must be the canonical frame of what is actually shown.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            state = client.evaluate("window.__state()")
+            shown = state.get("displayedPtsUs")
+            if shown is not None and shown >= state.get("tUs", 0) - frame_dur:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError(f"displayed frame never caught up with the clock: {state}")
+        shown = state["displayedPtsUs"]
+        if state.get("frameIndex") != canonical_frame(shown, fps):
+            raise AssertionError(f"frameIndex does not match the displayed PTS: {state}")
+
         # 4. Playback runs on the backend clock: timestamps advance and are
         #    monotonic within a generation.
         client.evaluate("window.__play(true)")

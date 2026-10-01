@@ -247,13 +247,21 @@ async function reorderedDispatch() {
   installFetch((call) => {
     if (call.url.includes("/api/backend/snapshot")) {
       snapshotCalls += 1;
-      return ok(snapshotCalls === 1
-        ? { backend: "mlt", phase: "paused", playback_id: "pb-2", seek_request_id: 1,
-            generation: 1, frame_index: 300, t_us: 10_000_000, duration_us: 64_000_000,
-            playing: false, error: null, open: true }
-        : { backend: "mlt", phase: "playing", playback_id: "pb-2", seek_request_id: 3,
-            generation: 3, frame_index: 900, t_us: 30_000_000, duration_us: 64_000_000,
-            playing: true, error: null, open: true });
+      if (snapshotCalls === 1) {
+        return ok({ backend: "mlt", phase: "paused", playback_id: "pb-2", seek_request_id: 1,
+          generation: 1, frame_index: 300, t_us: 10_000_000, duration_us: 64_000_000,
+          playing: false, error: null, open: true });
+      }
+      if (snapshotCalls === 2) {
+        return ok({ backend: "mlt", phase: "playing", playback_id: "pb-2", seek_request_id: 3,
+          generation: 3, frame_index: 900, t_us: 30_000_000, duration_us: 64_000_000,
+          playing: true, error: null, open: true });
+      }
+      // In order (rid 3) but with an older PTS: frameIndex must ride the same
+      // monotonic gate as tUs instead of moving backwards alone.
+      return ok({ backend: "mlt", phase: "paused", playback_id: "pb-2", seek_request_id: 3,
+        generation: 3, frame_index: 100, t_us: 5_000_000, duration_us: 64_000_000,
+        playing: false, error: null, open: true });
     }
     if (call.url.includes("/api/backend/close")) return ok({ closed: true });
     throw new Error(`unexpected fetch: ${call.url}`);
@@ -265,6 +273,12 @@ async function reorderedDispatch() {
   assert.equal(fresh.applied, true);
   assert.equal(client.playing, true);
   assert.equal(client.frameIndex, 900);
+
+  const rewound = await client.snapshot();
+  assert.equal(rewound.applied, true, "an in-order snapshot still applies");
+  assert.equal(client.tUs, 30_000_000, "an older PTS must not rewind the clock");
+  assert.equal(client.frameIndex, 900,
+    "an older PTS must not move frameIndex backwards while the clock stays");
 }
 
 async function lateDecodeAfterNewerSeek() {
@@ -350,12 +364,21 @@ async function renderResponses() {
       }) });
     }
     if (call.url.includes("/api/backend/render")) {
+      const rid = Number(queryOf(call).get("request_id"));
       if (mode === "superseded") {
         return json({ ok: false, code: "render_superseded", reason: "identity moved on" },
           { status: 409 });
       }
+      if (mode === "supersededEnded") {
+        // An ended payload answering an older request id: transport must not mutate.
+        return ok({ ended: true, phase: "ended" }, { headers: seekHeaders({
+          playbackId: "pb-4", generation: 1, requestId: rid - 1, frameIndex: 300,
+          ptsUs: 10_000_000,
+        }) });
+      }
       return ok({ ended: true, phase: "ended" }, { headers: seekHeaders({
-        playbackId: "pb-4", generation: 2, requestId: 2, frameIndex: 600, ptsUs: 20_000_000,
+        playbackId: "pb-4", generation: rid, requestId: rid, frameIndex: rid * 300,
+        ptsUs: rid * 10_000_000,
       }) });
     }
     if (call.url.includes("/api/backend/close")) return ok({ closed: true });
@@ -366,8 +389,15 @@ async function renderResponses() {
   assert.equal(superseded.superseded, true, "render 409 must be reported as superseded");
   assert.equal(superseded.blob, undefined);
 
+  mode = "supersededEnded";
+  const staleEnded = await client.renderAt(20_000_000);
+  assert.equal(staleEnded.superseded, true,
+    "an ended payload answering an older request id is superseded");
+  assert.notEqual(client.phase, "ended",
+    "a superseded ended response must not mutate the phase");
+
   mode = "ended";
-  const ended = await client.renderAt(20_000_000);
+  const ended = await client.renderAt(30_000_000);
   assert.equal(ended.ended, true, "an ended render must not be an error");
   assert.equal(client.phase, "ended");
 }
@@ -375,7 +405,7 @@ async function renderResponses() {
 async function selectionEpoch() {
   const firstOpen = deferred();
   let openCount = 0;
-  installFetch((call) => {
+  const calls = installFetch((call) => {
     if (call.url.includes("/api/backend/open")) {
       openCount += 1;
       if (openCount === 1) {
@@ -404,6 +434,10 @@ async function selectionEpoch() {
   assert.equal(client.playbackId, "pb-current", "a late open must not overwrite the selection");
   assert.equal(client.accepts({ playbackId: "pb-late", seekRequestId: 5, generation: 5 }), false,
     "old identity cannot update the new selection");
+  const closed = calls.filter((call) => call.url.includes("/api/backend/close"))
+    .map((call) => queryOf(call).get("playback_id"));
+  assert.ok(closed.includes("pb-late"),
+    "a superseded open must best-effort close the handle it leaked");
 }
 
 async function frameQueueCap() {
@@ -451,6 +485,104 @@ async function frameQueueCap() {
   await client.close();
 }
 
+/** A failed stream must not latch the transport off: the next accepted seek reissues it. */
+async function streamFailureRecoversOnSeek() {
+  const boundary = "frame";
+  const client = await openSeekingClient({ playbackId: "pb-6" });
+  let failing = true;
+  let streamFetches = 0;
+  let streamController = null;
+  const errors = [];
+  const delivered = [];
+  installFetch((call) => {
+    if (call.url.includes("/api/backend/stream")) {
+      streamFetches += 1;
+      if (failing) return new Response("nope", { status: 500 });
+      const stream = new ReadableStream({ start(controller) { streamController = controller; } });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": `multipart/x-mixed-replace; boundary=${boundary}` },
+      });
+    }
+    if (call.url.includes("/api/backend/seek")) {
+      const rid = Number(queryOf(call).get("request_id"));
+      return new Response(null, { status: 200, headers: seekHeaders({
+        playbackId: "pb-6", generation: rid, requestId: rid,
+        frameIndex: rid * 300, ptsUs: rid * 100_000,
+      }) });
+    }
+    if (call.url.includes("/api/backend/close")) return ok({ closed: true });
+    throw new Error(`unexpected fetch: ${call.url}`);
+  });
+
+  client.startStream((frame) => { delivered.push(frame.ptsUs); },
+    (error) => { errors.push(error); });
+  await tick();
+  assert.equal(streamFetches, 1, "startStream must issue the stream fetch");
+  assert.equal(errors.length, 1, "an HTTP-failed stream must report the error");
+
+  // The next accepted seek must re-arm the stream and reissue the fetch.
+  failing = false;
+  await client.seek(200_000);
+  await tick();
+  assert.equal(streamFetches, 2, "a seek after a stream failure must restart the stream");
+  assert.ok(streamController, "the restarted stream must expose a readable body");
+
+  push(streamController, multipartFrame(boundary, {
+    playbackId: "pb-6", generation: 2, requestId: 2, frameIndex: 600, ptsUs: 200_000,
+    payload: Uint8Array.from([7]),
+  }));
+  await tick();
+  assert.deepEqual(delivered, [200_000], "the restarted stream must deliver frames again");
+  assert.equal(errors.length, 1, "the recovery must not report new errors");
+  await client.close();
+}
+
+/** The stream close is a failure only while playback was active, never at ended. */
+async function streamCloseOnlyFailsWhileActive() {
+  const boundary = "frame";
+  const client = await openSeekingClient({ playbackId: "pb-7" });
+  let phase = "ended";
+  const controllers = [];
+  const errors = [];
+  installFetch((call) => {
+    if (call.url.includes("/api/backend/snapshot")) {
+      return ok({ backend: "mlt", phase, playback_id: "pb-7", seek_request_id: 1,
+        generation: 1, frame_index: 300, t_us: 100_000, duration_us: 64_000_000,
+        playing: phase === "playing", error: null, open: true });
+    }
+    if (call.url.includes("/api/backend/stream")) {
+      const stream = new ReadableStream({ start(controller) { controllers.push(controller); } });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": `multipart/x-mixed-replace; boundary=${boundary}` },
+      });
+    }
+    if (call.url.includes("/api/backend/close")) return ok({ closed: true });
+    throw new Error(`unexpected fetch: ${call.url}`);
+  });
+
+  const ended = await client.snapshot();
+  assert.equal(ended.applied, true);
+  assert.equal(client.phase, "ended");
+  client.startStream(() => {}, (error) => { errors.push(error); });
+  await tick();
+  controllers[0].close();
+  await tick();
+  assert.equal(errors.length, 0, "a stream closing at ended is not a failure");
+
+  phase = "playing";
+  const playing = await client.snapshot();
+  assert.equal(playing.applied, true);
+  assert.equal(client.phase, "playing");
+  client.startStream(() => {}, (error) => { errors.push(error); });
+  await tick();
+  controllers[1].close();
+  await tick();
+  assert.equal(errors.length, 1, "a stream closing while playback is active is a failure");
+  await client.close();
+}
+
 async function main() {
   await multipartParsing();
   await reorderedDispatch();
@@ -458,6 +590,8 @@ async function main() {
   await renderResponses();
   await selectionEpoch();
   await frameQueueCap();
+  await streamFailureRecoversOnSeek();
+  await streamCloseOnlyFailsWhileActive();
 
   {
     const layer = { animation: { start_us: 100_000, duration_us: 400_000,

@@ -190,11 +190,13 @@ export class MltPlaybackClient {
     const previous = this.accepted;
     if (requestId !== null) this.accepted = requestId;
     if (ident.generation !== null) this.generation = ident.generation;
-    if (ident.frameIndex !== null) this.frameIndex = ident.frameIndex;
     const pts = ident.ptsUs !== null ? ident.ptsUs : num(data && data.t_us);
-    if (pts !== null) {
-      const moved = requestId !== null && requestId !== previous;
-      if (moved || pts >= this.tUs) this.tUs = pts;    // never run the playhead backwards mid-position
+    const moved = requestId !== null && requestId !== previous;
+    if (pts !== null && (moved || pts >= this.tUs)) {
+      this.tUs = pts;                                  // never run the playhead backwards mid-position
+      // frameIndex rides the same monotonic gate: a late older snapshot must not
+      // move the frame backwards while the clock stays put.
+      if (ident.frameIndex !== null) this.frameIndex = ident.frameIndex;
     }
     if (data && typeof data === "object") {
       if (data.phase) this.phase = String(data.phase);
@@ -229,15 +231,16 @@ export class MltPlaybackClient {
     this.#stopStream();
     const previous = this.playbackId;
     this.#resetIdentity({ draft, timeline });
-    if (previous) {
-      try {
-        await fetch(this.#url("/api/backend/close", { playback_id: previous }), { method: "POST" });
-      } catch (error) { void error; }   // closing the previous handle is best-effort
-    }
+    if (previous) await this.#closeBestEffort(previous);   // closing the previous handle is best-effort
     const { res, data } = await this.#request("POST", "/api/backend/open", { draft, timeline });
-    if (epoch !== this.epoch) return { applied: false, stale: true };
     const body = data && data.snapshot && typeof data.snapshot === "object" ? data.snapshot : data;
     const ident = identityOf(res, body);
+    if (epoch !== this.epoch) {
+      // The discarded open still allocated a backend handle that this.playbackId
+      // will never see; close it best-effort so it cannot linger.
+      await this.#closeBestEffort(ident.playbackId);
+      return { applied: false, stale: true };
+    }
     if (ident.playbackId === null) {
       throw new Error("backend open response is missing playback identity (X-Playback-ID)");
     }
@@ -269,6 +272,14 @@ export class MltPlaybackClient {
       void error;
       return { closed: false };
     }
+  }
+
+  /** Closing a backend handle is best-effort: the caller is discarding it anyway. */
+  async #closeBestEffort(playbackId) {
+    if (!playbackId) return;
+    try {
+      await fetch(this.#url("/api/backend/close", { playback_id: playbackId }), { method: "POST" });
+    } catch (error) { void error; }
   }
 
   async #handle(action) {
@@ -332,8 +343,10 @@ export class MltPlaybackClient {
       const ended = !!(body && (body.ended === true || body.phase === "ended" || /ended/i.test(code)));
       if (ended) {
         const result = this.#apply(identityOf(response, body), body, epoch);
-        this.phase = "ended";
-        this.playing = false;
+        if (result.applied) {          // a superseded response must not mutate transport state
+          this.phase = "ended";
+          this.playing = false;
+        }
         return { ...result, ended: true, requestId };
       }
       if (payload && payload.ok === false) {
@@ -400,7 +413,8 @@ export class MltPlaybackClient {
   }
 
   #streamFailed(error) {
-    this.streamWanted = false;
+    // streamWanted stays set on purpose: the next accepted seek reissues the
+    // stream fetch, so one failure must not leave video dead until a re-select.
     this.#abortStream();
     if (this.onError) { try { this.onError(error); } catch (handlerError) { void handlerError; } }
   }
@@ -439,7 +453,12 @@ export class MltPlaybackClient {
         if (done) break;
         if (value) this.#deliver(parser.push(value), epoch);
       }
-      if (epoch === this.epoch && this.streamWanted && !abort.signal.aborted) {
+      // The Task 4 server keeps the stream open at ended (pulls return None ->
+      // idle; its loop only breaks on client disconnect), so a natural play-to-
+      // end does not close the stream — still, only flag a close while playback
+      // was actually active.
+      if (epoch === this.epoch && this.streamWanted && !abort.signal.aborted
+          && this.phase !== "ended") {
         this.#streamFailed(new Error("stream closed while playback was active"));
       }
     } catch (error) {
