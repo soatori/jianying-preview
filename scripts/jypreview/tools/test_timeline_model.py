@@ -73,10 +73,14 @@ def adapter_assertions():
         assert evaluate(model, 500_000).video[0].source_us == 2_999_999
         for fps, expected in ((None, FrameRate(30)), (29.97, FrameRate(30_000, 1001)),
                               (59.94, FrameRate(60_000, 1001)), (23.976, FrameRate(24_000, 1001)),
-                              ({"num": 30_000, "den": 1001}, FrameRate(30_000, 1001))):
+                              ({"num": 30_000, "den": 1001}, FrameRate(30_000, 1001)),
+                              ({"num": 299699, "den": 10000}, FrameRate(299699, 10000)),
+                              (29.9699, FrameRate(299699, 10000))):
             normalized = build(dict(value, fps=fps), config)
             assert normalized.frame_rate == expected
             assert ("fps_defaulted" in normalized.warnings) == (fps is None)
+        with patch("jypreview.media.probe", return_value=dict(PROBE, frame_rate={"num": 299699, "den": 10000})):
+            assert build(value, config).tracks[0].clips[0].media_ref.frame_rate == FrameRate(299699, 10000)
         # Dictionary mutation after build cannot change any model field.
         value["tracks"][0]["segments"][0]["volume"] = 0
         assert clip.audio.volume == 1.5
@@ -203,6 +207,28 @@ def adapter_assertions():
         assert [p.nested.tracks[0].clips[0].id for p in parents] == ["parent1/child", "parent2/child"]
         assert [p.nested.tracks[0].id for p in parents] == ["parent1/track", "parent2/track"]
         assert [p.nested.id for p in parents] == ["parent1/timeline", "parent2/timeline"]
+        # Repair candidates can already be raw IDs; check each candidate before use.
+        collisions = deepcopy(value)
+        collisions["tracks"] = [dict(value["tracks"][0], id=ident, segments=[]) for ident in ("t@2", "t", "t")]
+        collisions["tracks"][0]["segments"] = [dict(value["tracks"][0]["segments"][0], id=ident)
+                                                 for ident in ("x@0-2", "x", "x", "x@0-2@0-2")]
+        repaired = build(collisions, config)
+        track_ids = [track.id for track in repaired.tracks]
+        clip_ids = [c.id for track in repaired.tracks for c in track.clips]
+        assert len(set(track_ids)) == len(track_ids) == 3
+        assert len(set(clip_ids)) == len(clip_ids) == 4
+        assert clip_ids[:2] == ["x@0-2", "x"] and track_ids[:2] == ["t@2", "t"]
+        assert repaired == build(collisions, config)
+        nested["materials"]["drafts"][0]["draft"] = collisions
+        nested["tracks"][0]["segments"] = [dict(value["tracks"][0]["segments"][0], id=ident, material_id="d")
+                                            for ident in ("p@0-2", "p", "p")]
+        qualified = build(nested, config)
+        nested_track_ids = [track.id for p in qualified.tracks[0].clips for track in p.nested.tracks]
+        nested_clip_ids = [c.id for p in qualified.tracks[0].clips for track in p.nested.tracks for c in track.clips]
+        assert len(set(nested_track_ids)) == len(nested_track_ids) == 9
+        assert len(set(nested_clip_ids)) == len(nested_clip_ids) == 12
+        assert any(note.startswith("duplicate_track_id:") for note in repaired.warnings)
+        assert any(note.startswith("duplicate_clip_id:") for note in repaired.warnings)
         recursive = deepcopy(value)
         recursive["materials"]["drafts"] = [{"id": "d", "draft": recursive}]
         recursive["tracks"][0]["segments"][0]["material_id"] = "d"

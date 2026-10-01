@@ -38,11 +38,10 @@ def _integer(value: Any, default: int = 0) -> int:
 def _rate(value: Any) -> FrameRate | None:
     try:
         if isinstance(value, dict):
-            rate = Fraction(int(value["num"]), int(value.get("den", 1)))
-        else:
-            rate = Fraction(str(value)).limit_denominator(1_000_000)
-        for num in (24_000, 30_000, 60_000):
-            if abs(float(rate) - num / 1001) < 0.001:
+            return FrameRate(int(value["num"]), int(value.get("den", 1)))
+        rate = Fraction(str(value)).limit_denominator(1_000_000)
+        for rounded, num in (("23.976", 24_000), ("29.97", 30_000), ("59.94", 60_000)):
+            if rate == Fraction(rounded):
                 rate = Fraction(num, 1001)
                 break
         return FrameRate(rate.numerator, rate.denominator)
@@ -104,7 +103,8 @@ class DraftAdapter:
             track_id = str(raw_track.get("id") or f"track-{order}")
             track_id = f"{prefix}/{quote(track_id, safe='')}" if prefix else track_id
             if track_id in seen_tracks:
-                track_id += f"@{order}"
+                while track_id in seen_tracks:
+                    track_id += f"@{order}"
                 warnings.append(f"duplicate_track_id:{track_id}")
             seen_tracks.add(track_id)
             kind = str(raw_track.get("type") or "video")
@@ -116,7 +116,8 @@ class DraftAdapter:
                 ident = str(segment.get("id") or f"{track_id}/segment-{position}")
                 ident = f"{prefix}/{quote(ident, safe='')}" if prefix else ident
                 if ident in seen_clips:
-                    ident += f"@{order}-{position}"
+                    while ident in seen_clips:
+                        ident += f"@{order}-{position}"
                     warnings.append(f"duplicate_clip_id:{ident}")
                 seen_clips.add(ident)
                 try:
