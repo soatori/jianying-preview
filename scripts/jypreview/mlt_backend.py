@@ -1,0 +1,426 @@
+"""Compile immutable timeline values into an owned MLT audio/video graph."""
+
+from dataclasses import dataclass, field
+import ctypes
+from math import log10
+
+from .model.content import DEFAULT_RI
+from .model.timeline import FrameRate, TimelineModel, Transform
+
+
+class BackendUnavailable(RuntimeError):
+    """The optional native MLT runtime or required services are unavailable."""
+
+
+@dataclass(frozen=True)
+class RenderedFrame:
+    playback_id: str
+    generation: int
+    seek_request_id: int
+    frame_index: int
+    pts_us: int
+    width: int
+    height: int
+    rgba: bytes
+
+
+@dataclass
+class CompiledTimeline:
+    model: TimelineModel
+    profile: object
+    tractor: object
+    duration_frames: int
+    warnings: tuple[str, ...]
+    _owned: list = field(default_factory=list, repr=False)
+
+    def close(self) -> None:
+        # SWIG owns these references and exposes no close() on these services.
+        self.tractor = None
+        for child in self._owned:
+            if isinstance(child, CompiledTimeline):
+                child.close()
+        self._owned.clear()
+        self.profile = None
+
+
+_repository = None
+_tractor_class = None
+_cache_purge = None
+
+
+def _purge_audio_caches(graph, position):
+    """Worker-only native cache reset for discontinuous source positions."""
+    for decoder, positions in graph._audio_decoders:
+        source = positions.get(position)
+        key = int(decoder.get_service())
+        previous = graph._last_audio_positions.get(key)
+        if source is not None and previous is not None and source != previous + 1:
+            _cache_purge(key)
+
+
+def _tractor(mlt, profile):
+    global _tractor_class, _cache_purge
+    if _tractor_class is None:
+        # ponytail: SWIG omits cache purge; use the loaded C API until bindings expose it.
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        kernel.GetModuleHandleW.restype = ctypes.c_void_p
+        handle = kernel.GetModuleHandleW("libmlt-7.dll")
+        if not handle:
+            raise BackendUnavailable("Loaded MLT DLL is unavailable for decoder cache purge")
+        library = ctypes.CDLL("libmlt-7.dll", handle=handle)
+        purge = library.mlt_service_cache_purge
+        purge.argtypes = [ctypes.c_void_p]
+        purge.restype = None
+        _cache_purge = purge
+
+        class Graph(mlt.Tractor):
+            def __init__(self, profile):
+                super().__init__(profile)
+                self._audio_decoders = []
+                self._last_audio_positions = {}
+
+            def get_frame(self, *args):
+                position = self.position()
+                _purge_audio_caches(self, position)
+                for decoder, positions in self._audio_decoders:
+                    source = positions.get(position)
+                    key = int(decoder.get_service())
+                    self._last_audio_positions[key] = source
+                return super().get_frame(*args)
+
+        _tractor_class = Graph
+    return _tractor_class(profile)
+
+
+class MltCompiler:
+    @staticmethod
+    def _runtime():
+        global _repository
+        try:
+            import mlt7 as mlt
+            if _repository is None:
+                _repository = mlt.Factory().init(None)
+            for kind, names in (("producers", ("loader", "color", "timewarp", "pango")),
+                                ("transitions", ("frei0r.cairoaffineblend", "mix")),
+                                ("filters", ("volume", "frei0r.flippo", "frei0r.alphaspot"))):
+                services = getattr(_repository, kind)()
+                installed = {services.get_name(i) for i in range(services.count())}
+                if not set(names) <= installed:
+                    raise RuntimeError(f"Missing MLT {kind}: {set(names) - installed}")
+            return mlt
+        except Exception as exc:
+            raise BackendUnavailable(f"MLT unavailable: {exc}") from exc
+
+    @staticmethod
+    def available() -> tuple[bool, str]:
+        try:
+            mlt = MltCompiler._runtime()
+            _tractor(mlt, mlt.Profile())
+            return True, f"MLT {mlt.mlt_version_get_string()}"
+        except Exception as exc:
+            return False, str(exc)
+
+    @staticmethod
+    def _profile(mlt, model, rate=None):
+        rate = rate or model.frame_rate
+        width, height = model.canvas
+        profile = mlt.Profile()
+        profile.set_frame_rate(rate.num, rate.den)
+        profile.set_width(width)
+        profile.set_height(height)
+        profile.set_progressive(1)
+        profile.set_sample_aspect(1, 1)
+        profile.set_display_aspect(width, height)
+        profile.set_explicit(1)
+        return profile
+
+    def compile(self, model: TimelineModel) -> CompiledTimeline:
+        if not isinstance(model, TimelineModel):
+            raise TypeError("MltCompiler requires TimelineModel")
+        return self._compile(model, 0)
+
+    def _compile(self, model, depth):
+        mlt = self._runtime()
+        profile = self._profile(mlt, model)
+        count = model.frame_rate.frame_count(model.duration_us)
+        owned, warnings = [], list(model.warnings)
+        compiled = CompiledTimeline(model, profile, None, count, (), owned)
+        if not count:
+            compiled.warnings = tuple(warnings)
+            return compiled
+        try:
+            tractor = _tractor(mlt, profile)
+            compiled.tractor = tractor
+
+            def keep(value):
+                if not value.is_valid():
+                    raise BackendUnavailable("MLT service could not be constructed")
+                owned.append(value)
+                return value
+
+            background = keep(mlt.Producer(profile, "color", "#000000"))
+            background.set("set.test_audio", 1)
+            background.set("length", count)
+            background.set_in_and_out(0, count - 1)
+            tractor.set_track(background, 0)
+            clips = []
+            for ti, track in enumerate(model.tracks):
+                if not track.enabled:
+                    continue
+                for si, clip in enumerate(track.clips):
+                    if not clip.visible:
+                        continue
+                    if clip.kind in ("effect", "filter", "adjust", "none", ""):
+                        warnings.extend(clip.warnings)
+                        warnings.append(f"effect_unsupported:{clip.id}")
+                        continue
+                    z = clip.render_index if clip.render_index is not None else track.render_index
+                    z = DEFAULT_RI.get(track.type, 0) if z is None else z
+                    if clip.kind != "audio" and track.type != "audio":
+                        clips.append((z, ti, si, track, clip, "video"))
+                    if (clip.audio.enabled and not track.muted and clip.kind in
+                            ("audio", "video", "draft", "compound") and
+                            (clip.media_ref is None or clip.media_ref.has_audio is not False)):
+                        clips.append((z, ti, si, track, clip, "audio"))
+            # Higher model z is blended later into MLT's base track (priority reversal).
+            clips.sort(key=lambda row: row[:3])
+            for transition in model.transitions:
+                warnings.extend(transition.warnings)
+                if transition.kind not in ("fade", "crossfade"):
+                    warnings.append(f"transition_unsupported:{transition.id}")
+
+            for _, _, _, track, clip, mode in clips:
+                warnings.extend(clip.warnings)
+                for effect in clip.effects + clip.animations:
+                    warnings.extend(effect.warnings)
+                    if effect.kind not in ("audio_fade_in", "audio_fade_out"):
+                        warnings.append(f"effect_unsupported:{effect.id}")
+                linked = [t for t in model.transitions if t.kind in ("fade", "crossfade")
+                          and clip.id in (t.from_clip_id, t.to_clip_id) and t.window.duration_us]
+                windows = [clip.timeline_range] + [t.window for t in linked if t.kind == "crossfade"]
+                intervals = sorted((model.frame_rate.first_frame_at_or_after(w.start_us),
+                                    min(count, model.frame_rate.first_frame_at_or_after(w.end_us)))
+                                   for w in windows)
+                merged = []
+                for start, end in intervals:
+                    if end <= start:
+                        continue
+                    if merged and start <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+                    else:
+                        merged.append((start, end))
+                if not merged:
+                    continue
+                still = clip.kind in ("image", "photo", "sticker", "text")
+                source_rate = clip.media_ref.frame_rate if clip.media_ref else None
+                source_rate = source_rate or (clip.nested.frame_rate if clip.nested else model.frame_rate)
+                if mode == "audio": source_rate = model.frame_rate
+                mapping = clip.time_mapping
+                speed = mapping.rate_num / mapping.rate_den
+                reverse = mapping.direction == "reverse"
+                broken = clip.placeholder
+                if clip.media_ref is not None and not still and not clip.source_range.duration_us:
+                    warnings.append("source_range_empty")
+                    broken = True
+                producer = None
+                title_size = None
+                if not broken and clip.nested is not None:
+                    if depth >= 2:
+                        warnings.append("max_nest_depth")
+                        broken = True
+                    else:
+                        child = self._compile(clip.nested, depth + 1)
+                        owned.append(child)
+                        warnings.extend(child.warnings)
+                        producer = child.tractor
+                        if producer is None:
+                            broken = True
+                        elif speed != 1 or reverse:
+                            # Native timewarp only accepts a resource; cut mapping handles nested clocks.
+                            warnings.append("nested_time_mapping")
+                elif not broken and clip.kind == "text" and clip.text_payload:
+                    text = clip.text_payload
+                    producer = keep(mlt.Producer(profile, "loader", "pango:"))
+                    for key, value in {"text": text.text, "family": text.font_family or "Sans",
+                                       "size": round(text.font_size), "fgcolour": text.color,
+                                       "bgcolour": "0x00000000", "align": "centre"}.items():
+                        producer.set(key, value)
+                    for key, value in text.style:
+                        if key in ("weight", "style", "underline", "strikethrough", "align"):
+                            producer.set(key, value)
+                    producer.get_frame().get_image(mlt.mlt_image_rgba, *model.canvas)
+                    title_size = (producer.get_int("meta.media.width"), producer.get_int("meta.media.height"))
+                elif not broken and clip.media_ref and clip.media_ref.exists:
+                    if mode == "video" and not still and clip.media_ref.frame_rate is None:
+                        probe = mlt.Producer(profile, "loader", clip.media_ref.path)
+                        owned.append(probe)
+                        if probe.is_valid():
+                            probe.get_frame().get_image(mlt.mlt_image_rgba, *model.canvas)
+                        num, den = probe.get_int("meta.media.frame_rate_num"), probe.get_int("meta.media.frame_rate_den")
+                        if num > 0 and den > 0:
+                            source_rate = FrameRate(num, den)
+                        else:
+                            warnings.append(f"source_frame_rate_unknown:{clip.id}")
+                    source_profile = self._profile(mlt, model, source_rate)
+                    owned.append(source_profile)
+                    resource = clip.media_ref.path
+                    if not still and (speed != 1 or reverse):
+                        # This profile makes each warped position address one native source frame.
+                        warp_rate = source_rate if mode == "audio" else FrameRate(
+                            source_rate.num * mapping.rate_num, source_rate.den * mapping.rate_den)
+                        source_profile = self._profile(mlt, model, warp_rate)
+                        owned.append(source_profile)
+                        resource = f"timewarp:{-speed if reverse else speed}:{resource}"
+                    producer = mlt.Producer(source_profile, "loader", resource)
+                    if producer.is_valid():
+                        producer.seek(0)
+                        frame = producer.get_frame()
+                        if mode == "audio":
+                            broken = producer.get_int("audio_index") < 0
+                        else:
+                            data = frame.get_image(mlt.mlt_image_rgba, *model.canvas)
+                            broken = data is None or frame.get_int("test_image") != 0
+                        owned.append(producer)
+                    else:
+                        broken = True
+                else:
+                    broken = True
+                visual, audio = mode == "video", mode == "audio"
+                if broken:
+                    warnings.append(f"media_placeholder:{clip.id}")
+                    producer = keep(mlt.Producer(profile, "color", "#e040a0"))
+                    audio, still = False, True
+                producer.set_speed(1)
+                decoder = None
+                if audio and clip.media_ref is not None:
+                    producer.seek(0)
+                    decoder_frame = producer.get_frame()
+                    decoder = decoder_frame.get_original_producer()
+                    keep(decoder)
+                    if decoder.get("mlt_service") != "avformat":
+                        raise BackendUnavailable("Decoder cache purge requires a live avformat service")
+                if still:
+                    length = max(count, max(end for _, end in merged))
+                    producer.set("length", length)
+                    producer.set_in_and_out(0, length - 1)
+                lane = keep(mlt.Playlist(profile))
+                lane.set("jypreview.clip_id", clip.id)
+                lane.set("jypreview.track_id", track.id)
+                if not visual: lane.set("hide", 1)
+                if not audio: lane.set("hide", 2 if visual else 3)
+                if audio: lane.set("set.test_audio", 0)
+                positions, weights, volumes = [], {}, {}
+                for start, end in merged:
+                    for pos in range(start, end):
+                        stamp = model.frame_rate.sample_us(pos)
+                        active = [t for t in linked if t.window.contains(stamp)]
+                        handle = any(t.kind == "crossfade" for t in active)
+                        local = stamp - clip.timeline_range.start_us
+                        src = mapping._unclamped_us(local, clip.source_range)
+                        bounds = clip.source_range
+                        available = clip.media_ref.available_range if clip.media_ref else None
+                        if handle and available is not None:
+                            low, high = available.start_us, available.end_us
+                        else:
+                            low, high = bounds.start_us, bounds.end_us
+                            if available is not None:
+                                low, high = max(low, available.start_us), min(high, available.end_us)
+                        if not still and high > low:
+                            bounded = min(max(src, low), high - 1)
+                            if bounded != src:
+                                warnings.append("transition_handle_clamped" if handle else "source_time_clamped")
+                            src = bounded
+                        elif not still:
+                            warnings.append("source_range_empty")
+                            src = 0
+                        native = source_rate.quantize(max(0, src))[0]
+                        if audio and clip.media_ref is not None and (speed != 1 or reverse):
+                            native = (max(0,src) * source_rate.num * mapping.rate_den
+                                      // (1_000_000 * source_rate.den * mapping.rate_num))
+                        if clip.nested is not None and not broken:
+                            source_pos = min(native, producer.get_out())
+                        elif still:
+                            source_pos = pos - merged[0][0]
+                        else:
+                            source_pos = producer.get_out() - native if reverse else native
+                            source_pos = max(0, min(source_pos, producer.get_out()))
+                        positions.append((pos, source_pos))
+                        weight = 1.0
+                        for transition in active:
+                            progress = (stamp - transition.window.start_us) / transition.window.duration_us
+                            weight *= 1 - progress if clip.id == transition.from_clip_id else progress
+                        weights[pos] = clip.opacity * weight
+                        gain = clip.audio.volume * weight
+                        for effect in clip.effects:
+                            if effect.window and effect.window.contains(stamp) and effect.window.duration_us:
+                                progress = (stamp - effect.window.start_us) / effect.window.duration_us
+                                if effect.kind == "audio_fade_in": gain *= progress
+                                elif effect.kind == "audio_fade_out": gain *= 1 - progress
+                        volumes[pos] = gain
+                if decoder is not None:
+                    tractor._audio_decoders.append((decoder, dict(positions)))
+                # ponytail: scan project samples once at compile time; group consecutive cuts.
+                # Add piecewise rational runs only if large timelines make compilation expensive.
+                cursor, i = 0, 0
+                while i < len(positions):
+                    pos, source_pos = positions[i]
+                    if pos > cursor: lane.blank(pos - cursor - 1)
+                    j = i + 1
+                    while j < len(positions) and positions[j] == (pos + j-i, source_pos + j-i):
+                        j += 1
+                    lane.append(producer, source_pos, source_pos + j-i-1)
+                    cursor = pos + j-i
+                    i = j
+                if cursor < count: lane.blank(count - cursor - 1)
+                if audio:
+                    gain_filter = keep(mlt.Filter(profile, "volume"))
+                    if all(value == clip.audio.volume for value in volumes.values()):
+                        gain_filter.set("gain", clip.audio.volume)
+                    else:
+                        gain_filter.set("level", ";".join(f"{pos}={20*log10(max(gain,1e-10))}"
+                                                           for pos,gain in volumes.items()))
+                    lane.attach(gain_filter)
+                if visual:
+                    if clip.crop != (0, 0, 1, 1):
+                        left, top, right, bottom = clip.crop
+                        mask = keep(mlt.Filter(profile, "frei0r.alphaspot"))
+                        for key,value in {"0":0.0,"1":(left+right)/2,"2":(top+bottom)/2,
+                                           "3":(right-left)/2,"4":(bottom-top)/2,
+                                           "5":.5,"6":0,"7":0,"8":1,"9":.5}.items():
+                            mask.set(key,value)
+                        lane.attach(mask)
+                    if clip.transform.flip_x or clip.transform.flip_y:
+                        flip = keep(mlt.Filter(profile, "frei0r.flippo"))
+                        flip.set("0", int(clip.transform.flip_x)); flip.set("1", int(clip.transform.flip_y))
+                        lane.attach(flip)
+                index = tractor.multitrack().count()
+                tractor.set_track(lane, index)
+                if visual:
+                    blend = keep(mlt.Transition(profile, "frei0r.cairoaffineblend"))
+                    width, height = model.canvas
+                    t = clip.transform
+                    if t == Transform():
+                        tw, th = title_size or (width, height)
+                        t = Transform(width/2, height/2, tw or width, th or height)
+                    for key,value in {"0":.4+t.x/(5*width),"1":.4+t.y/(5*height),
+                                       "2":(t.width or width)*t.scale_x/(5*width),
+                                       "3":(t.height or height)*t.scale_y/(5*height),
+                                       "4":(t.rotation%360)/360,"5":clip.opacity,"6":clip.blend_mode,
+                                       "7":t.anchor_x,"8":t.anchor_y,"always_active":1}.items():
+                        blend.set(key,value)
+                    if linked:
+                        blend.set("5", ";".join(f"{pos}={value}" for pos,value in weights.items()))
+                    tractor.plant_transition(blend, 0, index)
+                if audio:
+                    mix = keep(mlt.Transition(profile, "mix"))
+                    mix.set("sum", 1); mix.set("always_active", 1)
+                    tractor.plant_transition(mix, 0, index)
+            tractor.set("length", count)
+            tractor.set_in_and_out(0, count - 1)
+            tractor.set_speed(1)
+            compiled.warnings = tuple(dict.fromkeys(warnings))
+            return compiled
+        except Exception:
+            compiled.close()
+            raise
