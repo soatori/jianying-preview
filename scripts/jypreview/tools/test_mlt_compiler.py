@@ -2,6 +2,7 @@
 
 from array import array
 from contextlib import contextmanager
+import ctypes
 from dataclasses import FrozenInstanceError, replace
 import os
 from pathlib import Path
@@ -76,6 +77,69 @@ def pixel(data, x=W//2, y=H//2):
 def color(compiled, position, expected, x=W//2, y=H//2):
     actual = pixel(pixels(compiled, position), x, y)
     assert all(abs(a-b) <= 3 for a, b in zip(actual[:3], expected)), (position, actual, expected)
+
+
+def review_regressions(compiler, video, marker_media, mlt, get_audio):
+    def marker_read(graph, position, expected):
+        graph.tractor.seek(position)
+        frame = graph.tractor.get_frame()
+        pointer = ctypes.c_void_p()
+        rate = graph.model.frame_rate
+        count = round(48000 * rate.den / rate.num)
+        fmt, frequency, channels, samples = (ctypes.c_int(v) for v in (mlt.mlt_audio_s16,48000,2,count))
+        assert get_audio(int(frame.get_frame()),ctypes.byref(pointer),ctypes.byref(fmt),
+                         ctypes.byref(frequency),ctypes.byref(channels),ctypes.byref(samples)) == 0
+        assert samples.value == count and not frame.get_int("test_audio")
+        values = array("h",ctypes.string_at(pointer,samples.value*channels.value*2))
+        assert max(abs(v-expected) for v in values) <= 2, (position,expected,min(values),max(values))
+
+    marker = Clip("marker","audio",TimeRange(0,300_000),TimeRange(0,300_000),marker_media)
+    def gap_and_lazy_history():
+        graph = compiler.compile(model(Track("t","audio",(marker,))))
+        marker_read(graph,3,1300)
+        pixels(graph,15)  # Inactive lane must retain the last consumed source position.
+        assert set(graph.tractor._last_audio_positions.values()) == {3}
+        marker_read(graph,7,1700)
+        marker_read(graph,3,1300)
+        pixels(graph,6)   # Pulling an image must not claim that frame 6 PCM was consumed.
+        assert set(graph.tractor._last_audio_positions.values()) == {3}
+        marker_read(graph,7,1700)
+        graph.close()
+
+    child = model(Track("audio","audio",(replace(marker,timeline_range=TimeRange(0,1_000_000),
+                                              source_range=TimeRange(0,1_000_000)),)))
+    compound = Clip("child","compound",TimeRange(0,1_000_000),TimeRange(0,1_000_000),nested=child)
+    def nested_discontinuities():
+        for mapping in (TimeMapping(),TimeMapping(2)):
+            graph = compiler.compile(model(Track("compound","compound",(replace(compound,time_mapping=mapping),))))
+            for pos in (0,1,3,7,2):
+                wanted = FPS.quantize(mapping.source_us(FPS.sample_us(pos),compound.source_range))[0]
+                marker_read(graph,pos,1000+100*wanted)
+            graph.close()
+
+    def nested_frame_rates():
+        graph = compiler.compile(model(Track("compound","compound",(compound,)),rate=FrameRate(24)))
+        marker_read(graph,12,2500)  # Parent 12 at 24 FPS is child 15 at 30 FPS.
+        marker_read(graph,3,1300)
+        graph.close()
+
+    def unavailable_intersection():
+        missing = Clip("disjoint","video",TimeRange(0,1_000_000),TimeRange(0,500_000),
+                       replace(video,available_range=TimeRange(1_000_000,500_000)))
+        graph = compiler.compile(model(Track("video","video",(missing,))))
+        assert "source_range_unavailable" in graph.warnings
+        color(graph,0,(224,64,160))
+        graph.tractor.seek(0); frame=graph.tractor.get_frame()
+        pointer=ctypes.c_void_p(); values=[ctypes.c_int(v) for v in (mlt.mlt_audio_s16,48000,2,1600)]
+        assert get_audio(int(frame.get_frame()),ctypes.byref(pointer),*(ctypes.byref(v) for v in values)) == 0
+        assert not any(array("h",ctypes.string_at(pointer,values[2].value*values[3].value*2)))
+        graph.close()
+
+    failures=[]
+    for check in (gap_and_lazy_history,nested_discontinuities,nested_frame_rates,unavailable_intersection):
+        try: check()
+        except (AssertionError,RuntimeError) as exc: failures.append(f"{check.__name__}: {exc}")
+    assert not failures, "\n".join(failures)
 
 
 def main():
@@ -234,8 +298,9 @@ def main():
             graph.tractor.seek(pos); values = pcm(graph.tractor.get_frame(),get_audio,mlt)
             wanted = FPS.quantize(mapping.source_us(FPS.sample_us(pos),marker.source_range))[0]
             assert abs(sum(values)/len(values) - (1000+100*wanted)) <= 101, (mapping,pos,wanted,min(values),max(values))
-        graph.close()
+    graph.close()
     # Fade and crossfade use the same half-open window; missing handles freeze.
+    review_regressions(compiler,video,marker_media,mlt,get_audio)
     left = picture("left",red,duration=500_000)
     right = picture("right",blue,start=500_000,duration=500_000,z=1)
     cross = Transition("cross","crossfade",TimeRange(400_000,200_000),"left","right")

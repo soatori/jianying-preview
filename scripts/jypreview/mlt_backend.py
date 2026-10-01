@@ -50,11 +50,16 @@ _cache_purge = None
 
 def _purge_audio_caches(graph, position):
     """Worker-only native cache reset for discontinuous source positions."""
+    if graph._audio_frame is not None:
+        frame, sources = graph._audio_frame
+        if frame.get_int("audio_samples") and not frame.get_int("test_audio"):
+            graph._last_audio_positions.update(sources)
+            graph._audio_frame = None
     for decoder, positions in graph._audio_decoders:
         source = positions.get(position)
         key = int(decoder.get_service())
         previous = graph._last_audio_positions.get(key)
-        if source is not None and previous is not None and source != previous + 1:
+        if source is not None and (previous is None or source != previous + 1):
             _cache_purge(key)
 
 
@@ -79,15 +84,17 @@ def _tractor(mlt, profile):
                 super().__init__(profile)
                 self._audio_decoders = []
                 self._last_audio_positions = {}
+                self._audio_frame = None
 
             def get_frame(self, *args):
                 position = self.position()
                 _purge_audio_caches(self, position)
-                for decoder, positions in self._audio_decoders:
-                    source = positions.get(position)
-                    key = int(decoder.get_service())
-                    self._last_audio_positions[key] = source
-                return super().get_frame(*args)
+                frame = super().get_frame(*args)
+                sources = {int(decoder.get_service()): positions[position]
+                           for decoder, positions in self._audio_decoders if position in positions}
+                # Retain the last lazy frame until the next serialized pull observes PCM consumption.
+                self._audio_frame = (frame, sources)
+                return frame
 
         _tractor_class = Graph
     return _tractor_class(profile)
@@ -215,7 +222,7 @@ class MltCompiler:
                 still = clip.kind in ("image", "photo", "sticker", "text")
                 source_rate = clip.media_ref.frame_rate if clip.media_ref else None
                 source_rate = source_rate or (clip.nested.frame_rate if clip.nested else model.frame_rate)
-                if mode == "audio": source_rate = model.frame_rate
+                if mode == "audio" and clip.nested is None: source_rate = model.frame_rate
                 mapping = clip.time_mapping
                 speed = mapping.rate_num / mapping.rate_den
                 reverse = mapping.direction == "reverse"
@@ -223,6 +230,11 @@ class MltCompiler:
                 if clip.media_ref is not None and not still and not clip.source_range.duration_us:
                     warnings.append("source_range_empty")
                     broken = True
+                if clip.media_ref is not None and not still and clip.media_ref.available_range is not None:
+                    available = clip.media_ref.available_range
+                    if max(clip.source_range.start_us, available.start_us) >= min(clip.source_range.end_us, available.end_us):
+                        warnings.append("source_range_unavailable")
+                        broken = True
                 producer = None
                 title_size = None
                 if not broken and clip.nested is not None:
@@ -360,6 +372,10 @@ class MltCompiler:
                         volumes[pos] = gain
                 if decoder is not None:
                     tractor._audio_decoders.append((decoder, dict(positions)))
+                elif audio and clip.nested is not None:
+                    for descendant, child_positions in producer._audio_decoders:
+                        mapped = {pos: child_positions[source] for pos,source in positions if source in child_positions}
+                        tractor._audio_decoders.append((descendant, mapped))
                 # ponytail: scan project samples once at compile time; group consecutive cuts.
                 # Add piecewise rational runs only if large timelines make compilation expensive.
                 cursor, i = 0, 0
