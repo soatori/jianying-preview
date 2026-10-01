@@ -137,7 +137,11 @@ async def render(request: web.Request) -> web.Response:
         return JSON({"ended": True, "snapshot": state})
     if state["error"]:
         return error_payload("mlt_render_failed", state["error"], status=500)
-    frame = await handle.call("pull_frame", 500)
+    try:
+        frame = await handle.call("pull_frame", 500)
+    except RuntimeError as exc:
+        # A dying sink raises here; surface it as the render failure it is.
+        return error_payload("mlt_render_failed", str(exc), status=500)
     if frame is None:
         return error_payload("mlt_frame_unavailable", "no frame is available", status=503)
     if frame.playback_id != handle.playback_id or frame.seek_request_id != request_id:
