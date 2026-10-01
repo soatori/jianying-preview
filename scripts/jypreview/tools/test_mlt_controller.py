@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import struct
 import threading
 import time
@@ -11,7 +12,7 @@ from array import array
 from pathlib import Path
 from typing import cast
 
-from jypreview.mlt_backend import PlaybackController
+from jypreview.mlt_backend import PlaybackController, _stop_consumer
 from jypreview.model.timeline import (
     Clip,
     FrameRate,
@@ -212,7 +213,8 @@ def consumer_failure_and_reopen(long_model, playback_id):
     controller.play()
     controller.pull_frame(3_000)
     assert controller.snapshot()["phase"] == "playing"
-    controller._consumer.stop()  # simulate a consumer dying mid-playback
+    if controller._consumer is not None:
+        _stop_consumer(controller._consumer)  # simulate a consumer dying mid-playback
     failed = controller.snapshot()
     assert failed["phase"] == "error" and failed["error"], failed
     assert failed["playing"] is False
@@ -242,6 +244,7 @@ def end_of_stream(short_model):
     playback_id = controller.open(short_model)["playback_id"]
     controller.play()
     deadline = time.monotonic() + 10
+    snap = {}
     while time.monotonic() < deadline:
         controller.pull_frame(50)
         snap = controller.snapshot()
@@ -257,6 +260,28 @@ def end_of_stream(short_model):
     assert settled["phase"] == "ready" and settled["frame_index"] == 0
     assert settled["t_us"] == 0 and settled["error"] is None
     controller.close()
+
+
+def worker_lifecycle(short_model):
+    """close() must retire the worker; open/close cycles must not leak threads."""
+    baseline = threading.active_count()
+    for _ in range(5):
+        controller = PlaybackController()
+        controller.open(short_model)
+        controller.close()
+        controller.close()  # idempotent second close is a no-op
+    # A failed open still owns a live worker; close must retire it too.
+    failing = PlaybackController()
+    must_raise(failing.open, "not a timeline")
+    failing.close()
+    deadline = time.monotonic() + 5
+    while threading.active_count() > baseline and time.monotonic() < deadline:
+        time.sleep(0.02)
+    leftover = [t for t in threading.enumerate() if t.name == "jypreview-playback"]
+    assert not leftover, f"worker threads leaked: {leftover}"
+    assert threading.active_count() <= baseline + 1, (baseline, threading.active_count())
+    print(f"ok: {5 + 1} open/close cycles retired all workers; "
+          f"active_count {baseline} -> {threading.active_count()}")
 
 
 async def _read_until(stream, marker: bytes) -> bytes:
@@ -354,6 +379,7 @@ async def endpoint_acceptance(model):
                                                                     t_us="1000000", request_id="9"))
         wrong_body = await wrong.json()
         assert wrong.status == 409 and wrong_body["code"] == "stale_playback_id", (wrong.status, wrong_body)
+        assert "expected" not in wrong_body["data"], "stale id must not echo the current credential"
 
         rendered = await client.get("/api/backend/render", params=dict(q, request_id="3"))
         assert rendered.status == 200 and rendered.content_type == "image/png", rendered.status
@@ -460,6 +486,60 @@ async def endpoint_acceptance(model):
         assert paused.status == 200 and p2["phase"] == "paused", (paused.status, p2)
         assert p2["playing"] is False, p2
 
+        # Live stream: while playing the multipart source emits continuous parts
+        # whose X-Project-Frame advances (bounded read with a timeout guard).
+        playing2 = await client.post("/api/backend/play", params=q2)
+        assert playing2.status == 200, playing2.status
+        live_state = {}
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            live_state = (await (await client.get("/api/backend/snapshot", params=q2)).json())["data"]
+            if live_state["phase"] == "playing":
+                break
+            await asyncio.sleep(0.02)
+        assert live_state["phase"] == "playing", live_state
+
+        live = await client.get("/api/backend/stream", params=q2)
+        assert live.status == 200, live.status
+        assert live.headers["Content-Type"].startswith("multipart/x-mixed-replace"), live.headers["Content-Type"]
+        live_frames = []
+        read_deadline = time.monotonic() + 1.0
+        while time.monotonic() < read_deadline and len(live_frames) < 10:
+            try:
+                head = await asyncio.wait_for(_read_until(live.content, b"\r\n\r\n"), timeout=3)
+            except asyncio.TimeoutError:
+                break
+            part = {}
+            for line in head.split(b"\r\n"):
+                if not line or line.startswith(b"--"):
+                    continue  # boundary marker / blank separator
+                name, sep, value = line.partition(b": ")
+                assert sep, line
+                part[name.decode()] = value.decode()
+            live_frames.append(int(part["X-Project-Frame"]))
+            await asyncio.wait_for(live.content.readexactly(int(part["Content-Length"])), timeout=3)
+        assert len(set(live_frames)) >= 2, f"stream starved during play: {live_frames}"
+        assert live_frames == sorted(live_frames), f"frame index regressed: {live_frames}"
+        assert live_frames[-1] > live_frames[0], live_frames
+        print(f"ok: live stream {len(set(live_frames))} distinct advancing frames "
+              f"{live_frames[0]}..{live_frames[-1]}")
+
+        # Killing the sink while the stream is open must terminate it with a
+        # logged error instead of idling forever on pull_frame() -> None.
+        handle = app["playback_backends"]["fake-draft:timeline-acceptance"]
+        _stop_consumer(handle.controller._consumer)
+        tail = None
+        with contextlib.suppress(asyncio.TimeoutError):
+            tail = await asyncio.wait_for(live.content.read(), timeout=5)
+        live.close()
+        assert tail is not None, "stream never terminated after consumer failure"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not any(
+                "mlt stream" in line and "playback failed" in line for line in app["log"]):
+            await asyncio.sleep(0.05)
+        assert any("mlt stream" in line and "playback failed" in line
+                   for line in app["log"]), app["log"]
+
         # A late client from the first session cannot touch or close its replacement.
         for method, path, extra in (("get", "/api/backend/snapshot", {}),
                                     ("post", "/api/backend/seek", {"t_us": "1000000", "request_id": "7"}),
@@ -495,6 +575,7 @@ def main():
     controller.close()
     consumer_failure_and_reopen(long_model, playback_id)
     end_of_stream(short_model)
+    worker_lifecycle(short_model)
     print("ok: playback controller phase, identity, and clock regressions")
     asyncio.run(endpoint_acceptance(long_model))
     print("ok: MLT playback endpoint acceptance")

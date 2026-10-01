@@ -9,10 +9,11 @@ production time so a client can discard frames its own requests superseded.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 from concurrent.futures import ThreadPoolExecutor
 
-from aiohttp import web
+from aiohttp import web  # type: ignore[import-not-found]  # present in the runtime env, not the analyzer's
 
 from ..mlt_backend import BackendUnavailable, MltCompiler, PlaybackController
 from ._http import JSON, error_payload, offload, selector, session_of
@@ -115,8 +116,9 @@ async def _open_handle(request: web.Request) -> web.Response | PlaybackHandle:
     if not playback_id:
         return error_payload("invalid_playback_id", "missing ?playback_id", status=400)
     if playback_id != handle.playback_id:
+        # Do not echo the current credential back to an excluded caller.
         return error_payload("stale_playback_id", "playback_id does not match the open session",
-                             status=409, expected=handle.playback_id)
+                             status=409)
     return handle
 
 
@@ -224,10 +226,8 @@ async def stream(request: web.Request) -> web.StreamResponse:
     except Exception as exc:  # noqa: BLE001
         request.app["log"].append(f"mlt stream: {exc.__class__.__name__}: {exc}")
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await response.write_eof()
-        except Exception:
-            pass
     return response
 
 

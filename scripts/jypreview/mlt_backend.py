@@ -53,6 +53,67 @@ _repository = None
 _tractor_class = None
 _cache_purge = None
 _sink_name = None
+_libmlt_cache = None
+_natives_configured = False
+
+# (properties, listener_data, event_data) as MLT fires it; event_data carries the frame.
+_Listener = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+
+
+def _libmlt() -> ctypes.CDLL:
+    """The already-loaded libmlt-7, for C entry points SWIG does not expose."""
+    global _libmlt_cache
+    if _libmlt_cache is None:
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        kernel.GetModuleHandleW.restype = ctypes.c_void_p
+        handle = kernel.GetModuleHandleW("libmlt-7.dll")
+        if not handle:
+            raise BackendUnavailable("Loaded MLT DLL is unavailable")
+        _libmlt_cache = ctypes.CDLL("libmlt-7.dll", handle=handle)
+    return _libmlt_cache
+
+
+def _natives() -> ctypes.CDLL:
+    """libmlt entry points invoked with the GIL released.
+
+    ctypes drops the GIL around each call, which is what lets MLT join the
+    threads that fire the Python frame listener while a stop() in progress
+    holds it: the listener can always acquire the GIL, so the join completes.
+    The equivalent SWIG call holds the GIL for the whole join and would
+    deadlock against a pending listener.
+    """
+    global _natives_configured
+    lib = _libmlt()
+    if not _natives_configured:
+        lib.mlt_consumer_start.argtypes = [ctypes.c_void_p]
+        lib.mlt_consumer_start.restype = ctypes.c_int
+        lib.mlt_consumer_stop.argtypes = [ctypes.c_void_p]
+        lib.mlt_consumer_stop.restype = ctypes.c_int
+        lib.mlt_events_listen.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                          ctypes.c_char_p, ctypes.c_void_p]
+        lib.mlt_events_listen.restype = ctypes.c_void_p
+        lib.mlt_event_close.argtypes = [ctypes.c_void_p]
+        lib.mlt_event_close.restype = None
+        lib.mlt_event_data_to_frame.argtypes = [ctypes.c_void_p]
+        lib.mlt_event_data_to_frame.restype = ctypes.c_void_p
+        lib.mlt_frame_get_position.argtypes = [ctypes.c_void_p]
+        lib.mlt_frame_get_position.restype = ctypes.c_int64
+        lib.mlt_frame_get_image.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                                            ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        lib.mlt_frame_get_image.restype = ctypes.c_int
+        _natives_configured = True
+    return lib
+
+
+def _start_consumer(consumer) -> int:
+    return _natives().mlt_consumer_start(int(consumer.get_consumer()))
+
+
+def _stop_consumer(consumer) -> int:
+    """Stop the sink and join its frame-show threads (see _natives)."""
+    return _natives().mlt_consumer_stop(int(consumer.get_consumer()))
 
 
 def _purge_audio_caches(graph, position):
@@ -74,14 +135,7 @@ def _tractor(mlt, profile):
     global _tractor_class, _cache_purge
     if _tractor_class is None:
         # ponytail: SWIG omits cache purge; use the loaded C API until bindings expose it.
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
-        kernel.GetModuleHandleW.restype = ctypes.c_void_p
-        handle = kernel.GetModuleHandleW("libmlt-7.dll")
-        if not handle:
-            raise BackendUnavailable("Loaded MLT DLL is unavailable for decoder cache purge")
-        library = ctypes.CDLL("libmlt-7.dll", handle=handle)
-        purge = library.mlt_service_cache_purge
+        purge = _libmlt().mlt_service_cache_purge
         purge.argtypes = [ctypes.c_void_p]
         purge.restype = None
         _cache_purge = purge
@@ -479,11 +533,19 @@ class PlaybackController:
         self._consumer: Any = None
         self._mlt = None
         self._width = self._height = 0
-        threading.Thread(target=self._run, name="jypreview-playback", daemon=True).start()
+        # Live frame source: a consumer-frame-show listener stamps frames from
+        # the sink's own thread while the transport plays.
+        self._frame_event: Any = None
+        self._frame_listener: Any = None
+        self._worker: threading.Thread | None = None
+        self._spawn()
 
     # -- public API -----------------------------------------------------
 
     def open(self, model: TimelineModel) -> dict[str, Any]:
+        if self._worker is None or not self._worker.is_alive():
+            # close() retired the worker; a reopen needs a fresh one.
+            self._spawn()
         return self._submit(self._h_open, model)
 
     def play(self) -> dict[str, Any]:
@@ -499,23 +561,40 @@ class PlaybackController:
         return self._submit(self._h_snapshot)
 
     def close(self) -> None:
-        self._submit(self._h_close)
+        """Shut down and retire the worker thread; safe to call repeatedly."""
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            try:
+                self._submit(self._h_close)
+            finally:
+                worker.join(timeout=5)
 
     def pull_frame(self, timeout_ms: int = 100) -> RenderedFrame | None:
-        _, intent = self._submit(self._h_prepare_pull)
+        phase, intent = self._submit(self._h_prepare_pull)
+        if phase == "error":
+            # Surface a dead sink instead of returning None forever so callers
+            # (the multipart stream) can terminate with a readable error.
+            raise RuntimeError(f"playback failed: {self._error}")
+        # Capture before any buffering wait: the frame-show listener advances
+        # the slot while playing, but a pull right after a seek must return the
+        # accepted seek target rather than a frame past it.  Steady-state pulls
+        # skip the wait entirely, so they still read the live frame.
+        frame = self._frame_slot
         end = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
         if intent:
             while self._phase == "buffering" and time.monotonic() < end:
                 time.sleep(0.005)
-        while True:
+        while frame is None and time.monotonic() < end:
             frame = self._frame_slot
-            if frame is not None:
-                return frame
-            if time.monotonic() >= end:
-                return None
-            time.sleep(0.005)
+            if frame is None:
+                time.sleep(0.005)
+        return frame
 
     # -- worker plumbing ------------------------------------------------
+
+    def _spawn(self) -> None:
+        self._worker = threading.Thread(target=self._run, name="jypreview-playback", daemon=True)
+        self._worker.start()
 
     def _run(self) -> None:
         while True:
@@ -537,8 +616,17 @@ class PlaybackController:
                 reply.put(("err", exc))
             else:
                 reply.put(("ok", result))
+            if handler == self._h_close:
+                # Poison pill: close() joins this worker before returning.
+                # (Bound methods are rebuilt per access, so compare with ==).
+                return
 
     def _submit(self, handler, *args):
+        worker = self._worker
+        if worker is None or not worker.is_alive():
+            # Retired worker means the controller is idle, so a read-only or
+            # rejecting handler is safe to run on the caller's thread.
+            return handler(*args)
         reply: queue.Queue = queue.Queue(maxsize=1)
         self._commands.put((handler, args, reply))
         kind, payload = reply.get()
@@ -586,6 +674,7 @@ class PlaybackController:
         self._open = True
         self._phase = "ready"
         tractor.capture = self._capture
+        self._listen(consumer)
         if tractor.seek(0) != 0:
             raise RuntimeError("MLT seek to the first frame failed")
         tractor.get_frame()
@@ -611,7 +700,7 @@ class PlaybackController:
         self._settle()
         self._intent = True
         if self._consumer is not None and self._consumer.is_stopped() \
-                and self._consumer.start() != 0:
+                and _start_consumer(self._consumer) != 0:
             raise RuntimeError("MLT consumer failed to start playback")
         self._phase = "buffering"
         return self._snapshot()
@@ -621,7 +710,7 @@ class PlaybackController:
         self._settle()
         self._intent = False
         if self._consumer is not None and not self._consumer.is_stopped():
-            self._consumer.stop()
+            _stop_consumer(self._consumer)
         self._phase = "paused"
         return self._snapshot()
 
@@ -640,7 +729,7 @@ class PlaybackController:
             raise ValueError("t_us must be an integer microsecond position") from None
         # Quiesce the consumer before mutating identity so no frame can stamp late.
         if self._consumer is not None and not self._consumer.is_stopped():
-            self._consumer.stop()
+            _stop_consumer(self._consumer)
         self._generation += 1
         self._seek_request_id = request_id
         self._frame_slot = None
@@ -699,35 +788,42 @@ class PlaybackController:
         self._frame_index = frame
         self._t_us = sample
         self._phase = "buffering" if self._intent else "ready"
-        if self._intent and consumer.is_stopped() and consumer.start() != 0:
+        if self._intent and consumer.is_stopped() and _start_consumer(consumer) != 0:
             raise RuntimeError("MLT consumer failed to resume after seek")
 
     def _end_of_stream(self) -> None:
+        # Stop first so the frame-show listener is quiesced before clearing the slot.
+        if self._consumer is not None and not self._consumer.is_stopped():
+            _stop_consumer(self._consumer)
         self._intent = False
         self._phase = "ended"
         self._frame_slot = None
-        if self._consumer is not None and not self._consumer.is_stopped():
-            self._consumer.stop()
 
     def _fail(self, exc) -> None:
         self._phase = "error"
         self._error = str(exc) or exc.__class__.__name__
         self._intent = False
-        self._frame_slot = None
         if self._consumer is not None:
             with suppress(Exception):
-                self._consumer.stop()
+                _stop_consumer(self._consumer)
+        self._frame_slot = None
 
     def _shutdown(self) -> None:
         if self._consumer is not None:
             with suppress(Exception):
-                self._consumer.stop()
+                _stop_consumer(self._consumer)
+        # Do not mlt_event_close here: the consumer destructor already releases
+        # its listener registrations, and closing first double-frees the event.
+        self._frame_event = None
         if self._compiled is not None:
             tractor: Any = self._compiled.tractor
             if tractor is not None:
                 tractor.capture = None
             self._compiled.close()
         self._consumer = None
+        # Free the callback thunk only after the consumer (the sole frame-show
+        # source) is gone, so its destructor can never run freed memory.
+        self._frame_listener = None
         self._compiled = None
         self._mlt = None
         self._frame_slot = None
@@ -745,14 +841,54 @@ class PlaybackController:
         self._duration_frames = 0
 
     def _capture(self, mlt_frame) -> None:
+        """Worker-side stamp from a tractor pull (seek/open, consumer stopped)."""
+        self._stamp(mlt_frame.get_position(),
+                    bytes(mlt_frame.get_image(self._mlt.mlt_image_rgba,
+                                              self._width, self._height)))
+
+    def _listen(self, consumer) -> None:
+        """Stamp frames from the sink's frame-show thread during playback.
+
+        The audio consumer is the master clock, so its own thread is the only
+        place a continuous frame index can be read.  Identity still mutates
+        only while the consumer is stopped (which joins this thread), keeping
+        stamping and identity changes disjoint.
+        """
+        listener = _Listener(self._on_frame_show)
+        event = _natives().mlt_events_listen(int(consumer.get_consumer()), None,
+                                             b"consumer-frame-show",
+                                             ctypes.cast(listener, ctypes.c_void_p).value)
+        if not event:
+            raise RuntimeError("MLT consumer-frame-show listener could not be registered")
+        # The C side keeps the raw callback pointer, so its thunk must outlive
+        # the registration and is released only in _shutdown.
+        self._frame_listener = listener
+        self._frame_event = event
+
+    def _on_frame_show(self, _properties, _data, event_data) -> None:
+        """Runs on the MLT consumer thread; never let an exception escape into MLT."""
+        with suppress(Exception):
+            lib = _natives()
+            frame = lib.mlt_event_data_to_frame(event_data)
+            if frame:
+                pos = lib.mlt_frame_get_position(frame)
+                self._stamp(pos, self._native_image(lib, frame))
+
+    def _native_image(self, lib, frame) -> bytes:
+        buffer, fmt = ctypes.c_void_p(), ctypes.c_int(int(self._mlt.mlt_image_rgba))
+        width, height = ctypes.c_int(self._width), ctypes.c_int(self._height)
+        if lib.mlt_frame_get_image(frame, ctypes.byref(buffer), ctypes.byref(fmt),
+                                   ctypes.byref(width), ctypes.byref(height),
+                                   ctypes.c_int(0)) != 0 or not buffer.value:
+            raise RuntimeError("MLT could not render the frame-show image")
+        return ctypes.string_at(buffer.value, width.value * height.value * 4)
+
+    def _stamp(self, position, rgba) -> None:
         if not self._open or not self._playback_id:
             return
-        pos = mlt_frame.get_position()
-        rgba = bytes(mlt_frame.get_image(self._mlt.mlt_image_rgba,
-                                         self._width, self._height))
         self._frame_slot = RenderedFrame(
             self._playback_id, self._generation, self._seek_request_id,
-            pos, self._fps.sample_us(pos), self._width, self._height, rgba)
+            position, self._fps.sample_us(position), self._width, self._height, rgba)
 
     def _make_consumer(self, mlt, compiled):
         global _sink_name
@@ -774,15 +910,15 @@ class PlaybackController:
     @staticmethod
     def _drives(consumer) -> bool:
         """Prove the sink advances the project clock before committing to it."""
-        if consumer.start() != 0:
+        if _start_consumer(consumer) != 0:
             return False
         deadline = time.monotonic() + 1.5
         while time.monotonic() < deadline:
             if consumer.position() >= 2:
-                consumer.stop()
+                _stop_consumer(consumer)
                 return True
             if consumer.is_stopped():
                 return False
             time.sleep(0.02)
-        consumer.stop()
+        _stop_consumer(consumer)
         return False
