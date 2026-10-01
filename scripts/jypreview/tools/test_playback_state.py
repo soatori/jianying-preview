@@ -202,7 +202,7 @@ def main() -> int:
             raise AssertionError(f"reopen did not produce a fresh playback id: {reopened}")
         stale_accepted = client.evaluate(
             f"window.__backend.accepts({{ playbackId: {json.dumps(old_playback)}, "
-            "seekRequestId: 999, generation: 99 }})")
+            "seekRequestId: 999, generation: 99 })")
         if stale_accepted is not False:
             raise AssertionError(f"old identity still updates the new selection: {stale_accepted}")
 
