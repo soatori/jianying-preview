@@ -239,6 +239,50 @@ def consumer_failure_and_reopen(long_model, playback_id):
     controller.close()
 
 
+def playing_backward_seek(long_model):
+    """A rewind cannot reuse the sink's last position, including near EOS."""
+    controller = PlaybackController()
+    try:
+        playback_id = controller.open(long_model)["playback_id"]
+        for request_id, old_us in ((1, 8_000_000), (3, LONG_US - 500_000)):
+            controller.seek(old_us, playback_id=playback_id, request_id=request_id)
+            controller.snapshot()
+            controller.play()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                before = controller.snapshot()
+                if before["phase"] == "playing" and before["t_us"] > old_us:
+                    break
+                assert before["phase"] not in ("error", "ended"), before
+                time.sleep(0.01)
+            else:
+                raise AssertionError(f"playback did not advance: {before}")
+            controller.seek(50_000, playback_id=playback_id, request_id=request_id + 1)
+            target = controller.snapshot()
+            assert target["t_us"] == 33_334 and target["frame_index"] == 1, target
+            frame = controller.pull_frame(500)
+            assert frame is not None and frame.frame_index == 1, frame
+            assert frame.seek_request_id == request_id + 1
+            immediate = controller.snapshot()
+            assert immediate["t_us"] < 500_000, (before, target, immediate)
+            assert immediate["phase"] in ("buffering", "playing"), immediate
+            time.sleep(0.5)
+            advanced = controller.snapshot()
+            assert 33_334 < advanced["t_us"] < 1_000_000, advanced
+            assert advanced["phase"] == "playing", advanced
+            live = controller.pull_frame(0)
+            assert live is not None and live.frame_index > 1, live
+            for _ in range(2):
+                frozen = controller.pull_frame(0, seek_target=True)
+                assert frozen is not None and frozen.frame_index == 1 and frozen.pts_us == 33_334, frozen
+                assert frozen.seek_request_id == request_id + 1
+            print(f"ok: playing rewind {before['t_us']} -> {target['t_us']} -> "
+                  f"{immediate['t_us']} -> {advanced['t_us']}")
+            controller.pause()
+    finally:
+        controller.close()
+
+
 def end_of_stream(short_model):
     controller = PlaybackController()
     playback_id = controller.open(short_model)["playback_id"]
@@ -260,6 +304,35 @@ def end_of_stream(short_model):
     assert settled["phase"] == "ready" and settled["frame_index"] == 0
     assert settled["t_us"] == 0 and settled["error"] is None
     controller.close()
+
+
+def missing_consumer_output(long_model):
+    """Manual captures and retained consumer.position cannot impersonate output."""
+    class SilentController(PlaybackController):
+        def _on_frame_show(self, _properties, _data, event_data):
+            pass  # Simulate a sink that never delivers its output event.
+
+    controller = SilentController()
+    try:
+        playback_id = controller.open(long_model)["playback_id"]
+        controller.seek(50_000, playback_id=playback_id, request_id=1)
+        controller.snapshot()
+        started = controller.play()
+        returned_at = time.monotonic()
+        assert started["phase"] == "buffering" and started["t_us"] == 33_334, started
+        deadline = returned_at + 2.5
+        while time.monotonic() < deadline:
+            snap = controller.snapshot()
+            if snap["phase"] == "error":
+                break
+            assert snap["phase"] == "buffering" and snap["t_us"] == 33_334, snap
+            time.sleep(0.02)
+        elapsed = time.monotonic() - returned_at
+        assert snap["phase"] == "error" and "no frame" in snap["error"], snap
+        assert 1.45 <= elapsed < 2.5, elapsed
+        print(f"ok: missing output kept target/buffering then failed after {elapsed:.3f}s")
+    finally:
+        controller.close()
 
 
 def worker_lifecycle(short_model):
@@ -499,6 +572,22 @@ async def endpoint_acceptance(model):
             await asyncio.sleep(0.02)
         assert live_state["phase"] == "playing", live_state
 
+        # Snapshot polling can settle/restart a seek before /render arrives.
+        rewind = await client.post("/api/backend/seek", params=dict(q2, t_us="0", request_id="1"))
+        assert rewind.status == 200, rewind.status
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            live_state = (await (await client.get("/api/backend/snapshot", params=q2)).json())["data"]
+            if live_state["t_us"] > 100_000:
+                break
+            await asyncio.sleep(0.02)
+        assert live_state["phase"] == "playing" and live_state["t_us"] > 100_000, live_state
+        frozen = await client.get("/api/backend/render", params=dict(q2, request_id="1"))
+        assert frozen.status == 200 and frozen.headers["X-Project-PTS-US"] == "0", dict(frozen.headers)
+        assert frozen.headers["X-Project-Frame"] == "0" and frozen.headers["X-Seek-Request-ID"] == "1"
+        await frozen.read()
+        print(f"ok: render kept frame0 after concurrent snapshots advanced to {live_state['t_us']}")
+
         live = await client.get("/api/backend/stream", params=q2)
         assert live.status == 200, live.status
         assert live.headers["Content-Type"].startswith("multipart/x-mixed-replace"), live.headers["Content-Type"]
@@ -592,6 +681,8 @@ def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     long_model = build_model(LONG_US, still("red", (255, 0, 0)), tone("tone-long", 31))
     short_model = build_model(500_000, still("blue", (0, 0, 255)), tone("tone-short", 1))
+    playing_backward_seek(long_model)
+    missing_consumer_output(long_model)
 
     # Capture-guard pin (design: temp/teardown/verify.md): pin the e562d7f
     # invariant that no capture-path _stamp ever lands while the consumer runs.

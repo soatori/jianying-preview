@@ -550,6 +550,9 @@ class PlaybackController:
         self._pending: int | None = None
         self._fps: FrameRate | None = None
         self._frame_slot: RenderedFrame | None = None
+        self._seek_frame: RenderedFrame | None = None
+        self._output_position: tuple[int, int] | None = None
+        self._output_deadline: float | None = None
         self._compiled: CompiledTimeline | None = None
         self._consumer: Any = None
         self._mlt = None
@@ -590,23 +593,21 @@ class PlaybackController:
             finally:
                 worker.join(timeout=5)
 
-    def pull_frame(self, timeout_ms: int = 100) -> RenderedFrame | None:
+    def pull_frame(self, timeout_ms: int = 100, *, seek_target: bool = False) -> RenderedFrame | None:
         phase, intent = self._submit(self._h_prepare_pull)
         if phase == "error":
             # Surface a dead sink instead of returning None forever so callers
             # (the multipart stream) can terminate with a readable error.
             raise RuntimeError(f"playback failed: {self._error}")
-        # Capture before any buffering wait: the frame-show listener advances
-        # the slot while playing, but a pull right after a seek must return the
-        # accepted seek target rather than a frame past it.  Steady-state pulls
-        # skip the wait entirely, so they still read the live frame.
-        frame = self._frame_slot
+        # Capture before buffering waits. /render retains the immutable seek
+        # target; streaming reads the live slot advanced by frame-show output.
+        frame = self._seek_frame if seek_target else self._frame_slot
         end = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
         if intent:
             while self._phase == "buffering" and time.monotonic() < end:
                 time.sleep(0.005)
         while frame is None and time.monotonic() < end:
-            frame = self._frame_slot
+            frame = self._seek_frame if seek_target else self._frame_slot
             if frame is None:
                 time.sleep(0.005)
         return frame
@@ -690,6 +691,9 @@ class PlaybackController:
         self._intent = False
         self._pending = None
         self._frame_slot = None
+        self._seek_frame = None
+        self._output_position = None
+        self._output_deadline = None
         self._compiled = compiled
         self._consumer = consumer
         self._open = True
@@ -699,6 +703,7 @@ class PlaybackController:
         if tractor.seek(0) != 0:
             raise RuntimeError("MLT seek to the first frame failed")
         tractor.get_frame()
+        self._seek_frame = self._frame_slot
         return self._snapshot()
 
     def _h_close(self) -> None:
@@ -720,9 +725,11 @@ class PlaybackController:
         self._require_commandable()
         self._settle()
         self._intent = True
-        if self._consumer is not None and self._consumer.is_stopped() \
-                and _start_consumer(self._consumer) != 0:
-            raise RuntimeError("MLT consumer failed to start playback")
+        if self._consumer is not None and self._consumer.is_stopped():
+            self._output_position = None
+            if _start_consumer(self._consumer) != 0:
+                raise RuntimeError("MLT consumer failed to start playback")
+            self._output_deadline = time.monotonic() + 1.5
         self._phase = "buffering"
         return self._snapshot()
 
@@ -751,9 +758,14 @@ class PlaybackController:
         # Quiesce the consumer before mutating identity so no frame can stamp late.
         if self._consumer is not None and not self._consumer.is_stopped():
             _stop_consumer(self._consumer)
+        if self._consumer is not None:
+            self._consumer.purge()
         self._generation += 1
         self._seek_request_id = request_id
         self._frame_slot = None
+        self._seek_frame = None
+        self._output_position = None
+        self._output_deadline = None
         frame, sample = self._fps.quantize(max(0, target))
         if frame >= self._duration_frames:
             self._pending = None
@@ -779,14 +791,20 @@ class PlaybackController:
             return
         if self._consumer is None:
             return
-        pos = self._consumer.position()
+        output = self._output_position
+        if output is None or output[0] != self._generation:
+            if self._output_deadline is not None and time.monotonic() >= self._output_deadline:
+                self._fail(RuntimeError("MLT consumer produced no frame after 1.5 seconds"))
+            return
+        self._output_deadline = None
+        pos = output[1]
         if pos >= self._duration_frames - 1:
             self._end_of_stream()
             return
         if self._phase == "playing" and self._consumer.is_stopped():
             self._fail(RuntimeError("MLT consumer stopped unexpectedly"))
             return
-        if self._phase == "buffering" and pos > self._frame_index:
+        if self._phase == "buffering" and pos >= self._frame_index:
             self._phase = "playing"
         sample = self._fps.sample_us(pos)
         if sample >= self._t_us:
@@ -806,11 +824,14 @@ class PlaybackController:
         if tractor.seek(frame) != 0:
             raise RuntimeError(f"MLT seek to frame {frame} failed")
         tractor.get_frame()  # capture stamps the slot with current identity
+        self._seek_frame = self._frame_slot  # immutable target survives live frame-show updates
         self._frame_index = frame
         self._t_us = sample
         self._phase = "buffering" if self._intent else "ready"
-        if self._intent and consumer.is_stopped() and _start_consumer(consumer) != 0:
-            raise RuntimeError("MLT consumer failed to resume after seek")
+        if self._intent and consumer.is_stopped():
+            if _start_consumer(consumer) != 0:
+                raise RuntimeError("MLT consumer failed to resume after seek")
+            self._output_deadline = time.monotonic() + 1.5
 
     def _end_of_stream(self) -> None:
         # Stop first so the frame-show listener is quiesced before clearing the slot.
@@ -819,6 +840,7 @@ class PlaybackController:
         self._intent = False
         self._phase = "ended"
         self._frame_slot = None
+        self._seek_frame = None
 
     def _fail(self, exc) -> None:
         self._phase = "error"
@@ -828,6 +850,7 @@ class PlaybackController:
             with suppress(Exception):
                 _stop_consumer(self._consumer)
         self._frame_slot = None
+        self._seek_frame = None
 
     def _shutdown(self) -> None:
         if self._consumer is not None:
@@ -848,7 +871,10 @@ class PlaybackController:
         self._compiled = None
         self._mlt = None
         self._frame_slot = None
+        self._seek_frame = None
         self._pending = None
+        self._output_position = None
+        self._output_deadline = None
         self._intent = False
         self._open = False
         self._phase = "idle"
@@ -903,6 +929,9 @@ class PlaybackController:
             if frame:
                 pos = lib.mlt_frame_get_position(frame)
                 self._stamp(pos, self._native_image(lib, frame))
+                # Only actual audio-consumer output owns the clock. position()
+                # retains the previous seek's position even after stop/purge.
+                self._output_position = (self._generation, pos)
 
     def _native_image(self, lib, frame) -> bytes:
         buffer, fmt = ctypes.c_void_p(), ctypes.c_int(int(self._mlt.mlt_image_rgba))

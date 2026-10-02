@@ -122,7 +122,9 @@ export class MltPlaybackClient {
     this.draft = null;
     this.timeline = null;
     this.issued = 0;              // last request id issued (intent), monotonic per open
-    this.accepted = 0;            // last request id acknowledged by the backend
+    this.accepted = 0;            // last request id committed to the client clock
+    this.pendingSeek = null;      // renderAt owns clock commit until its matching frame arrives
+    this.clockRevision = 0;       // invalidates snapshots issued before a seek/frame commit
     this.generation = 0;
     this.tUs = 0;
     this.frameIndex = 0;
@@ -178,7 +180,7 @@ export class MltPlaybackClient {
    * identity, and the latest issued request id. Returns superseded/stale instead
    * of mutating state when the response predates the newest intent.
    */
-  #apply(ident, data, epoch) {
+  #apply(ident, data, epoch, clockRevision = this.clockRevision, commit = false) {
     if (epoch !== this.epoch) return { applied: false, stale: true, superseded: false };
     if (ident.playbackId === null) {
       throw new Error("backend response is missing playback identity (X-Playback-ID)");
@@ -190,14 +192,24 @@ export class MltPlaybackClient {
     if (requestId !== null && requestId < this.issued) {
       return { applied: false, stale: false, superseded: true };
     }
+    if (commit) {
+      if (!this.pendingSeek || this.pendingSeek.epoch !== epoch
+          || this.pendingSeek.requestId !== requestId) {
+        return { applied: false, stale: false, superseded: true };
+      }
+      this.pendingSeek = null;
+      this.clockRevision += 1;
+    }
     // A seek acknowledgment carries the old clock; let the rendered response consume any rewind.
     const seeking = data && data.phase === "seeking";
+    const clockAllowed = !seeking && (commit
+      || (!this.pendingSeek && clockRevision === this.clockRevision));
     const previous = this.accepted;
-    if (requestId !== null && !seeking) this.accepted = requestId;
+    if (requestId !== null && clockAllowed) this.accepted = requestId;
     if (ident.generation !== null) this.generation = ident.generation;
     const pts = ident.ptsUs !== null ? ident.ptsUs : num(data && data.t_us);
     const moved = requestId !== null && requestId !== previous;
-    if (!seeking && pts !== null && (moved || pts >= this.tUs)) {
+    if (clockAllowed && pts !== null && (moved || pts >= this.tUs)) {
       this.tUs = pts;                                  // never run the playhead backwards mid-position
       // frameIndex rides the same monotonic gate: a late older snapshot must not
       // move the frame backwards while the clock stays put.
@@ -218,6 +230,8 @@ export class MltPlaybackClient {
     this.playbackId = null;
     this.issued = 0;
     this.accepted = 0;
+    this.pendingSeek = null;
+    this.clockRevision += 1;
     this.generation = 0;
     this.tUs = 0;
     this.frameIndex = 0;
@@ -301,9 +315,10 @@ export class MltPlaybackClient {
   async #handle(action) {
     if (!this.playbackId) throw new Error("backend is not open");
     const epoch = this.epoch;
+    const clockRevision = this.clockRevision;
     const { res, data } = await this.#request("POST", `/api/backend/${action}`,
       { playback_id: this.playbackId });
-    return this.#apply(identityOf(res, data), data, epoch);
+    return this.#apply(identityOf(res, data), data, epoch, clockRevision);
   }
 
   play() { return this.#handle("play"); }
@@ -314,13 +329,16 @@ export class MltPlaybackClient {
     if (!this.playbackId) throw new Error("backend is not open");
     const requestId = ++this.issued;
     const epoch = this.epoch;
+    this.pendingSeek = null;
+    this.clockRevision += 1;
+    const clockRevision = this.clockRevision;
     this.#abortStream();
     const t = Math.max(0, Math.round(Number(tUs) || 0));
     const { res, data } = await this.#request("POST", "/api/backend/seek",
       { t_us: t, request_id: requestId, playback_id: this.playbackId });
     const ident = identityOf(res, data);
     if (ident.seekRequestId === null) ident.seekRequestId = requestId;
-    const result = this.#apply(ident, data, epoch);
+    const result = this.#apply(ident, data, epoch, clockRevision);
     if (result.applied && this.streamWanted && requestId === this.issued) this.#startStream();
     return { ...result, requestId };
   }
@@ -330,65 +348,73 @@ export class MltPlaybackClient {
     if (!this.playbackId) throw new Error("backend is not open");
     const requestId = ++this.issued;
     const epoch = this.epoch;
+    const pending = { requestId, epoch };
+    this.pendingSeek = pending;
+    this.clockRevision += 1;
     this.#abortStream();
     const t = Math.max(0, Math.round(Number(tUs) || 0));
-    const { res, data } = await this.#request("POST", "/api/backend/seek",
-      { t_us: t, request_id: requestId, playback_id: this.playbackId });
-    const seekIdent = identityOf(res, data);
-    if (seekIdent.seekRequestId === null) seekIdent.seekRequestId = requestId;
-    const seekResult = this.#apply(seekIdent, data, epoch);
-    if (!seekResult.applied) return { ...seekResult, requestId };
-    if (this.streamWanted && requestId === this.issued) this.#startStream();
+    try {
+      const { res, data } = await this.#request("POST", "/api/backend/seek",
+        { t_us: t, request_id: requestId, playback_id: this.playbackId });
+      const seekIdent = identityOf(res, data);
+      if (seekIdent.seekRequestId === null) seekIdent.seekRequestId = requestId;
+      const seekResult = this.#apply(seekIdent, data, epoch);
+      if (!seekResult.applied) return { ...seekResult, requestId };
 
-    const response = await fetch(this.#url("/api/backend/render",
-      { t_us: t, request_id: requestId, playback_id: this.playbackId }), { cache: "no-store" });
-    if (epoch !== this.epoch) return { applied: false, stale: true, superseded: false, requestId };
-    if (response.status === 409) {
-      return { applied: false, stale: false, superseded: true, requestId };
-    }
-    const type = headerOf(response, "content-type") || "";
-    if (!type.includes("image/")) {
-      let payload = null;
-      try { payload = await response.json(); } catch (error) { void error; }
-      const body = payload && typeof payload === "object"
-        ? (typeof payload.ok === "boolean"
-          ? (payload.data && typeof payload.data === "object" ? payload.data : payload)
-          : payload)
-        : null;
-      const code = String((payload && payload.code) || (body && body.code) || "");
-      const ended = !!(body && (body.ended === true || body.phase === "ended" || /ended/i.test(code)));
-      if (ended) {
-        const result = this.#apply(identityOf(response, body), body, epoch);
-        if (result.applied) {          // a superseded response must not mutate transport state
-          this.phase = "ended";
-          this.playing = false;
+      const response = await fetch(this.#url("/api/backend/render",
+        { t_us: t, request_id: requestId, playback_id: this.playbackId }), { cache: "no-store" });
+      if (epoch !== this.epoch) return { applied: false, stale: true, superseded: false, requestId };
+      if (response.status === 409) {
+        return { applied: false, stale: false, superseded: true, requestId };
+      }
+      const type = headerOf(response, "content-type") || "";
+      if (!type.includes("image/")) {
+        let payload = null;
+        try { payload = await response.json(); } catch (error) { void error; }
+        const body = payload && typeof payload === "object"
+          ? (typeof payload.ok === "boolean"
+            ? (payload.data && typeof payload.data === "object" ? payload.data : payload)
+            : payload)
+          : null;
+        const code = String((payload && payload.code) || (body && body.code) || "");
+        const ended = !!(body && (body.ended === true || body.phase === "ended" || /ended/i.test(code)));
+        if (ended) {
+          const result = this.#apply(identityOf(response, body), body, epoch, this.clockRevision, true);
+          if (result.applied) {          // a superseded response must not mutate transport state
+            this.phase = "ended";
+            this.playing = false;
+          }
+          return { ...result, ended: true, requestId };
         }
-        return { ...result, ended: true, requestId };
+        if (payload && payload.ok === false) {
+          const failure = new Error(`${payload.code}: ${payload.reason}`);
+          failure.code = payload.code;
+          throw failure;
+        }
+        if (!response.ok) throw new Error(`backend render failed: HTTP ${response.status}`);
+        throw new Error("backend render returned neither PNG nor ended");
       }
-      if (payload && payload.ok === false) {
-        const failure = new Error(`${payload.code}: ${payload.reason}`);
-        failure.code = payload.code;
-        throw failure;
-      }
-      if (!response.ok) throw new Error(`backend render failed: HTTP ${response.status}`);
-      throw new Error("backend render returned neither PNG nor ended");
+      const ident = identityOf(response, null);
+      const blob = await response.blob();
+      const result = this.#apply(ident, null, epoch, this.clockRevision, true);
+      if (!result.applied) return { ...result, requestId };
+      if (this.streamWanted) this.#startStream();
+      return { ...result, requestId, blob,
+        playbackId: ident.playbackId, seekRequestId: ident.seekRequestId,
+        generation: ident.generation, frameIndex: ident.frameIndex, ptsUs: ident.ptsUs };
+    } finally {
+      if (this.pendingSeek === pending) this.pendingSeek = null;
     }
-    const ident = identityOf(response, null);
-    const blob = await response.blob();
-    const result = this.#apply(ident, null, epoch);
-    if (!result.applied) return { ...result, requestId };
-    return { ...result, requestId, blob,
-      playbackId: ident.playbackId, seekRequestId: ident.seekRequestId,
-      generation: ident.generation, frameIndex: ident.frameIndex, ptsUs: ident.ptsUs };
   }
 
   async snapshot() {
     if (!this.playbackId) return { applied: false, stale: true, superseded: false };
     const epoch = this.epoch;
+    const clockRevision = this.clockRevision;
     const { res, data } = await this.#request("GET", "/api/backend/snapshot",
       { playback_id: this.playbackId });
     if (!data) throw new Error("backend snapshot returned no JSON");
-    const result = this.#apply(identityOf(res, data), data, epoch);
+    const result = this.#apply(identityOf(res, data), data, epoch, clockRevision);
     return { ...result, snapshot: data };
   }
 
@@ -436,7 +462,7 @@ export class MltPlaybackClient {
   }
 
   async #startStream() {
-    if (!this.streamWanted || !this.playbackId) return;
+    if (!this.streamWanted || !this.playbackId || this.pendingSeek) return;
     this.#abortStream();       // clear any previous reader; streamWanted stays set
     const epoch = this.epoch;
     const abort = new AbortController();

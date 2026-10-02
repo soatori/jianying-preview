@@ -148,7 +148,7 @@ async def render(request: web.Request) -> web.Response:
     if state["error"]:
         return error_payload("mlt_render_failed", state["error"], status=500)
     try:
-        frame = await handle.call("pull_frame", 500)
+        frame = await handle.call("pull_frame", 500, seek_target=True)
     except RuntimeError as exc:
         # A dying sink raises here; surface it as the render failure it is.
         return error_payload("mlt_render_failed", str(exc), status=500)

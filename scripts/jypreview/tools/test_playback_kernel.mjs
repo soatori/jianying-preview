@@ -440,6 +440,124 @@ async function renderResponses() {
   assert.equal(client.phase, "ended");
 }
 
+async function seekCommitBarrier() {
+  const client = await openClient({ playbackId: "pb-barrier" });
+  client.tUs = 8_133_334;
+  client.frameIndex = 244;
+  const renders = new Map();
+  const late = deferred();
+  let snapshotMode = "buffering";
+  let streamFetches = 0;
+  const snapshot = (phase, ptsUs) => ok({ backend: "mlt", phase,
+    playback_id: client.playbackId, seek_request_id: client.issued,
+    generation: client.issued, frame_index: Math.floor(ptsUs * 30 / 1e6),
+    t_us: ptsUs, duration_us: 45_000_000, playing: phase === "playing",
+    error: null, open: true });
+  installFetch((call) => {
+    if (call.url.includes("/api/backend/seek")) return snapshot("seeking", 8_133_334);
+    if (call.url.includes("/api/backend/render")) {
+      const rid = Number(queryOf(call).get("request_id"));
+      const reply = deferred();
+      renders.set(rid, reply);
+      return reply.promise;
+    }
+    if (call.url.includes("/api/backend/snapshot")) {
+      if (snapshotMode === "late") return late.promise;
+      return snapshot(snapshotMode, snapshotMode === "buffering" ? 0 : 8_200_000);
+    }
+    if (call.url.includes("/api/backend/play")) return snapshot("playing", 8_200_000);
+    if (call.url.includes("/api/backend/pause")) return snapshot("paused", 8_200_000);
+    if (call.url.includes("/api/backend/stream")) {
+      streamFetches += 1;
+      return new Response(new ReadableStream(), { headers: {
+        "content-type": "multipart/x-mixed-replace; boundary=frame" } });
+    }
+    if (call.url.includes("/api/backend/close")) return ok({ closed: true });
+    if (call.url.includes("/api/backend/open")) return ok({ playback_id: "pb-reopened" });
+    throw new Error(`unexpected fetch: ${call.url}`);
+  });
+  const image = (rid, ptsUs = 0, playbackId = client.playbackId) => new Response(Uint8Array.of(1), {
+    headers: { "content-type": "image/png", ...seekHeaders({ playbackId,
+      generation: rid, requestId: rid, frameIndex: Math.floor(ptsUs * 30 / 1e6), ptsUs }) },
+  });
+  client.startStream(() => {});
+  const rewind = client.renderAt(0);
+  await tick();
+  assert.equal(streamFetches, 1, "seek ack must not restart stream before render commits");
+  await client.snapshot();
+  assert.equal(client.phase, "buffering", "JSON may update transport during pending seek");
+  assert.equal(client.accepted, 0, "buffering JSON must not commit the seek request");
+  assert.equal(client.tUs, 8_133_334);
+  snapshotMode = "playing";
+  await client.snapshot();
+  await client.play();
+  await client.pause();
+  assert.equal(client.accepted, 0);
+  assert.equal(client.frameIndex, 244);
+  assert.equal(client.tUs, 8_133_334);
+  snapshotMode = "late";
+  const oldSnapshot = client.snapshot();
+  const oldReply = snapshot("playing", 8_200_000);
+  renders.get(1).resolve(image(1));
+  assert.equal((await rewind).applied, true);
+  assert.equal(client.tUs, 0, "matching render commits the backward target");
+  assert.equal(client.accepted, 1);
+  assert.equal(client.frameIndex, 0);
+  assert.equal(streamFetches, 2, "stream resumes after the frame commit");
+  late.resolve(oldReply);
+  await oldSnapshot;
+  assert.equal(client.tUs, 0, "snapshot issued before commit cannot restore old clock");
+
+  // An older render finishing cannot clear the newer seek barrier.
+  const older = client.renderAt(1_000_000);
+  await tick();
+  const newer = client.renderAt(2_000_000);
+  await tick();
+  renders.get(2).resolve(image(2, 1_000_000));
+  assert.equal((await older).superseded, true);
+  snapshotMode = "playing";
+  await client.snapshot();
+  assert.equal(client.tUs, 0, "old finally must leave newer pending seek intact");
+  renders.get(3).resolve(image(3, 2_000_000));
+  assert.equal((await newer).applied, true);
+  assert.equal(client.tUs, 2_000_000);
+
+  // Failed/409 renders clear only their own barrier, allowing the next snapshot.
+  for (const response of [new Response(null, { status: 409 }),
+    json({ ok: false, code: "render_failed", reason: "failed" }, { status: 500 })]) {
+    const pending = client.renderAt(0);
+    const settled = pending.then((result) => result, (error) => error);
+    await tick();
+    renders.get(client.issued).resolve(response);
+    const result = await settled;
+    assert.ok(result.superseded || result instanceof Error);
+    await client.snapshot();
+    assert.equal(client.tUs, 8_200_000, "failure must release the clock barrier");
+  }
+  const ended = client.renderAt(45_000_000);
+  await tick();
+  renders.get(client.issued).resolve(snapshot("ended", 45_000_000));
+  assert.equal((await ended).ended, true);
+  assert.equal(client.phase, "ended");
+  assert.equal(client.tUs, 45_000_000);
+  assert.equal(client.accepted, client.issued);
+
+  const closing = client.renderAt(0);
+  await tick();
+  const closedRid = client.issued;
+  await client.close();
+  await client.open("draft-y", "timeline-y");
+  const reopened = client.renderAt(0);
+  await tick();
+  renders.get(closedRid).resolve(image(closedRid, 0, "pb-barrier"));
+  assert.equal((await closing).stale, true);
+  await client.snapshot();
+  assert.equal(client.tUs, 0, "old epoch finally cannot clear reopened seek barrier");
+  renders.get(1).resolve(image(1));
+  assert.equal((await reopened).applied, true);
+  await client.close();
+}
+
 async function selectionEpoch() {
   const firstOpen = deferred();
   let openCount = 0;
@@ -651,6 +769,7 @@ async function main() {
   await reorderedDispatch();
   await lateDecodeAfterNewerSeek();
   await backwardSeekUsesRenderedPts();
+  await seekCommitBarrier();
   await renderResponses();
   await selectionEpoch();
   await frameQueueCap();
