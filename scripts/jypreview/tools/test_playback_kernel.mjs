@@ -43,10 +43,10 @@ function queryOf(call) {
 }
 
 /** One synthetic multipart frame carrying every Task 4 identity/frame header. */
-function multipartFrame(boundary, { playbackId, generation, requestId, frameIndex, ptsUs, payload }) {
+function multipartFrame(boundary, { playbackId, generation, requestId, frameIndex, ptsUs, payload, contentType = "image/png" }) {
   const head = [
     `--${boundary}`,
-    "Content-Type: image/png",
+    `Content-Type: ${contentType}`,
     `Content-Length: ${payload.length}`,
     `X-Playback-ID: ${playbackId}`,
     `X-Playback-Generation: ${generation}`,
@@ -154,6 +154,7 @@ async function multipartParsing() {
 
   const valid = multipartFrame(boundary, {
     playbackId: "pb-1", generation: 1, requestId: 1, frameIndex: 7, ptsUs: 100_000, payload,
+    contentType: "image/jpeg",
   });
   const stalePlayback = multipartFrame(boundary, {
     playbackId: "pb-0", generation: 1, requestId: 1, frameIndex: 6, ptsUs: 66_666, payload,
@@ -182,6 +183,7 @@ async function multipartParsing() {
     ptsUs: frames[0].ptsUs,
   }, { playbackId: "pb-1", seekRequestId: 1, generation: 1, frameIndex: 7, ptsUs: 100_000 });
   assert.equal(frames[0].blob.size, payload.length, "the body must survive header parsing");
+  assert.equal(frames[0].blob.type, "image/jpeg", "the stream MIME must reach the image decoder");
   assert.deepEqual([...new Uint8Array(await frames[0].blob.arrayBuffer())], [...payload]);
   assert.equal(streamError, null, "the stream must not report errors while healthy");
 

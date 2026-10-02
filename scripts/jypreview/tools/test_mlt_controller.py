@@ -541,10 +541,15 @@ async def endpoint_acceptance(model):
             part[name.decode()] = value.decode()
         for header in FRAME_HEADERS:
             assert header in part, (header, part)
+        assert part["Content-Type"] == "image/jpeg", part
         assert part["X-Playback-ID"] == playback2, part
         assert part["X-Playback-Generation"] == "0" and part["X-Seek-Request-ID"] == "0", part
         body = await stream_resp.content.readexactly(int(part["Content-Length"]))
-        assert body[:8] == b"\x89PNG\r\n\x1a\n", len(body)
+        assert body[:2] == b"\xff\xd8" and body[-2:] == b"\xff\xd9", len(body)
+        from PIL import Image
+        import io
+        with Image.open(io.BytesIO(body)) as image:
+            assert image.format == "JPEG" and image.size == (W, H), (image.format,image.size)
         stream_resp.close()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not any("stream" in line for line in app["log"]):
@@ -605,6 +610,7 @@ async def endpoint_acceptance(model):
                 name, sep, value = line.partition(b": ")
                 assert sep, line
                 part[name.decode()] = value.decode()
+            assert part["Content-Type"] == "image/jpeg", part
             live_frames.append(int(part["X-Project-Frame"]))
             await asyncio.wait_for(live.content.readexactly(int(part["Content-Length"])), timeout=3)
         assert len(set(live_frames)) >= 2, f"stream starved during play: {live_frames}"

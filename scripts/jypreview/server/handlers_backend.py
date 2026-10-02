@@ -94,6 +94,15 @@ def _encode_png(frame) -> bytes:
     return output.getvalue()
 
 
+def _encode_jpeg(frame) -> bytes:
+    from PIL import Image
+
+    image = Image.frombytes("RGBA", (frame.width, frame.height), frame.rgba).convert("RGB")
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=85)
+    return output.getvalue()
+
+
 async def capabilities(request: web.Request) -> web.Response:
     available, reason = await offload(MltCompiler.available)
     return JSON({"name": "mlt", "available": available, "reason": reason,
@@ -259,10 +268,10 @@ async def stream(request: web.Request) -> web.StreamResponse:
                 await asyncio.sleep(0.02)
                 continue
             last = stamp
-            payload = await offload(_encode_png, frame)
+            payload = await offload(_encode_jpeg, frame)
             headers = "".join(f"{name}: {value}\r\n" for name, value in _frame_headers(frame).items())
             await response.write(
-                b"--frame\r\nContent-Type: image/png\r\n"
+                b"--frame\r\nContent-Type: image/jpeg\r\n"
                 + f"Content-Length: {len(payload)}\r\n".encode()
                 + headers.encode() + b"\r\n" + payload + b"\r\n")
     except ConnectionResetError:
