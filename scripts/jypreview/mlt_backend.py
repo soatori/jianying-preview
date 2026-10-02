@@ -673,6 +673,7 @@ class PlaybackController:
             raise ValueError("PlaybackController requires TimelineModel")
         self._shutdown()
         compiled = MltCompiler().compile(model)
+        self._compiled = compiled  # close also owns graphs whose sink probe fails
         tractor: Any = compiled.tractor
         if tractor is None:
             raise BackendUnavailable("Timeline has no frames to play")
@@ -694,7 +695,6 @@ class PlaybackController:
         self._seek_frame = None
         self._output_position = None
         self._output_deadline = None
-        self._compiled = compiled
         self._consumer = consumer
         self._open = True
         self._phase = "ready"
@@ -969,15 +969,16 @@ class PlaybackController:
     @staticmethod
     def _drives(consumer) -> bool:
         """Prove the sink advances the project clock before committing to it."""
-        if _start_consumer(consumer) != 0:
-            return False
-        deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline:
-            if consumer.position() >= 2:
-                _stop_consumer(consumer)
-                return True
-            if consumer.is_stopped():
+        try:
+            if _start_consumer(consumer) != 0:
                 return False
-            time.sleep(0.02)
-        _stop_consumer(consumer)
-        return False
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                if consumer.position() >= 2:
+                    return True
+                if consumer.is_stopped():
+                    return False
+                time.sleep(0.02)
+            return False
+        finally:
+            _stop_consumer(consumer)

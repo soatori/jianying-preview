@@ -84,9 +84,24 @@ async def open_backend(request: web.Request) -> web.Response:
     view = await offload(lambda: session.view(selector(request)))
     tid = await offload(lambda: view.resolve_timeline(request.query.get("timeline") or "active")["id"])
     model = await offload(lambda: view.timeline_model(tid))
+    key = _key(view.did, tid)
+    # ponytail: one registry mutation lock; split by key if open/close throughput matters.
+    async with request.app["playback_lifecycle_lock"]:
+        return await _replace_backend(request, view.did, tid, key, model)
+
+
+async def _replace_backend(request, did, tid, key, model):
+    backends = request.app["playback_backends"]
+    previous = backends.pop(key, None)
+    if previous:
+        await previous.close()
     handle = PlaybackHandle()
     try:
         state = await handle.call("open", model)
+    except asyncio.CancelledError:
+        # The executor may still be probing; close queues behind it and joins it.
+        await handle.close()
+        raise
     except BackendUnavailable as exc:
         await handle.close()
         return error_payload("mlt_backend_unavailable", str(exc), status=503)
@@ -97,15 +112,10 @@ async def open_backend(request: web.Request) -> web.Response:
         await handle.close()
         return error_payload("mlt_backend_open_failed", str(exc), status=500)
     handle.playback_id = state["playback_id"]
-    backends = request.app["playback_backends"]
-    key = _key(view.did, tid)
-    previous = backends.get(key)
-    if previous:
-        await previous.close()
     backends[key] = handle
     # Echo the resolved selectors so the client can keep every later handle
     # request on the same key even when open() was given a raw name.
-    return JSON({"did": view.did, "key": key, "timeline": tid, "snapshot": state})
+    return JSON({"did": did, "key": key, "timeline": tid, "snapshot": state})
 
 
 async def _open_handle(request: web.Request) -> web.Response | PlaybackHandle:
@@ -253,6 +263,11 @@ async def snapshot(request: web.Request) -> web.Response:
 
 
 async def close_backend(request: web.Request) -> web.Response:
+    async with request.app["playback_lifecycle_lock"]:
+        return await _close_backend(request)
+
+
+async def _close_backend(request: web.Request) -> web.Response:
     backends = request.app["playback_backends"]
     if not (request.query.get("draft") or request.query.get("timeline")):
         # With no selector to scope a key, the playback_id IS the close identity:

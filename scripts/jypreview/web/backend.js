@@ -118,6 +118,8 @@ export class MltPlaybackClient {
   constructor({ baseUrl = "" } = {}) {
     this.baseUrl = baseUrl || "";
     this.epoch = 0;               // local selection epoch: invalidates late open/close work
+    this.lifecycle = Promise.resolve(); // open/close must release each native owner in order
+    this.owner = null;           // captured selectors survive selection resets and failed close
     this.playbackId = null;
     this.draft = null;
     this.timeline = null;
@@ -248,16 +250,26 @@ export class MltPlaybackClient {
   async open(draft, timeline) {
     const epoch = ++this.epoch;
     this.#stopStream();
-    const previous = this.playbackId;
     this.#resetIdentity({ draft, timeline });
-    if (previous) await this.#closeBestEffort(previous);   // closing the previous handle is best-effort
+    return this.#serializeLifecycle(() => this.#openSelection(draft, timeline, epoch));
+  }
+
+  async #openSelection(draft, timeline, epoch) {
+    if (this.owner && !await this.#releaseOwner()) {
+      throw new Error("backend previous playback could not be closed");
+    }
+    if (epoch !== this.epoch) return { applied: false, stale: true };
     const { res, data } = await this.#request("POST", "/api/backend/open", { draft, timeline });
     const body = data && data.snapshot && typeof data.snapshot === "object" ? data.snapshot : data;
     const ident = identityOf(res, body);
+    this.owner = { playbackId: ident.playbackId,
+      draft: data?.did || draft, timeline: data?.timeline || timeline };
     if (epoch !== this.epoch) {
       // The discarded open still allocated a backend handle that this.playbackId
       // will never see; close it best-effort so it cannot linger.
-      await this.#closeBestEffort(ident.playbackId);
+      if (!await this.#releaseOwner()) {
+        throw new Error("backend superseded playback could not be closed");
+      }
       return { applied: false, stale: true };
     }
     if (ident.playbackId === null) {
@@ -286,30 +298,30 @@ export class MltPlaybackClient {
   async close() {
     this.epoch += 1;
     this.#stopStream();
-    const previous = this.playbackId;
     this.#resetIdentity();
-    if (!previous) return { closed: false };
-    try {
-      const res = await fetch(this.#url("/api/backend/close", { playback_id: previous }),
-        { method: "POST" });
-      return { closed: res.ok };
-    } catch (error) {
-      void error;
-      return { closed: false };
-    }
+    return this.#serializeLifecycle(async () => ({ closed: await this.#releaseOwner() }));
+  }
+
+  #serializeLifecycle(operation) {
+    const pending = this.lifecycle.then(operation);
+    this.lifecycle = pending.catch(() => {});
+    return pending;
+  }
+
+  async #releaseOwner() {
+    if (!this.owner || !await this.#closeBestEffort(this.owner)) return false;
+    this.owner = null;
+    return true;
   }
 
   /** Closing a backend handle is best-effort: the caller is discarding it anyway. */
-  async #closeBestEffort(playbackId) {
-    if (!playbackId) return;
+  async #closeBestEffort({ playbackId, draft, timeline }) {
+    if (!playbackId) return false;
     try {
-      // The selectors may already be the NEW selection (open() resets identity
-      // first), which would resolve the wrong playback key server-side (404/409)
-      // and leak this handle. Null them so #url's filter emits playback_id only,
-      // hitting the server's exact-id close path.
-      await fetch(this.#url("/api/backend/close",
-        { playback_id: playbackId, draft: null, timeline: null }), { method: "POST" });
-    } catch (error) { void error; }
+      const res = await fetch(this.#url("/api/backend/close",
+        { playback_id: playbackId, draft, timeline }), { method: "POST" });
+      return res.ok || res.status === 404 || res.status === 409;
+    } catch (error) { void error; return false; }
   }
 
   async #handle(action) {

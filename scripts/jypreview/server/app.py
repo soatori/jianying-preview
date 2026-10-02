@@ -56,6 +56,7 @@ def create_app(config: Config, session: PreviewSession | None = None,
     app["watcher"] = Watcher(config, app["hub"], app["session"])
     app["browser"] = BrowserSession(Path(config.user_state_dir) / "browser")
     app["playback_backends"] = {}
+    app["playback_lifecycle_lock"] = asyncio.Lock()
     app["frames_built"] = 0
 
     async def revalidate_ui(request, response):

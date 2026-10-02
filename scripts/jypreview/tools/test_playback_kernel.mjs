@@ -560,6 +560,8 @@ async function seekCommitBarrier() {
 
 async function selectionEpoch() {
   const firstOpen = deferred();
+  const lateClose = deferred();
+  const currentClose = deferred();
   let openCount = 0;
   const calls = installFetch((call) => {
     if (call.url.includes("/api/backend/open")) {
@@ -578,19 +580,28 @@ async function selectionEpoch() {
         headers: { "X-Playback-ID": "pb-reopen", "X-Playback-Generation": "0" },
       });
     }
-    if (call.url.includes("/api/backend/close")) return ok({ closed: true });
+    if (call.url.includes("/api/backend/close")) {
+      const id = queryOf(call).get("playback_id");
+      if (id === "pb-late") return lateClose.promise.then(() => ok({ closed: true }));
+      if (id === "pb-current") return currentClose.promise.then(() => ok({ closed: true }));
+      return ok({ closed: true });
+    }
     throw new Error(`unexpected fetch: ${call.url}`);
   });
 
   const client = new MltPlaybackClient();
   const late = client.open("draft-a", "timeline-a");
+  await tick();
   const current = client.open("draft-b", "timeline-b");
+  await tick();
+  assert.equal(openCount, 1, "a superseding open must wait for the native owner in flight");
+  firstOpen.resolve();
+  await tick();
+  assert.equal(openCount, 1, "the superseded native owner must finish closing before the next open");
+  lateClose.resolve();
+  const lateResult = await late;
   const currentResult = await current;
   assert.equal(currentResult.stale, false);
-  assert.equal(client.playbackId, "pb-current");
-
-  firstOpen.resolve();
-  const lateResult = await late;
   assert.equal(lateResult.stale, true, "a late open must be ignored after a timeline switch");
   assert.equal(client.playbackId, "pb-current", "a late open must not overwrite the selection");
   assert.equal(client.accepts({ playbackId: "pb-late", seekRequestId: 5, generation: 5 }), false,
@@ -600,12 +611,14 @@ async function selectionEpoch() {
   assert.equal(client.timeline, "timeline-b", "a stale open must not rewrite the timeline selector");
 
   // Re-open under yet another selection: the previous handle must be closed too.
-  const reopened = await client.open("draft-c", "timeline-c");
+  const reopening = client.open("draft-c", "timeline-c");
+  await tick();
+  assert.equal(openCount, 2, "a different-key switch must await its captured previous close");
+  currentClose.resolve();
+  const reopened = await reopening;
   assert.equal(reopened.stale, false);
 
-  // Close requests for discarded handles must carry ONLY playback_id. A merged
-  // draft/timeline would resolve the NEW key server-side (404/409) and the OLD
-  // handle's executor would leak; the selector-less URL forces the B1 exact-id path.
+  // Every discarded owner is closed with its own captured/resolved selectors.
   const closeCalls = calls.filter((call) => call.url.includes("/api/backend/close"));
   const closed = closeCalls.map((call) => queryOf(call).get("playback_id"));
   assert.ok(closed.includes("pb-late"),
@@ -614,11 +627,62 @@ async function selectionEpoch() {
     "a re-open must best-effort close the previous handle");
   for (const call of closeCalls) {
     const query = queryOf(call);
-    assert.equal(query.get("draft"), null,
-      `close must not carry a draft selector (would resolve the wrong key): ${call.url}`);
-    assert.equal(query.get("timeline"), null,
-      `close must not carry a timeline selector (would resolve the wrong key): ${call.url}`);
+    const suffix = query.get("playback_id") === "pb-late" ? "a" : "b";
+    assert.equal(query.get("draft"), `draft-${suffix}`, call.url);
+    assert.equal(query.get("timeline"), `timeline-${suffix}`, call.url);
   }
+}
+
+async function failedLifecycleRelease() {
+  const client = await openClient({ playbackId: "pb-release" });
+  let failed = true;
+  let opens = 0;
+  installFetch((call) => {
+    if (call.url.includes("/api/backend/close")) {
+      assert.equal(queryOf(call).get("draft"), "draft-x");
+      assert.equal(queryOf(call).get("timeline"), "timeline-1");
+      return json({}, { status: failed ? 500 : 200 });
+    }
+    if (call.url.includes("/api/backend/open")) {
+      opens += 1;
+      return ok({ playback_id: "pb-recovered" });
+    }
+    throw new Error(`unexpected fetch: ${call.url}`);
+  });
+  await assert.rejects(client.open("draft-y", "timeline-y"), /could not be closed/);
+  assert.equal(opens, 0, "failed cleanup cannot permit another native probe");
+  failed = false;
+  await client.open("draft-y", "timeline-y");
+  assert.equal(opens, 1, "retry must release the captured owner before opening");
+
+  const pendingOpen = deferred();
+  const pendingClose = deferred();
+  let openCalls = 0;
+  installFetch((call) => {
+    if (call.url.includes("/api/backend/open")) {
+      openCalls += 1;
+      return pendingOpen.promise.then(() => ok({ playback_id: "pb-pending" }));
+    }
+    if (call.url.includes("/api/backend/close")) {
+      if (queryOf(call).get("playback_id") === "pb-pending") {
+        return pendingClose.promise.then(() => ok({ closed: true }));
+      }
+      return ok({ closed: true });
+    }
+    throw new Error(`unexpected fetch: ${call.url}`);
+  });
+  const opening = client.open("draft-z", "timeline-z");
+  await tick();
+  let closed = false;
+  const closing = client.close().then(() => { closed = true; });
+  pendingOpen.resolve();
+  await tick();
+  assert.equal(closed, false, "close must await cleanup of a native open already in flight");
+  pendingClose.resolve();
+  assert.equal((await opening).stale, true);
+  await closing;
+  assert.equal(client.playbackId, null);
+  assert.equal(openCalls, 1);
 }
 
 async function frameQueueCap() {
@@ -772,6 +836,7 @@ async function main() {
   await seekCommitBarrier();
   await renderResponses();
   await selectionEpoch();
+  await failedLifecycleRelease();
   await frameQueueCap();
   await streamFailureRecoversOnSeek();
   await streamCloseOnlyFailsWhileActive();

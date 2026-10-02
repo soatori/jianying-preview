@@ -260,7 +260,7 @@ def playing_backward_seek(long_model):
             controller.seek(50_000, playback_id=playback_id, request_id=request_id + 1)
             target = controller.snapshot()
             assert target["t_us"] == 33_334 and target["frame_index"] == 1, target
-            frame = controller.pull_frame(500)
+            frame = controller.pull_frame(500, seek_target=True)
             assert frame is not None and frame.frame_index == 1, frame
             assert frame.seek_request_id == request_id + 1
             immediate = controller.snapshot()
