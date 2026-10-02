@@ -1,35 +1,35 @@
-"""Optional native playback backend endpoints.
+"""Native MLT playback backend endpoints.
 
-The browser UI can probe this surface without making GStreamer a hard import
-for the normal read-only server.  The endpoint returns PNG frames for exact
-single-frame validation first; continuous transport is added only after the
-full timeline profile passes the native audit.
+The browser UI probes this surface without making MLT a hard import for the
+normal read-only server.  PNG frames validate exact seeks first; the multipart
+stream carries continuous playback with per-frame identity headers stamped at
+production time so a client can discard frames its own requests superseded.
 """
 
 from __future__ import annotations
 
-import io
 import asyncio
-import json
+import contextlib
+import io
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 
-from aiohttp import web
+from aiohttp import web  # type: ignore[import-not-found]  # present in the runtime env, not the analyzer's
 
-from ..playback_backend import BackendUnavailable, GstGesBackend, clips_from_frame_ir
+from ..mlt_backend import BackendUnavailable, MltCompiler, PlaybackController
 from ._http import JSON, error_payload, offload, selector, session_of
 
 
-class NativeHandle:
-    """Serialize all GES calls on the thread where GES was initialized."""
+class PlaybackHandle:
+    """Serialize handle calls on one thread; PlaybackController owns its worker."""
 
-    def __init__(self, backend: GstGesBackend) -> None:
-        self.backend = backend
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jypreview-ges")
+    def __init__(self) -> None:
+        self.controller = PlaybackController()
+        self.playback_id = ""
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jypreview-playback")
 
     async def call(self, method: str, *args, **kwargs):
         loop = asyncio.get_running_loop()
-        fn = getattr(self.backend, method)
+        fn = getattr(self.controller, method)
         return await loop.run_in_executor(self.executor, lambda: fn(*args, **kwargs))
 
     async def close(self) -> None:
@@ -43,9 +43,39 @@ def _key(did: str, tid: str) -> str:
     return f"{did}:{tid}"
 
 
+def _int_param(value: str | None, name: str, minimum: int | None = None) -> int:
+    try:
+        parsed = int(value or "")
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer") from None
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return parsed
+
+
+def _frame_headers(frame) -> dict[str, str]:
+    # Frame envelope comes from the RenderedFrame stamped at production, never
+    # from a current snapshot: a delayed encode must keep the old identity.
+    return {"X-Backend": "mlt",
+            "X-Playback-ID": frame.playback_id,
+            "X-Playback-Generation": str(frame.generation),
+            "X-Seek-Request-ID": str(frame.seek_request_id),
+            "X-Project-Frame": str(frame.frame_index),
+            "X-Project-PTS-US": str(frame.pts_us)}
+
+
+def _encode_png(frame) -> bytes:
+    from PIL import Image
+
+    image = Image.frombytes("RGBA", (frame.width, frame.height), frame.rgba)
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
 async def capabilities(request: web.Request) -> web.Response:
-    available, reason = await offload(GstGesBackend.available)
-    return JSON({"name": "gstreamer-ges", "available": available, "reason": reason,
+    available, reason = await offload(MltCompiler.available)
+    return JSON({"name": "mlt", "available": available, "reason": reason,
                  "installed": available})
 
 
@@ -53,140 +83,192 @@ async def open_backend(request: web.Request) -> web.Response:
     session = session_of(request)
     view = await offload(lambda: session.view(selector(request)))
     tid = await offload(lambda: view.resolve_timeline(request.query.get("timeline") or "active")["id"])
-    entry = await offload(lambda: view.resolve_timeline(tid))
-    duration_us = int(entry.get("duration_us") or 0)
-    if duration_us <= 0:
-        return error_payload("native_empty_timeline", "timeline has no duration", status=422)
-    handle = None
+    model = await offload(lambda: view.timeline_model(tid))
+    handle = PlaybackHandle()
     try:
-        ir = await offload(lambda: view.frame(tid, 0, window=(0, duration_us)))
-        clips = clips_from_frame_ir(ir)
-        handle = NativeHandle(GstGesBackend())
-        await handle.call("open", view.did, tid, profile={
-            "clips": clips, "realtime": request.query.get("realtime") in ("1", "true"),
-            "audio_sink": request.query.get("audio_sink") or "fakesink",
-        })
-        if request.query.get("realtime") in ("1", "true"):
-            await handle.call("render_at", 0)
+        state = await handle.call("open", model)
     except BackendUnavailable as exc:
-        if handle:
-            await handle.close()
-        return error_payload("native_backend_unavailable", str(exc), status=503)
-    except (NotImplementedError, RuntimeError, ValueError) as exc:
-        if handle:
-            await handle.close()
-        return error_payload("native_backend_open_failed", str(exc), status=422)
-    backends = request.app["native_backends"]
+        await handle.close()
+        return error_payload("mlt_backend_unavailable", str(exc), status=503)
+    except (NotImplementedError, RuntimeError, ValueError, TypeError) as exc:
+        await handle.close()
+        return error_payload("mlt_backend_open_failed", str(exc), status=422)
+    except Exception as exc:  # noqa: BLE001
+        await handle.close()
+        return error_payload("mlt_backend_open_failed", str(exc), status=500)
+    handle.playback_id = state["playback_id"]
+    backends = request.app["playback_backends"]
     key = _key(view.did, tid)
     previous = backends.get(key)
     if previous:
         await previous.close()
     backends[key] = handle
-    return JSON({"key": key, "timeline": tid, "clips": len(clips),
-                 "capabilities": handle.backend.capabilities.__dict__,
-                 "snapshot": await handle.call("snapshot")})
+    # Echo the resolved selectors so the client can keep every later handle
+    # request on the same key even when open() was given a raw name.
+    return JSON({"did": view.did, "key": key, "timeline": tid, "snapshot": state})
 
 
-def _backend(request: web.Request):
+async def _open_handle(request: web.Request) -> web.Response | PlaybackHandle:
+    """Resolve the handle, or the structured error rejecting this caller."""
     key = _key(request.query.get("draft") or "", request.query.get("timeline") or "")
-    handle = request.app["native_backends"].get(key)
+    handle = request.app["playback_backends"].get(key)
     if handle is None:
-        raise web.HTTPNotFound(text="native backend is not open")
+        raise web.HTTPNotFound(text="playback backend is not open")
+    playback_id = request.query.get("playback_id") or ""
+    if not playback_id:
+        return error_payload("invalid_playback_id", "missing ?playback_id", status=400)
+    if playback_id != handle.playback_id:
+        # Do not echo the current credential back to an excluded caller.
+        return error_payload("stale_playback_id", "playback_id does not match the open session",
+                             status=409)
     return handle
 
 
 async def render(request: web.Request) -> web.Response:
-    handle = _backend(request)
+    handle = await _open_handle(request)
+    if isinstance(handle, web.Response):
+        return handle
     try:
-        t_us = int(float(request.query.get("t_us") or 0))
-        result = await handle.call("render_at", t_us)
-    except (RuntimeError, ValueError) as exc:
-        return error_payload("native_render_failed", str(exc), status=422)
-    if not result.get("ok"):
-        return web.json_response({"ok": False, "code": "native_buffering",
-                                   "reason": result.get("reason", ""), "data": result},
-                                  status=503, dumps=lambda value: json.dumps(value, default=str))
+        request_id = _int_param(request.query.get("request_id", "0"), "request_id", minimum=0)
+    except ValueError as exc:
+        return error_payload("invalid_request_id", str(exc), status=400)
+    # The snapshot settles the accepted seek so its frame lands in the slot;
+    # render never issues a seek of its own.
+    state = await handle.call("snapshot")
+    if state["phase"] == "ended":
+        # No frame is pulled at ended, so the settled snapshot authors the
+        # envelope headers (the accepted identity for this request id).
+        headers = {"X-Backend": "mlt",
+                   "X-Playback-ID": state["playback_id"],
+                   "X-Playback-Generation": str(state["generation"]),
+                   "X-Seek-Request-ID": str(state["seek_request_id"]),
+                   "X-Project-Frame": str(state["frame_index"]),
+                   "X-Project-PTS-US": str(state["t_us"])}
+        return JSON({"ended": True, "snapshot": state}, headers=headers)
+    if state["error"]:
+        return error_payload("mlt_render_failed", state["error"], status=500)
     try:
-        from PIL import Image
-
-        image = Image.frombytes("RGBA", (result["width"], result["height"]), result["buffer"])
-        output = io.BytesIO()
-        image.save(output, format="PNG")
-    except Exception as exc:  # noqa: BLE001
-        return error_payload("native_encode_failed", str(exc), status=500)
-    return web.Response(body=output.getvalue(), content_type="image/png",
-                        headers={"X-Backend": "gstreamer-ges",
-                                 "X-Backend-PTS-US": str(result.get("pts_us"))})
+        frame = await handle.call("pull_frame", 500)
+    except RuntimeError as exc:
+        # A dying sink raises here; surface it as the render failure it is.
+        return error_payload("mlt_render_failed", str(exc), status=500)
+    if frame is None:
+        return error_payload("mlt_frame_unavailable", "no frame is available", status=503)
+    if frame.playback_id != handle.playback_id or frame.seek_request_id != request_id:
+        return error_payload("frame_superseded", "frame identity does not match request_id",
+                             status=409, frame_playback_id=frame.playback_id,
+                             frame_request_id=frame.seek_request_id,
+                             frame_generation=frame.generation)
+    payload = await offload(_encode_png, frame)
+    return web.Response(body=payload, content_type="image/png", headers=_frame_headers(frame))
 
 
 async def play(request: web.Request) -> web.Response:
-    handle = _backend(request)
+    handle = await _open_handle(request)
+    if isinstance(handle, web.Response):
+        return handle
     try:
-        await handle.call("play", float(request.query.get("rate") or 1.0))
-    except (RuntimeError, NotImplementedError) as exc:
-        return error_payload("native_play_failed", str(exc), status=422)
-    return JSON(await handle.call("snapshot"))
+        return JSON(await handle.call("play"))
+    except (RuntimeError, NotImplementedError, ValueError) as exc:
+        return error_payload("mlt_play_failed", str(exc), status=422)
 
 
 async def pause(request: web.Request) -> web.Response:
-    handle = _backend(request)
-    await handle.call("pause")
-    return JSON(await handle.call("snapshot"))
+    handle = await _open_handle(request)
+    if isinstance(handle, web.Response):
+        return handle
+    try:
+        return JSON(await handle.call("pause"))
+    except (RuntimeError, NotImplementedError, ValueError) as exc:
+        return error_payload("mlt_pause_failed", str(exc), status=422)
 
 
 async def seek(request: web.Request) -> web.Response:
-    handle = _backend(request)
+    handle = await _open_handle(request)
+    if isinstance(handle, web.Response):
+        return handle
     try:
-        await handle.call("seek", int(float(request.query.get("t_us") or 0)))
+        t_us = _int_param(request.query.get("t_us"), "t_us")
+        request_id = _int_param(request.query.get("request_id"), "request_id", minimum=1)
+    except ValueError as exc:
+        return error_payload("invalid_seek_params", str(exc), status=400)
+    try:
+        result = await handle.call("seek", t_us,
+                                   playback_id=handle.playback_id, request_id=request_id)
     except (RuntimeError, ValueError) as exc:
-        return error_payload("native_seek_failed", str(exc), status=422)
-    return JSON(await handle.call("snapshot"))
+        return error_payload("mlt_seek_failed", str(exc), status=422)
+    return JSON(result)
 
 
 async def stream(request: web.Request) -> web.StreamResponse:
-    handle = _backend(request)
+    handle = await _open_handle(request)
+    if isinstance(handle, web.Response):
+        return handle
     response = web.StreamResponse(headers={
         "Content-Type": "multipart/x-mixed-replace; boundary=frame",
-        "Cache-Control": "no-store", "X-Backend": "gstreamer-ges"})
+        "Cache-Control": "no-store", "X-Backend": "mlt"})
     await response.prepare(request)
+    last = None
     try:
-        from PIL import Image
         while True:
-            result = await handle.call("pull_frame", 250)
-            if not result:
-                await asyncio.sleep(0.01)
+            transport = request.transport
+            if transport is None or transport.is_closing():
+                request.app["log"].append("mlt stream: client disconnected")
+                break
+            frame = await handle.call("pull_frame", 100)
+            if frame is None:
+                await asyncio.sleep(0.02)
                 continue
-            image = Image.frombytes("RGBA", (result["width"], result["height"]), result["buffer"])
-            output = io.BytesIO()
-            image.save(output, format="PNG")
-            payload = output.getvalue()
+            stamp = (frame.playback_id, frame.generation, frame.seek_request_id,
+                     frame.frame_index, frame.pts_us)
+            if stamp == last:
+                # Re-sending the identical frame would spin; wait for progress.
+                await asyncio.sleep(0.02)
+                continue
+            last = stamp
+            payload = await offload(_encode_png, frame)
+            headers = "".join(f"{name}: {value}\r\n" for name, value in _frame_headers(frame).items())
             await response.write(
                 b"--frame\r\nContent-Type: image/png\r\n"
                 + f"Content-Length: {len(payload)}\r\n".encode()
-                + f"X-Backend-PTS-US: {result.get('pts_us')}\r\n\r\n".encode()
-                + payload + b"\r\n")
+                + headers.encode() + b"\r\n" + payload + b"\r\n")
     except ConnectionResetError:
-        request.app["log"].append("native stream: client connection reset")
+        request.app["log"].append("mlt stream: client connection reset")
     except asyncio.CancelledError:
-        request.app["log"].append("native stream: request cancelled")
+        request.app["log"].append("mlt stream: request cancelled")
         raise
     except Exception as exc:  # noqa: BLE001
-        request.app["log"].append(f"native stream: {exc.__class__.__name__}: {exc}")
+        request.app["log"].append(f"mlt stream: {exc.__class__.__name__}: {exc}")
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await response.write_eof()
-        except Exception:
-            pass
     return response
 
 
 async def snapshot(request: web.Request) -> web.Response:
-    return JSON(await _backend(request).call("snapshot"))
+    handle = await _open_handle(request)
+    if isinstance(handle, web.Response):
+        return handle
+    return JSON(await handle.call("snapshot"))
 
 
 async def close_backend(request: web.Request) -> web.Response:
+    backends = request.app["playback_backends"]
+    if not (request.query.get("draft") or request.query.get("timeline")):
+        # With no selector to scope a key, the playback_id IS the close identity:
+        # exact match only, so a stale/unknown id closes nothing (404).
+        playback_id = request.query.get("playback_id") or ""
+        key = next((k for k, h in backends.items() if h.playback_id == playback_id), None)
+        if key is None:
+            raise web.HTTPNotFound(text="playback backend is not open")
+        popped = backends.pop(key)
+        await popped.close()
+        return JSON({"closed": True, "key": key})
+    handle = await _open_handle(request)
+    if isinstance(handle, web.Response):
+        return handle
     key = _key(request.query.get("draft") or "", request.query.get("timeline") or "")
-    handle = request.app["native_backends"].pop(key, None)
-    if handle:
-        await handle.close()
-    return JSON({"closed": bool(handle), "key": key})
+    popped = backends.pop(key, None)
+    if popped:
+        await popped.close()
+    return JSON({"closed": popped is not None, "key": key})

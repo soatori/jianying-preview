@@ -37,7 +37,7 @@ async def web_asset(request: web.Request) -> web.Response:
     rel = (request.match_info.get("path") or "").replace("\\", "/").lstrip("/")
     root = WEB_DIR.resolve()
     target = (root / rel).resolve()
-    if not str(target).startswith(str(root) + "\\") or not target.is_file():
+    if not target.is_relative_to(root) or not target.is_file():
         return error_payload("not_found", f"no such ui file: {rel}", status=404)
     suffix = target.suffix.lower()
     if suffix in (".js", ".css", ".html"):

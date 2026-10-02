@@ -15,6 +15,7 @@ from .draft_id import draft_id
 from .files import FileRegistry
 from .model.content import TimelineContent
 from .model.fonts import FontIndex
+from .model.timeline import TimelineModel
 from .model import framedesc
 
 
@@ -43,6 +44,7 @@ class DraftView:
         self.root = Path(row["path"])
         self.did = row["did"]
         self._contents: dict[str, tuple[TimelineContent, dict]] = {}
+        self._timeline_models: dict[str, TimelineModel] = {}
 
     @property
     def name(self) -> str:
@@ -100,6 +102,31 @@ class DraftView:
         content = TimelineContent.build(value, meta={**meta, "tid": tid, "layout": self.layout})
         self._contents[str(tid)] = (content, meta)
         return self._contents[str(tid)]
+
+    def timeline_model(self, tid: str) -> TimelineModel:
+        key = str(tid).upper()
+        if key not in self._timeline_models:
+            from .model.draft_adapter import DraftAdapter
+
+            content, _ = self.content(tid)
+            entry = next(item for item in self.timelines if str(item.get("id")).upper() == key)
+            primary = entry.get("primary")
+            rel = None
+            if primary:
+                try:
+                    rel = str(Path(primary).relative_to(self.root)).replace("\\", "/")
+                except ValueError:
+                    rel = Path(primary).name
+            session = self.session
+            self._timeline_models[key] = DraftAdapter(
+                session.config, session.registry, session.font_index, session.catalog,
+                Path(session.config.user_state_dir) / "probes",
+            ).build(content, draft_root=self.root, did=self.did,
+                    timeline_info={"layout": self.layout, "name": entry.get("name"),
+                                   "encoding": entry.get("encoding"), "content_rel": rel,
+                                   "mirror_drift": self.mirror.get("drift", False),
+                                   "replica_errors": entry.get("replica_errors", [])})
+        return self._timeline_models[key]
 
     def describe(self) -> dict[str, Any]:
         mirror = self.mirror
