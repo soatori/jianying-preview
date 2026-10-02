@@ -563,15 +563,53 @@ async def endpoint_acceptance(model):
         await client.close()
 
 
+_capture_pin = {"stamps_while_running": 0, "stamps_while_stopped": 0}
+_capture_pin_local = threading.local()
+_orig_capture = PlaybackController._capture
+_orig_stamp = PlaybackController._stamp
+
+
+def _pin_capture(self, mlt_frame):
+    """Run the real _capture with this thread marked as on the capture path."""
+    _capture_pin_local.in_capture = True
+    try:
+        return _orig_capture(self, mlt_frame)
+    finally:
+        _capture_pin_local.in_capture = False
+
+
+def _pin_stamp(self, position, rgba):
+    """Count capture-path stamps by consumer state; listener stamps pass through."""
+    if getattr(_capture_pin_local, "in_capture", False):
+        if self._consumer is not None and not self._consumer.is_stopped():
+            _capture_pin["stamps_while_running"] += 1
+        else:
+            _capture_pin["stamps_while_stopped"] += 1
+    return _orig_stamp(self, position, rgba)
+
+
 def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     long_model = build_model(LONG_US, still("red", (255, 0, 0)), tone("tone-long", 31))
     short_model = build_model(500_000, still("blue", (0, 0, 255)), tone("tone-short", 1))
 
+    # Capture-guard pin (design: temp/teardown/verify.md): pin the e562d7f
+    # invariant that no capture-path _stamp ever lands while the consumer runs.
+    # The thread-local marks capture-path _stamp calls only, so concurrent
+    # frame-show-listener stamps are not counted.
+    PlaybackController._capture = _pin_capture
+    PlaybackController._stamp = _pin_stamp
+
     controller, playback_id = phase_machine(long_model)
     arrival_order(controller, playback_id)
     end_and_cleanup(controller, playback_id)
     transport_and_clock(controller, playback_id)
+    # Non-vacuous pin: the stopped path really stamped, and no capture-path stamp
+    # ever landed while the consumer was running. Today _capture runs only on
+    # worker settle pulls (consumer stopped); a seam regression that routes a
+    # running-consumer pull through it trips the first assert.
+    assert _capture_pin["stamps_while_running"] == 0, _capture_pin
+    assert _capture_pin["stamps_while_stopped"] >= 1, _capture_pin
     controller.close()
     consumer_failure_and_reopen(long_model, playback_id)
     end_of_stream(short_model)
