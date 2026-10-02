@@ -412,12 +412,17 @@ async function selectionEpoch() {
     if (call.url.includes("/api/backend/open")) {
       openCount += 1;
       if (openCount === 1) {
-        return firstOpen.promise.then(() => ok({ playback_id: "pb-late" }, {
-          headers: { "X-Playback-ID": "pb-late" },
-        }));
+        return firstOpen.promise.then(() => ok({
+          playback_id: "pb-late", did: "draft-a", timeline: "timeline-a",
+        }, { headers: { "X-Playback-ID": "pb-late" } }));
       }
-      return ok({ playback_id: "pb-current" }, {
-        headers: { "X-Playback-ID": "pb-current", "X-Playback-Generation": "0" },
+      if (openCount === 2) {
+        return ok({ playback_id: "pb-current" }, {
+          headers: { "X-Playback-ID": "pb-current", "X-Playback-Generation": "0" },
+        });
+      }
+      return ok({ playback_id: "pb-reopen" }, {
+        headers: { "X-Playback-ID": "pb-reopen", "X-Playback-Generation": "0" },
       });
     }
     if (call.url.includes("/api/backend/close")) return ok({ closed: true });
@@ -437,10 +442,30 @@ async function selectionEpoch() {
   assert.equal(client.playbackId, "pb-current", "a late open must not overwrite the selection");
   assert.equal(client.accepts({ playbackId: "pb-late", seekRequestId: 5, generation: 5 }), false,
     "old identity cannot update the new selection");
-  const closed = calls.filter((call) => call.url.includes("/api/backend/close"))
-    .map((call) => queryOf(call).get("playback_id"));
+  // The late open's echoed did/timeline must not overwrite the new selection.
+  assert.equal(client.draft, "draft-b", "a stale open must not rewrite the draft selector");
+  assert.equal(client.timeline, "timeline-b", "a stale open must not rewrite the timeline selector");
+
+  // Re-open under yet another selection: the previous handle must be closed too.
+  const reopened = await client.open("draft-c", "timeline-c");
+  assert.equal(reopened.stale, false);
+
+  // Close requests for discarded handles must carry ONLY playback_id. A merged
+  // draft/timeline would resolve the NEW key server-side (404/409) and the OLD
+  // handle's executor would leak; the selector-less URL forces the B1 exact-id path.
+  const closeCalls = calls.filter((call) => call.url.includes("/api/backend/close"));
+  const closed = closeCalls.map((call) => queryOf(call).get("playback_id"));
   assert.ok(closed.includes("pb-late"),
     "a superseded open must best-effort close the handle it leaked");
+  assert.ok(closed.includes("pb-current"),
+    "a re-open must best-effort close the previous handle");
+  for (const call of closeCalls) {
+    const query = queryOf(call);
+    assert.equal(query.get("draft"), null,
+      `close must not carry a draft selector (would resolve the wrong key): ${call.url}`);
+    assert.equal(query.get("timeline"), null,
+      `close must not carry a timeline selector (would resolve the wrong key): ${call.url}`);
+  }
 }
 
 async function frameQueueCap() {
