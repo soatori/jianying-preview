@@ -190,12 +190,14 @@ export class MltPlaybackClient {
     if (requestId !== null && requestId < this.issued) {
       return { applied: false, stale: false, superseded: true };
     }
+    // A seek acknowledgment carries the old clock; let the rendered response consume any rewind.
+    const seeking = data && data.phase === "seeking";
     const previous = this.accepted;
-    if (requestId !== null) this.accepted = requestId;
+    if (requestId !== null && !seeking) this.accepted = requestId;
     if (ident.generation !== null) this.generation = ident.generation;
     const pts = ident.ptsUs !== null ? ident.ptsUs : num(data && data.t_us);
     const moved = requestId !== null && requestId !== previous;
-    if (pts !== null && (moved || pts >= this.tUs)) {
+    if (!seeking && pts !== null && (moved || pts >= this.tUs)) {
       this.tUs = pts;                                  // never run the playhead backwards mid-position
       // frameIndex rides the same monotonic gate: a late older snapshot must not
       // move the frame backwards while the clock stays put.

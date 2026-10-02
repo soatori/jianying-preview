@@ -355,6 +355,41 @@ async function lateDecodeAfterNewerSeek() {
   assert.deepEqual(renderCalls.map((call) => queryOf(call).get("request_id")), ["1", "2"]);
 }
 
+async function backwardSeekUsesRenderedPts() {
+  const client = await openClient({ playbackId: "pb-rewind" });
+  let positionUs = 0;
+  let generation = 0;
+  installFetch((call) => {
+    const params = queryOf(call);
+    if (call.url.includes("/api/backend/seek")) {
+      const requestId = Number(params.get("request_id"));
+      generation = requestId;
+      return ok({ phase: "seeking", playing: false, t_us: positionUs }, {
+        headers: seekHeaders({ playbackId: "pb-rewind", generation, requestId,
+          frameIndex: Math.floor(positionUs / 33_333), ptsUs: positionUs }),
+      });
+    }
+    if (call.url.includes("/api/backend/render")) {
+      const requestId = Number(params.get("request_id"));
+      positionUs = Number(params.get("t_us"));
+      return new Response(Uint8Array.of(1), { status: 200, headers: {
+        "content-type": "image/png", ...seekHeaders({ playbackId: "pb-rewind", generation,
+          requestId, frameIndex: Math.floor(positionUs / 33_333), ptsUs: positionUs }),
+      } });
+    }
+    if (call.url.includes("/api/backend/close")) return ok({ closed: true });
+    throw new Error(`unexpected fetch: ${call.url}`);
+  });
+
+  await client.renderAt(8_200_000);
+  assert.equal(client.tUs, 8_200_000);
+  const rewound = await client.renderAt(0);
+  assert.equal(rewound.applied, true);
+  assert.equal(rewound.ptsUs, 0);
+  assert.equal(client.tUs, 0, "a seek acknowledgment must not block its backward rendered frame");
+  await client.close();
+}
+
 async function renderResponses() {
   const client = await openClient({ playbackId: "pb-4" });
   let mode = "superseded";
@@ -615,6 +650,7 @@ async function main() {
   await multipartParsing();
   await reorderedDispatch();
   await lateDecodeAfterNewerSeek();
+  await backwardSeekUsesRenderedPts();
   await renderResponses();
   await selectionEpoch();
   await frameQueueCap();
