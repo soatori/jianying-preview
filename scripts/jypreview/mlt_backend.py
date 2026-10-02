@@ -1,6 +1,7 @@
 """Compile immutable timeline values into an owned MLT graph and drive playback."""
 
 import ctypes
+import os
 import queue
 import threading
 import time
@@ -12,6 +13,16 @@ from typing import Any
 
 from .model.content import DEFAULT_RI
 from .model.timeline import FrameRate, TimelineModel, Transform
+
+# SDL2's default WASAPI backend faults with a native access violation when
+# mlt_consumer_stop follows >=~25 s of continuous starved playback (heavy
+# graphs crawling ~0.13x realtime leave the device in sustained underrun;
+# reproduced 6/6, null sink clean). dsound avoids the WASAPI teardown path.
+# winmm was equally AV-clean but showed intermittent ~3.8 s "audio timed
+# out" start recoveries, so dsound is the default instead. setdefault keeps
+# an explicit operator override authoritative — overriding back to WASAPI
+# re-exposes the crash.
+os.environ.setdefault("SDL_AUDIODRIVER", "dsound")
 
 
 class BackendUnavailable(RuntimeError):
@@ -286,7 +297,8 @@ class MltCompiler:
                 still = clip.kind in ("image", "photo", "sticker", "text")
                 source_rate = clip.media_ref.frame_rate if clip.media_ref else None
                 source_rate = source_rate or (clip.nested.frame_rate if clip.nested else model.frame_rate)
-                if mode == "audio" and clip.nested is None: source_rate = model.frame_rate
+                if mode == "audio" and clip.nested is None:
+                    source_rate = model.frame_rate
                 mapping = clip.time_mapping
                 speed = mapping.rate_num / mapping.rate_den
                 reverse = mapping.direction == "reverse"
@@ -383,9 +395,12 @@ class MltCompiler:
                 lane = keep(mlt.Playlist(profile))
                 lane.set("jypreview.clip_id", clip.id)
                 lane.set("jypreview.track_id", track.id)
-                if not visual: lane.set("hide", 1)
-                if not audio: lane.set("hide", 2 if visual else 3)
-                if audio: lane.set("set.test_audio", 0)
+                if not visual:
+                    lane.set("hide", 1)
+                if not audio:
+                    lane.set("hide", 2 if visual else 3)
+                if audio:
+                    lane.set("set.test_audio", 0)
                 positions, weights, volumes = [], {}, {}
                 for start, end in merged:
                     for pos in range(start, end):
@@ -431,8 +446,10 @@ class MltCompiler:
                         for effect in clip.effects:
                             if effect.window and effect.window.contains(stamp) and effect.window.duration_us:
                                 progress = (stamp - effect.window.start_us) / effect.window.duration_us
-                                if effect.kind == "audio_fade_in": gain *= progress
-                                elif effect.kind == "audio_fade_out": gain *= 1 - progress
+                                if effect.kind == "audio_fade_in":
+                                    gain *= progress
+                                elif effect.kind == "audio_fade_out":
+                                    gain *= 1 - progress
                         volumes[pos] = gain
                 if decoder is not None:
                     tractor._audio_decoders.append((decoder, dict(positions)))
@@ -445,14 +462,16 @@ class MltCompiler:
                 cursor, i = 0, 0
                 while i < len(positions):
                     pos, source_pos = positions[i]
-                    if pos > cursor: lane.blank(pos - cursor - 1)
+                    if pos > cursor:
+                        lane.blank(pos - cursor - 1)
                     j = i + 1
                     while j < len(positions) and positions[j] == (pos + j-i, source_pos + j-i):
                         j += 1
                     lane.append(producer, source_pos, source_pos + j-i-1)
                     cursor = pos + j-i
                     i = j
-                if cursor < count: lane.blank(count - cursor - 1)
+                if cursor < count:
+                    lane.blank(count - cursor - 1)
                 if audio:
                     gain_filter = keep(mlt.Filter(profile, "volume"))
                     if all(value == clip.audio.volume for value in volumes.values()):
@@ -472,7 +491,8 @@ class MltCompiler:
                         lane.attach(mask)
                     if clip.transform.flip_x or clip.transform.flip_y:
                         flip = keep(mlt.Filter(profile, "frei0r.flippo"))
-                        flip.set("0", int(clip.transform.flip_x)); flip.set("1", int(clip.transform.flip_y))
+                        flip.set("0", int(clip.transform.flip_x))
+                        flip.set("1", int(clip.transform.flip_y))
                         lane.attach(flip)
                 index = tractor.multitrack().count()
                 tractor.set_track(lane, index)
@@ -494,7 +514,8 @@ class MltCompiler:
                     tractor.plant_transition(blend, 0, index)
                 if audio:
                     mix = keep(mlt.Transition(profile, "mix"))
-                    mix.set("sum", 1); mix.set("always_active", 1)
+                    mix.set("sum", 1)
+                    mix.set("always_active", 1)
                     tractor.plant_transition(mix, 0, index)
             tractor.set("length", count)
             tractor.set_in_and_out(0, count - 1)
