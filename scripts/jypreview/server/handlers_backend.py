@@ -25,6 +25,7 @@ class PlaybackHandle:
     def __init__(self) -> None:
         self.controller = PlaybackController()
         self.playback_id = ""
+        self.teardown_failed = False
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jypreview-playback")
 
     async def call(self, method: str, *args, **kwargs):
@@ -33,10 +34,30 @@ class PlaybackHandle:
         return await loop.run_in_executor(self.executor, lambda: fn(*args, **kwargs))
 
     async def close(self) -> None:
+        close_future = asyncio.get_running_loop().run_in_executor(self.executor, self.controller.close)
+        canceled = False
+        while True:
+            try:
+                await asyncio.shield(close_future)
+                break
+            except asyncio.CancelledError:
+                canceled = True
+        # Failed teardown retains the executor/owner for retry; only success retires it.
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        if canceled:
+            raise asyncio.CancelledError
+
+
+async def _retire_backend(backends, key, handle=None):
+    previous = backends.pop(key, None) if handle is None else handle
+    if previous:
         try:
-            await self.call("close")
-        finally:
-            self.executor.shutdown(wait=True, cancel_futures=True)
+            await previous.close()
+        except Exception:
+            previous.teardown_failed = True
+            backends[key] = previous  # failed teardown must still own this registry key
+            raise
+    return previous
 
 
 def _key(did: str, tid: str) -> str:
@@ -92,24 +113,26 @@ async def open_backend(request: web.Request) -> web.Response:
 
 async def _replace_backend(request, did, tid, key, model):
     backends = request.app["playback_backends"]
-    previous = backends.pop(key, None)
-    if previous:
-        await previous.close()
+    # Uncertain teardown is not an independent live session; retire it before any sink probe.
+    for failed_key, failed in list(backends.items()):
+        if getattr(failed, "teardown_failed", False):
+            await _retire_backend(backends, failed_key)
+    await _retire_backend(backends, key)
     handle = PlaybackHandle()
     try:
         state = await handle.call("open", model)
     except asyncio.CancelledError:
         # The executor may still be probing; close queues behind it and joins it.
-        await handle.close()
+        await _retire_backend(backends, key, handle)
         raise
     except BackendUnavailable as exc:
-        await handle.close()
+        await _retire_backend(backends, key, handle)
         return error_payload("mlt_backend_unavailable", str(exc), status=503)
     except (NotImplementedError, RuntimeError, ValueError, TypeError) as exc:
-        await handle.close()
+        await _retire_backend(backends, key, handle)
         return error_payload("mlt_backend_open_failed", str(exc), status=422)
     except Exception as exc:  # noqa: BLE001
-        await handle.close()
+        await _retire_backend(backends, key, handle)
         return error_payload("mlt_backend_open_failed", str(exc), status=500)
     handle.playback_id = state["playback_id"]
     backends[key] = handle
@@ -276,14 +299,11 @@ async def _close_backend(request: web.Request) -> web.Response:
         key = next((k for k, h in backends.items() if h.playback_id == playback_id), None)
         if key is None:
             raise web.HTTPNotFound(text="playback backend is not open")
-        popped = backends.pop(key)
-        await popped.close()
+        await _retire_backend(backends, key)
         return JSON({"closed": True, "key": key})
     handle = await _open_handle(request)
     if isinstance(handle, web.Response):
         return handle
     key = _key(request.query.get("draft") or "", request.query.get("timeline") or "")
-    popped = backends.pop(key, None)
-    if popped:
-        await popped.close()
+    popped = await _retire_backend(backends, key)
     return JSON({"closed": popped is not None, "key": key})

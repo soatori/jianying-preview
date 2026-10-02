@@ -592,6 +592,8 @@ class PlaybackController:
                 self._submit(self._h_close)
             finally:
                 worker.join(timeout=5)
+        else:
+            self._h_close()  # a failed close may retain native owners after worker retirement
 
     def pull_frame(self, timeout_ms: int = 100, *, seek_target: bool = False) -> RenderedFrame | None:
         phase, intent = self._submit(self._h_prepare_pull)
