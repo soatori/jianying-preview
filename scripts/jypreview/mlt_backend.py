@@ -272,7 +272,9 @@ class MltCompiler:
                 if transition.kind not in ("fade", "crossfade"):
                     warnings.append(f"transition_unsupported:{transition.id}")
 
-            for _, _, _, track, clip, mode in clips:
+            previous_still = None
+            for z, ti, _, track, clip, mode in clips:
+                previous, previous_still = previous_still, None
                 warnings.extend(clip.warnings)
                 for effect in clip.effects + clip.animations:
                     warnings.extend(effect.warnings)
@@ -392,9 +394,27 @@ class MltCompiler:
                     length = max(count, max(end for _, end in merged))
                     producer.set("length", length)
                     producer.set_in_and_out(0, length - 1)
-                lane = keep(mlt.Playlist(profile))
-                lane.set("jypreview.clip_id", clip.id)
-                lane.set("jypreview.track_id", track.id)
+                eligible = (visual and clip.kind in ("image", "photo") and not broken
+                            and clip.media_ref is not None and clip.media_ref.exists
+                            and clip.nested is None and not clip.effects and not clip.animations
+                            and not any(clip.id in (t.from_clip_id, t.to_clip_id)
+                                        for t in model.transitions))
+                key = (ti, z, clip.transform, clip.crop, clip.opacity, clip.blend_mode)
+                shared = (eligible and previous is not None and previous[0] == key
+                          and previous[1] <= clip.timeline_range.start_us
+                          and previous[2] <= merged[0][0])
+                if shared:
+                    lane = previous[3]
+                    # The prior clip's trailing blank becomes this clip's leading gap.
+                    if previous[2] < count:
+                        lane.remove(lane.count() - 1)
+                    lane.set("jypreview.clip_id", "")
+                else:
+                    lane = keep(mlt.Playlist(profile))
+                    lane.set("jypreview.clip_id", clip.id)
+                    lane.set("jypreview.track_id", track.id)
+                if eligible:
+                    producer.set("jypreview.clip_id", clip.id)
                 if not visual:
                     lane.set("hide", 1)
                 if not audio:
@@ -459,7 +479,7 @@ class MltCompiler:
                         tractor._audio_decoders.append((descendant, mapped))
                 # ponytail: scan project samples once at compile time; group consecutive cuts.
                 # Add piecewise rational runs only if large timelines make compilation expensive.
-                cursor, i = 0, 0
+                cursor, i = previous[2] if shared else 0, 0
                 while i < len(positions):
                     pos, source_pos = positions[i]
                     if pos > cursor:
@@ -472,6 +492,8 @@ class MltCompiler:
                     i = j
                 if cursor < count:
                     lane.blank(count - cursor - 1)
+                if eligible:
+                    previous_still = (key, clip.timeline_range.end_us, cursor, lane)
                 if audio:
                     gain_filter = keep(mlt.Filter(profile, "volume"))
                     if all(value == clip.audio.volume for value in volumes.values()):
@@ -480,7 +502,7 @@ class MltCompiler:
                         gain_filter.set("level", ";".join(f"{pos}={20*log10(max(gain,1e-10))}"
                                                            for pos,gain in volumes.items()))
                     lane.attach(gain_filter)
-                if visual:
+                if visual and not shared:
                     if clip.crop != (0, 0, 1, 1):
                         left, top, right, bottom = clip.crop
                         mask = keep(mlt.Filter(profile, "frei0r.alphaspot"))
@@ -495,8 +517,9 @@ class MltCompiler:
                         flip.set("1", int(clip.transform.flip_y))
                         lane.attach(flip)
                 index = tractor.multitrack().count()
-                tractor.set_track(lane, index)
-                if visual:
+                if not shared:
+                    tractor.set_track(lane, index)
+                if visual and not shared:
                     blend = keep(mlt.Transition(profile, "frei0r.cairoaffineblend"))
                     width, height = model.canvas
                     t = clip.transform

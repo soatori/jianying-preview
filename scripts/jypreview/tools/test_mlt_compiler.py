@@ -6,6 +6,7 @@ import ctypes
 from dataclasses import FrozenInstanceError, replace
 import os
 from pathlib import Path
+import random
 import struct
 import wave
 
@@ -79,6 +80,95 @@ def color(compiled, position, expected, x=W//2, y=H//2):
     assert all(abs(a-b) <= 3 for a, b in zip(actual[:3], expected)), (position, actual, expected)
 
 
+def still_lane_regressions(compiler, red, green, blue):
+    import mlt7 as mlt
+    clips = (picture("r", red, start=33334, duration=200000, warnings=("r-note",)),
+             replace(picture("b", blue, start=333334, duration=300000), kind="photo"),
+             picture("g", green, start=633334, duration=200000))
+    graph = compiler.compile(model(Track("stills", "image", clips)))
+    assert graph.tractor.multitrack().count() == 2, "consecutive stills should share one lane"
+    lane = mlt.Playlist(graph.tractor.multitrack().track(1))
+    assert lane.get("jypreview.track_id") == "stills" and not lane.get("jypreview.clip_id")
+    assert lane.get_length() == 30 and "r-note" in graph.warnings
+    # Includes both sides of cuts, leading/interior/trailing blanks and backwards seeks.
+    order = list(range(30)); random.Random(42).shuffle(order)
+    for pos in order + [1, 7, 8, 10, 11, 19, 20, 25, 26, 29, 0]:
+        expected = next((rgb for clip,rgb in zip(clips,((255,0,0),(0,0,255),(0,255,0)))
+                         if clip.timeline_range.contains(FPS.sample_us(pos))), (0,0,0))
+        color(graph, pos, expected)
+    cuts = [lane.clip_info(i) for i in range(lane.count()) if not lane.is_blank(i)]
+    assert [cut.frame_in for cut in cuts] == [0, 0, 0], "each image starts at its own local frame"
+    assert [cut.producer.get("jypreview.clip_id") for cut in cuts] == ["r", "b", "g"]
+    graph.close()
+    # Shared crop/flip/opacity/blend must be applied once, with pixel equivalence to separate lanes.
+    styled = tuple(replace(c, crop=(.25,0,.75,1), opacity=.5, blend_mode="add",
+                           transform=Transform(150,90,180,100,flip_x=True)) for c in clips)
+    shared = compiler.compile(model(Track("stills", "image", styled)))
+    separate = compiler.compile(model(Track("stills", "image", tuple(
+        replace(c, effects=(EffectSpec("barrier", "unsupported"),)) for c in styled))))
+    assert shared.tractor.multitrack().count() == 2
+    assert separate.tractor.multitrack().count() == 4
+    for pos in order:
+        assert pixels(shared, pos) == pixels(separate, pos), pos
+    assert mlt.Playlist(shared.tractor.multitrack().track(1)).filter_count() == 2
+    shared.close(); separate.close()
+    first, second = picture("a",red,duration=500000), picture("b",blue,start=500000,duration=500000)
+    child = model(Track("nested", "image", (picture("nested-red",red),)))
+    variants = (replace(second,render_index=1), replace(second,transform=Transform(150,90,100,100)),
+                replace(second,crop=(.25,0,.75,1)), replace(second,opacity=.5),
+                replace(second,blend_mode="add"), replace(second,effects=(EffectSpec("fx","unsupported"),)),
+                replace(second,animations=(EffectSpec("anim","unsupported"),)),
+                replace(second,nested=child), replace(second,placeholder=True),
+                replace(second,media_ref=replace(blue,exists=False)),
+                replace(second,kind="sticker"), replace(second,kind="video",source_range=TimeRange(0,500000)),
+                replace(second,timeline_range=TimeRange(499999,500001)))
+    for different in variants:
+        graph = compiler.compile(model(Track("stills", "image", (first,different))))
+        assert graph.tractor.multitrack().count() == 3, different
+        color(graph,0,(255,0,0))
+        pixels(graph,15)
+        graph.close()
+    # Every associated transition blocks grouping, including unsupported/zero-length ones.
+    for kind, duration in (("fade",100000),("crossfade",100000),("unsupported",100000),("fade",0)):
+        transition = Transition("t",kind,TimeRange(500000,duration),"a","b")
+        graph = compiler.compile(model(Track("stills","image",(first,second)),transitions=(transition,)))
+        assert graph.tractor.multitrack().count() == 3, transition
+        pixels(graph,15); graph.close()
+    broken_path = ROOT / "broken-still.mp4"; broken_path.write_bytes(b"not media")
+    broken = replace(second,media_ref=replace(blue,path=str(broken_path)))
+    with corrupt_decode_log():
+        graph = compiler.compile(model(Track("stills","image",(first,broken))))
+    assert graph.tractor.multitrack().count() == 3
+    assert "media_placeholder:b" in graph.warnings
+    color(graph,15,(224,64,160)); graph.close()
+    # An ineligible middle row must also prevent bridging two eligible rows.
+    middle = replace(second,timeline_range=TimeRange(333334,166666),effects=(EffectSpec("fx","unsupported"),))
+    graph = compiler.compile(model(Track("stills","image",(
+        replace(first,timeline_range=TimeRange(0,333334)),middle,replace(second,id="c")))))
+    assert graph.tractor.multitrack().count() == 4
+    color(graph,0,(255,0,0)); color(graph,10,(0,0,255)); color(graph,15,(0,0,255)); graph.close()
+    # A row from another original track is a barrier; never pack past it.
+    graph = compiler.compile(model(Track("A","image",(first,second)),
+                                   Track("B","image",(replace(second,id="c"),))))
+    assert graph.tractor.multitrack().count() == 3
+    color(graph,15,(0,0,255)); graph.close()
+    # Sorted row order may contain backwards time; keep that painter order unchanged.
+    graph = compiler.compile(model(Track("stills","image",(second,first))))
+    assert graph.tractor.multitrack().count() == 3
+    color(graph,0,(255,0,0)); color(graph,15,(0,0,255)); graph.close()
+    # 45 image clips plus a separate audio lane and background: 47 -> 3 tracks.
+    sound = ROOT / "lane-audio.wav"
+    with wave.open(str(sound),"wb") as output:
+        output.setparams((2,2,48000,0,"NONE","none")); output.writeframes(bytes(48000*4))
+    audio = MediaRef("lane-audio",str(sound),True,has_audio=True)
+    stills = tuple(picture(f"image-{i}",(red,green,blue)[i%3],start=i*1000000) for i in range(45))
+    graph = compiler.compile(model(Track("stills","image",stills),Track("audio","audio",(
+        Clip("sound","audio",TimeRange(0,45000000),TimeRange(0,1000000),audio),)),duration=45000000))
+    assert graph.tractor.multitrack().count() == 3
+    assert len(graph.tractor._audio_decoders) == 1
+    graph.close()
+
+
 def review_regressions(compiler, video, marker_media, mlt, get_audio):
     def marker_read(graph, position, expected):
         graph.tractor.seek(position)
@@ -148,6 +238,7 @@ def main():
     assert compiler.available()[0], compiler.available()
     red, green, blue = (still(n, c) for n, c in (
         ("red", (255, 0, 0)), ("green", (0, 255, 0)), ("blue", (0, 0, 255))))
+    still_lane_regressions(compiler, red, green, blue)
     # A's adjacent z crossing must cross B's continuous lane at exactly frame 15.
     graph = compiler.compile(model(
         Track("A", "video", (picture("a0", red, duration=500_000, z=0),
