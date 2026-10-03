@@ -139,6 +139,101 @@ def native_frame_handoff(long_model):
         controller.close()
 
 
+def stream_readiness():
+    controller = PlaybackController()
+    submit = controller._submit
+    rgba = bytes(16)
+    def ready(position=237):
+        controller._open = True
+        controller._phase = "paused"
+        controller._playback_id = "readiness"
+        controller._fps = FPS
+        controller._width = controller._height = 2
+        controller._stamp(position,rgba)
+        frame = controller._frame_slot
+        return (frame.playback_id,frame.generation,frame.seek_request_id,frame.frame_index,frame.pts_us)
+    def wait_call(after, timeout=500):
+        result = []
+        def call():
+            try: result.append(controller._pull_stream_frame(timeout,after_identity=after))
+            except Exception as exc: result.append(exc)
+        thread = threading.Thread(target=call)
+        thread.start()
+        return thread,result
+    try:
+        after = submit(ready)
+        assert hasattr(controller,"_pull_stream_frame"), "bounded frame-ready stream wait is missing"
+        def brief_frame():
+            time.sleep(.003); controller._stamp(238,rgba)
+            time.sleep(.003); controller._stamp(239,rgba)
+        producer = threading.Thread(target=brief_frame)
+        producer.start()
+        frame = controller._pull_stream_frame(100,after_identity=after)
+        producer.join()
+        assert frame.frame_index == 238, "3ms-lived frame must wake the stream between checks"
+        # An update after selection but before reply must leave a ready signal.
+        after = submit(ready)
+        fired = False
+        def selection_then_update(handler,*args):
+            nonlocal fired
+            result = submit(handler,*args)
+            if not fired:
+                fired = True
+                controller._stamp(238,rgba)
+            return result
+        controller._submit = selection_then_update
+        assert controller._pull_stream_frame(100,after_identity=after).frame_index == 238
+        controller._submit = submit
+        # Same identity notifications never extend the absolute deadline or emit repeats.
+        after = submit(lambda: ready(238))
+        stop = threading.Event()
+        def repeat():
+            while not stop.wait(.002): controller._stamp(238,rgba)
+        producer = threading.Thread(target=repeat)
+        producer.start(); started=time.monotonic()
+        assert controller._pull_stream_frame(40,after_identity=after) is None
+        elapsed=time.monotonic()-started; stop.set(); producer.join()
+        assert .035 <= elapsed < .15, elapsed
+        thread,result = wait_call(after)
+        time.sleep(.01); submit(controller._end_of_stream)
+        thread.join(.2)
+        assert not thread.is_alive() and result == [None], result
+        after = submit(ready)
+        thread,result = wait_call(after)
+        time.sleep(.01); submit(controller._fail,RuntimeError("readiness sink failed"))
+        thread.join(.2)
+        assert not thread.is_alive() and isinstance(result[0],RuntimeError), result
+        after = submit(ready)
+        thread,result = wait_call(after)
+        time.sleep(.01); controller.close(); thread.join(.2)
+        assert not thread.is_alive() and isinstance(result[0],ValueError), result
+    finally:
+        controller._submit = submit
+        controller.close()
+    print("ok: stream readiness catches3ms frame, preserves deadline, wakes end/error/close")
+
+
+def native_stream_readiness(long_model):
+    controller = PlaybackController()
+    result = []
+    try:
+        opened = controller.open(long_model)
+        frame = controller.pull_frame(0)
+        after = (frame.playback_id,frame.generation,frame.seek_request_id,frame.frame_index,frame.pts_us)
+        def waiting():
+            result.append(controller._pull_stream_frame(500,after_identity=after))
+        waiter = threading.Thread(target=waiting)
+        waiter.start(); time.sleep(.01)
+        controller.seek(500000,playback_id=opened["playback_id"],request_id=1)
+        waiter.join(1)
+        assert not waiter.is_alive() and result[0].frame_index == 15, result
+        assert result[0].generation == 1 and result[0].seek_request_id == 1
+        assert controller.pull_frame(0,seek_target=True) is result[0]
+        print("ok: native seek wakes stream waiter with exact frame 15 and frozen identity")
+    finally:
+        controller.close()
+
+
 def still(name, rgb):
     """One flat BMP still; content only needs to be a decodable visual clip."""
     path = ROOT / f"{name}.bmp"
@@ -793,10 +888,12 @@ def _pin_stamp(self, position, rgba):
 def main():
     encoding_formats()
     frame_handoff()
+    stream_readiness()
     ROOT.mkdir(parents=True, exist_ok=True)
     long_model = build_model(LONG_US, still("red", (255, 0, 0)), tone("tone-long", 31))
     short_model = build_model(500_000, still("blue", (0, 0, 255)), tone("tone-short", 1))
     native_frame_handoff(long_model)
+    native_stream_readiness(long_model)
     playing_backward_seek(long_model)
     missing_consumer_output(long_model)
 

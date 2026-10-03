@@ -257,16 +257,12 @@ async def stream(request: web.Request) -> web.StreamResponse:
             if transport is None or transport.is_closing():
                 request.app["log"].append("mlt stream: client disconnected")
                 break
-            frame = await handle.call("pull_frame", 100)
+            frame = await handle.call("_pull_stream_frame", 100, after_identity=last)
             if frame is None:
                 await asyncio.sleep(0.02)
                 continue
             stamp = (frame.playback_id, frame.generation, frame.seek_request_id,
                      frame.frame_index, frame.pts_us)
-            if stamp == last:
-                # ponytail: poll at most 200 Hz; use a frame-ready signal if idle polling matters.
-                await asyncio.sleep(0.005)
-                continue
             last = stamp
             payload = await offload(_encode_jpeg, frame)
             headers = "".join(f"{name}: {value}\r\n" for name, value in _frame_headers(frame).items())

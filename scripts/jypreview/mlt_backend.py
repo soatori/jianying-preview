@@ -574,6 +574,7 @@ class PlaybackController:
         self._fps: FrameRate | None = None
         self._frame_slot: RenderedFrame | None = None
         self._seek_frame: RenderedFrame | None = None
+        self._frame_ready = threading.Event()
         self._output_position: tuple[int, int] | None = None
         self._output_deadline: float | None = None
         self._compiled: CompiledTimeline | None = None
@@ -634,6 +635,27 @@ class PlaybackController:
             if frame is None:
                 time.sleep(0.005)
         return frame
+
+    def _pull_stream_frame(self, timeout_ms=100, *, after_identity=None) -> RenderedFrame | None:
+        end = time.monotonic() + max(0,int(timeout_ms))/1000
+        while True:
+            # Clear before selection: updates during the handoff must remain signalled.
+            self._frame_ready.clear()
+            if not self._open:
+                raise ValueError("playback controller is not open")
+            phase, _, frame = self._submit(self._h_prepare_pull, False)
+            if phase == "error":
+                raise RuntimeError(f"playback failed: {self._error}")
+            if phase == "ended":
+                return None
+            if frame is not None:
+                identity = (frame.playback_id,frame.generation,frame.seek_request_id,
+                            frame.frame_index,frame.pts_us)
+                if identity != after_identity:
+                    return frame
+            remaining = end-time.monotonic()
+            if remaining <= 0 or not self._frame_ready.wait(remaining):
+                return None
 
     # -- worker plumbing ------------------------------------------------
 
@@ -716,6 +738,7 @@ class PlaybackController:
         self._pending = None
         self._frame_slot = None
         self._seek_frame = None
+        self._frame_ready.set()
         self._output_position = None
         self._output_deadline = None
         self._consumer = consumer
@@ -802,6 +825,7 @@ class PlaybackController:
         else:
             self._pending = max(0, target)
             self._phase = "seeking"
+        self._frame_ready.set()
         return self._snapshot()
 
     def _require_commandable(self) -> None:
@@ -867,6 +891,7 @@ class PlaybackController:
         self._phase = "ended"
         self._frame_slot = None
         self._seek_frame = None
+        self._frame_ready.set()
 
     def _fail(self, exc) -> None:
         self._phase = "error"
@@ -877,6 +902,7 @@ class PlaybackController:
                 _stop_consumer(self._consumer)
         self._frame_slot = None
         self._seek_frame = None
+        self._frame_ready.set()
 
     def _shutdown(self) -> None:
         if self._consumer is not None:
@@ -912,6 +938,7 @@ class PlaybackController:
         self._t_us = 0
         self._duration_us = 0
         self._duration_frames = 0
+        self._frame_ready.set()
 
     def _capture(self, mlt_frame) -> None:
         """Worker-side stamp from a tractor pull (seek/open, consumer stopped).
@@ -974,6 +1001,7 @@ class PlaybackController:
         self._frame_slot = RenderedFrame(
             self._playback_id, self._generation, self._seek_request_id,
             position, self._fps.sample_us(position), self._width, self._height, rgba)
+        self._frame_ready.set()
 
     def _make_consumer(self, mlt, compiled):
         global _sink_name
