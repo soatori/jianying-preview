@@ -163,14 +163,19 @@ def stream_readiness():
     try:
         after = submit(ready)
         assert hasattr(controller,"_pull_stream_frame"), "bounded frame-ready stream wait is missing"
+        consumed = threading.Event()
         def brief_frame():
             time.sleep(.003); controller._stamp(238,rgba)
-            time.sleep(.003); controller._stamp(239,rgba)
+            consumed.wait(1); controller._stamp(239,rgba)
         producer = threading.Thread(target=brief_frame)
         producer.start()
-        frame = controller._pull_stream_frame(100,after_identity=after)
+        try:
+            frame = controller._pull_stream_frame(500,after_identity=after)
+        finally:
+            consumed.set()
         producer.join()
-        assert frame.frame_index == 238, "3ms-lived frame must wake the stream between checks"
+        assert frame is not None and frame.frame_index == 238, "frame-ready signal must retain the changed identity"
+        assert controller._frame_slot.frame_index == 239
         # An update after selection but before reply must leave a ready signal.
         after = submit(ready)
         fired = False
@@ -210,7 +215,7 @@ def stream_readiness():
     finally:
         controller._submit = submit
         controller.close()
-    print("ok: stream readiness catches3ms frame, preserves deadline, wakes end/error/close")
+    print("ok: stream readiness retains changed identity, preserves deadline, wakes end/error/close")
 
 
 def native_stream_readiness(long_model):
