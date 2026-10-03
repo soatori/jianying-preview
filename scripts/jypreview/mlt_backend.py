@@ -619,20 +619,18 @@ class PlaybackController:
             self._h_close()  # a failed close may retain native owners after worker retirement
 
     def pull_frame(self, timeout_ms: int = 100, *, seek_target: bool = False) -> RenderedFrame | None:
-        phase, intent = self._submit(self._h_prepare_pull)
+        phase, intent, frame = self._submit(self._h_prepare_pull, seek_target)
         if phase == "error":
             # Surface a dead sink instead of returning None forever so callers
             # (the multipart stream) can terminate with a readable error.
             raise RuntimeError(f"playback failed: {self._error}")
-        # Capture before buffering waits. /render retains the immutable seek
-        # target; streaming reads the live slot advanced by frame-show output.
-        frame = self._seek_frame if seek_target else self._frame_slot
+        # Keep the immutable reference selected before the worker handoff.
         end = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
         if intent:
             while self._phase == "buffering" and time.monotonic() < end:
                 time.sleep(0.005)
         while frame is None and time.monotonic() < end:
-            frame = self._seek_frame if seek_target else self._frame_slot
+            frame = self._submit(self._h_select_frame, seek_target)
             if frame is None:
                 time.sleep(0.005)
         return frame
@@ -739,12 +737,15 @@ class PlaybackController:
         self._settle()
         return self._snapshot()
 
-    def _h_prepare_pull(self) -> tuple[str, bool]:
+    def _h_prepare_pull(self, seek_target=False) -> tuple[str, bool, RenderedFrame | None]:
         if not self._open:
             raise ValueError("playback controller is not open")
         self._tick()
         self._settle()
-        return self._phase, self._intent
+        return self._phase, self._intent, self._h_select_frame(seek_target)
+
+    def _h_select_frame(self, seek_target) -> RenderedFrame | None:
+        return self._seek_frame if seek_target else self._frame_slot
 
     def _h_play(self) -> dict[str, Any]:
         self._require_commandable()

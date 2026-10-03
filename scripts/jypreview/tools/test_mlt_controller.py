@@ -46,6 +46,99 @@ def encoding_formats():
     print("ok: stream JPEG q85 byte identity and point-frame PNG RGBA")
 
 
+def frame_handoff():
+    controller = PlaybackController()
+    submit = controller._submit
+    rgba = bytes((255,0,0,255))*4
+    def ready():
+        controller._open = True
+        controller._phase = "ready"
+        controller._playback_id = "handoff"
+        controller._fps = FPS
+        controller._width = controller._height = 2
+        controller._stamp(237,rgba)
+        controller._seek_frame = RenderedFrame("handoff",0,0,1,FPS.sample_us(1),2,2,rgba)
+        return controller._frame_slot, controller._seek_frame
+    selected, target = submit(ready)
+    replaced = False
+    def reply_then_callback(handler, *args):
+        nonlocal replaced
+        result = submit(handler, *args)
+        if not replaced:
+            replaced = True
+            callback = threading.Thread(target=controller._stamp,args=(238,bytes(16)))
+            callback.start(); callback.join(1)
+            assert not callback.is_alive(), "selected frame must not block the callback"
+        return result
+    try:
+        controller._submit = reply_then_callback
+        assert controller.pull_frame(0) is selected, "handoff must return selected237, not replacement238"
+        assert controller.pull_frame(0).frame_index == 238
+        replaced = False
+        assert controller.pull_frame(0,seek_target=True) is target
+        controller._submit = submit
+        def empty():
+            controller._frame_slot = controller._seek_frame = None
+        submit(empty)
+        assert controller.pull_frame(0) is None and controller.pull_frame(0,seek_target=True) is None
+        started = time.monotonic()
+        assert controller.pull_frame(10) is None
+        assert .01 <= time.monotonic()-started < .25
+        submit(lambda: setattr(controller,"_phase","ended"))
+        assert controller.pull_frame(0) is None
+        submit(lambda: (setattr(controller,"_phase","error"),setattr(controller,"_error","dead sink")))
+        try:
+            controller.pull_frame(0)
+        except RuntimeError as exc:
+            assert str(exc) == "playback failed: dead sink"
+        else:
+            raise AssertionError("dead sink must remain a pull error")
+    finally:
+        controller._submit = submit
+        controller.close()
+    assert selected.rgba == rgba, "immutable selected bytes must survive shutdown"
+    print("ok: atomic worker frame handoff, frozen seek target, empty/timeout/ended/error")
+
+
+def native_frame_handoff(long_model):
+    controller = PlaybackController()
+    submit = controller._submit
+    selected = []
+    def reply_after_native_progress(handler, *args):
+        result = submit(handler, *args)
+        if handler == controller._h_prepare_pull and not selected:
+            frame = result[2]
+            assert frame is not None
+            selected.append(frame)
+            deadline = time.monotonic()+1
+            while controller._frame_slot is frame and time.monotonic()<deadline:
+                time.sleep(.002)
+            assert controller._frame_slot.frame_index > frame.frame_index
+        return result
+    try:
+        opened = controller.open(long_model)
+        controller.play()
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            if controller.snapshot()["phase"] == "playing":
+                break
+            time.sleep(.01)
+        else:
+            raise AssertionError("native handoff fixture did not start")
+        controller._submit = reply_after_native_progress
+        returned = controller.pull_frame(0)
+        controller._submit = submit
+        live = controller.pull_frame(0)
+        assert returned is selected[0] and live.frame_index > returned.frame_index
+        assert returned.playback_id == opened["playback_id"] and returned.generation == 0
+        assert returned.pts_us == FPS.sample_us(returned.frame_index)
+        assert len(returned.rgba) == W*H*4
+        print(f"ok: native handoff kept frame {returned.frame_index} while live advanced to {live.frame_index}")
+    finally:
+        controller._submit = submit
+        controller.close()
+
+
 def still(name, rgb):
     """One flat BMP still; content only needs to be a decodable visual clip."""
     path = ROOT / f"{name}.bmp"
@@ -699,9 +792,11 @@ def _pin_stamp(self, position, rgba):
 
 def main():
     encoding_formats()
+    frame_handoff()
     ROOT.mkdir(parents=True, exist_ok=True)
     long_model = build_model(LONG_US, still("red", (255, 0, 0)), tone("tone-long", 31))
     short_model = build_model(500_000, still("blue", (0, 0, 255)), tone("tone-short", 1))
+    native_frame_handoff(long_model)
     playing_backward_seek(long_model)
     missing_consumer_output(long_model)
 
