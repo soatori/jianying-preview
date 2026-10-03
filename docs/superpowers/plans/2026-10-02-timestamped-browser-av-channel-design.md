@@ -245,7 +245,7 @@ Budget: `uncertainty_us ≤ 8,333` (`uncertainty_us * 4 * num ≤ 1_000_000 * de
 | T4 | Audio pulse **write-instant detection**: device-position query cadence | ≤ 500 ceiling | **NOT ACHIEVED**; historical critical gaps 2.66/2.89 ms; 10 ms steps/interpolation do not prove emission |
 | T5 | One-time constant calibration residual: video external 240 fps half-frame 2,083 + audio loopback/mic beacon onset ±500 | 2,583 | instrument quantization (phone frame period; 48 kHz WAV onset) |
 | T6 | Marker/pulse identity quantization: server frame PTS (`X-Project-PTS-US`, exact µs; P1b: fMP4 `mediaTime`) and `first_frame_at_or_after` integer arithmetic on sample offsets | 0 | exact by construction (FrameRate integer arithmetic) |
-| | **Known subtotal T3–T6** | **3,583** | |
+| | **Allocated subtotal T3–T6** | **3,583** | |
 | | **Budget** | **8,333** | |
 | | **Spike pool shared by T1 + T2** | **4,750** | split decided by measured values; the gate needs the *sum* |
 
