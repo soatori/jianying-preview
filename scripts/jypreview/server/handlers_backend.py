@@ -97,7 +97,7 @@ def _encode_png(frame) -> bytes:
 def _encode_jpeg(frame) -> bytes:
     from PIL import Image
 
-    image = Image.frombytes("RGBA", (frame.width, frame.height), frame.rgba).convert("RGB")
+    image = Image.frombytes("RGB", (frame.width, frame.height), frame.rgba, "raw", "RGBX")
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=85)
     return output.getvalue()
@@ -264,8 +264,8 @@ async def stream(request: web.Request) -> web.StreamResponse:
             stamp = (frame.playback_id, frame.generation, frame.seek_request_id,
                      frame.frame_index, frame.pts_us)
             if stamp == last:
-                # Re-sending the identical frame would spin; wait for progress.
-                await asyncio.sleep(0.02)
+                # ponytail: poll at most 200 Hz; use a frame-ready signal if idle polling matters.
+                await asyncio.sleep(0.005)
                 continue
             last = stamp
             payload = await offload(_encode_jpeg, frame)
