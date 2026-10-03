@@ -97,7 +97,7 @@ def _encode_png(frame) -> bytes:
 def _encode_jpeg(frame) -> bytes:
     from PIL import Image
 
-    image = Image.frombytes("RGB", (frame.width, frame.height), frame.rgba, "raw", "RGBX")
+    image = Image.frombuffer("RGBX", (frame.width, frame.height), frame.rgba, "raw", "RGBX", 0, 1)
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=85)
     return output.getvalue()

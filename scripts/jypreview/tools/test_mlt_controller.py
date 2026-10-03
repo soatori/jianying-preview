@@ -12,7 +12,7 @@ from array import array
 from pathlib import Path
 from typing import cast
 
-from jypreview.mlt_backend import PlaybackController, _stop_consumer
+from jypreview.mlt_backend import PlaybackController, RenderedFrame, _stop_consumer
 from jypreview.model.timeline import (
     Clip,
     FrameRate,
@@ -30,6 +30,20 @@ SNAPSHOT_KEYS = {"backend", "phase", "playback_id", "seek_request_id", "generati
                  "frame_index", "t_us", "duration_us", "playing", "error", "open"}
 FRAME_HEADERS = ("X-Playback-ID", "X-Playback-Generation", "X-Seek-Request-ID",
                  "X-Project-Frame", "X-Project-PTS-US")
+
+
+def encoding_formats():
+    import io
+    from PIL import Image
+    from jypreview.server.handlers_backend import _encode_jpeg, _encode_png
+    rgba = bytes((255,0,0,255, 0,255,0,127, 0,0,255,0, 17,83,191,255))
+    frame = RenderedFrame("p",1,2,3,100000,2,2,rgba)
+    expected = io.BytesIO()
+    Image.frombytes("RGBA",(2,2),rgba).convert("RGB").save(expected,format="JPEG",quality=85)
+    assert _encode_jpeg(frame) == expected.getvalue(), "RGBX must keep exact q85 JPEG bytes"
+    with Image.open(io.BytesIO(_encode_png(frame))) as image:
+        assert image.format == "PNG" and image.tobytes() == rgba
+    print("ok: stream JPEG q85 byte identity and point-frame PNG RGBA")
 
 
 def still(name, rgb):
@@ -684,6 +698,7 @@ def _pin_stamp(self, position, rgba):
 
 
 def main():
+    encoding_formats()
     ROOT.mkdir(parents=True, exist_ok=True)
     long_model = build_model(LONG_US, still("red", (255, 0, 0)), tone("tone-long", 31))
     short_model = build_model(500_000, still("blue", (0, 0, 255)), tone("tone-short", 1))
