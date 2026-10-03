@@ -1,11 +1,13 @@
 # Design: one timestamped browser A/V channel (`timestamped-channel-v1`)
 
-**Status:** draft for coordinator review — **rev.2, revised 2026-10-02** after coordinator
-precondition verification. (rev.1 assumed an `<video>`-displayed product and page-owned audio;
-both assumptions were disproven against the code, see §9.)
-**Authored:** 2026-10-02 (user decision date = today, per plan Step 6 fallback).
+**Status:** fallback design for coordinator review — **rev.3, corrected 2026-10-03**.
+Task 1/1b are reviewed and merged into release `f0ef7da`; Task 2 production `204e731`
+is a quality-reviewed candidate, pending integration. B1 is still unmet: final normal-page
+RAF cadence **29.999238216104732 fps < 30**. Phase B/C and Task 7 remain blocked.
+Rev.1/rev.2 historical assumptions and failed evidence are retained in the evidence trail (§9).
+**Authored:** 2026-10-02 (original user decision date = 2026-10-02, per plan Step 6 fallback).
 **Authorization:** plan `docs/superpowers/plans/2026-10-01-timeline-playback-preview-engine.md`
-line 406 (Task 6 Step 6): *"If measured playback fails, stop and write a follow-up design for one
+Task 6 Step 6: *"If measured playback fails, stop and write a follow-up design for one
 timestamped browser A/V channel. Keep the old files until this gate passes; recapture if playback
 code, native runtime, or output device changes."*
 **Trigger:** both prior measurement lanes ended RED — `temp/mlt-capture/research.md`
@@ -17,12 +19,12 @@ optimization round; escalation to this design).
 replaces the *instrument*, not the gate. One branch (P1b) additionally proposes a product change
 that is explicitly out of scope until approved (§1.1B).
 
-**What rev.2 changed (brief items revised after coordinator adjudication):**
-1. **Audio ownership:** plan line 371's *"local MLT audio sink"* clause is **adopted** — pulses
+**Historical rev.2 decisions (current corrections below):**
+1. **Audio ownership:** plan Task 6 Step 1's *"local MLT audio sink"* clause is **adopted** — pulses
    exit via the server's MLT SDL/dsound sink. The rev.1 page-`AudioBuffer`/WebAudio design
    measured a path that does not exist and is **removed**; audio is now timestamped **server-side
    on the server clock** (§1.2).
-2. **P1 confirmed and split:** the native display path is `<img>` (`app.js:17`), rVFC does not
+2. **P1 confirmed and split:** the native display path is `<img>` (`scripts/jypreview/web/app.js`), rVFC does not
    apply as the product exists. The design now documents **both** the no-product-change branch
    **P1a** (decode → rAF paint observation) and the product-change fallback **P1b** (`<video>` +
    MSE of MLT frames, then original rVFC design) — §1.1A/§1.1B.
@@ -37,21 +39,24 @@ One coherent design: **video timestamps are taken in the page on `performance.no
 over the existing CDP WebSocket** (`scripts/jypreview/shot/cdp.py` → `Runtime.evaluate`, the
 channel the harness already uses for `window.__state()`); **audio timestamps are taken in the
 server process on the server monotonic clock** (same machine, same timebase family). One capture
-clock (§2), zero capture load during the run (no PrintWindow/encode/ffmpeg — the dose-response
-that cost the old instrument 0.988 → 0.892× content rate, `reassessment.md` §1).
+clock (§2), proposed capture avoids PrintWindow/ffmpeg recording; observation overhead still needs measurement. The dose-response
+cost the old instrument 0.988 → 0.892× content rate (`reassessment.md` §1).
 
 ### 1.1A. Video branch P1a (no product change, runs first in the spike)
 
-**Verified fact:** native display = `<img>` — `app.js:17`
-`const nativeFrame = document.createElement("img")`, appended to `.canvas` (line 21); frames
-arrive as PNG blobs (`nativeRenderAt`: fetch → blob → objectURL → `nativeFrame.src` swap). The
-`<video>` elements in `render.js` are the legacy GES source-clip path, not native MLT frames.
-**rVFC does not apply to displayed pixels as the product exists.**
+**Verified current source:** `scripts/jypreview/web/app.js` creates `nativeFrame` as an
+`<img>`; `renderMltAt` uses the point-render path and the application calls
+`mlt.startStream(queueFrame, ...)`. `scripts/jypreview/web/backend.js` implements
+`MltPlaybackClient.#startStream` fetching `/api/backend/stream`. Point render remains PNG;
+Task 2 production candidate `204e731` streams JPEG quality 85 through
+`scripts/jypreview/server/handlers_backend.py` (`_encode_jpeg` / `stream`).
+These symbol/path references were checked against current 024e source; subsequent `25ebffa`
+changes only tests, with no production delta from `204e731`. `<img>` has no rVFC presentation API.
 
 Per frame, the channel observes the paint chain:
 
 ```
-frame part arrives (identity: X-Backend-PTS-US, exact server PTS µs)
+frame part arrives (identity: X-Project-PTS-US, exact server PTS µs)
   → decode (img.decode() / createImageBitmap)
   → nativeFrame.src swap
   → first requestAnimationFrame after decode completes   ← video_capture_us anchor
@@ -61,37 +66,36 @@ frame part arrives (identity: X-Backend-PTS-US, exact server PTS µs)
 
 `video_capture_us(k)` = anchor of the first painted swap whose PTS ≥ `k·1e6` and <
 `(k+1)·1e6` (markers are one-second held windows), plus the constant. The rAF anchor is a
-*present-schedule observation*: that frame's pixels reach the panel at its frame deadline. The
+*present-schedule observation*: actual photon timing still requires a measured present bound. The
 residual — decode/paint race slipping a frame, main-thread jank, DWM scheduling — is **T1**, not
-observable in-band for `<img>`; worst case cited = one refresh (16,667 µs @ 60 Hz) plus race
+observable in-band for `<img>`; worst case cited = one measured hardware refresh (~6.1–7.7 ms over the observed 130–165 Hz range) plus race
 slip. **Phase A measures the paint-chain jitter against the §4 headroom; external 240 fps
 spot-check validates the constant. Vsync quantization may exceed headroom — the spike decides,
 not this document.**
 
-**Discovered precondition B1 (frame delivery during play):** `/api/backend/stream`
-(`handlers_backend.py:146`) exists — `multipart/x-mixed-replace` PNG parts each carrying an
-`X-Backend-PTS-US` header (identity travels free with the frame) — **but no page consumer exists
-today**: `native.streamUrl` is assigned at `app.js:158` and never read; during play the page only
-runs the 100 ms `syncNativeSnapshot` poll. P1a therefore includes wiring a page-side per-frame
-stream reader (fetch `ReadableStream` loop with part parsing → decode → swap); poll-rate display
-(100 ms) can never resolve 30 fps marker boundaries and is disqualified by design. **Phase B hour 0
-verifies the actual display cadence of the acceptance head** (the main worktree's native backend
-is still GStreamer-tagged — `X-Backend: gstreamer-ges`, `audio_sink: "autoaudiosink"` at
-`app.js:154`; the MLT head lives in the evidence worktrees with `SDL_AUDIODRIVER=dsound` as code
-default). (`frame-store.js`, checked for this revision, turned out to be IR window storage — not
-a frame-delivery path.)
+**B1 (frame delivery during play): implemented consumer, unmet cadence gate.**
+The native page consumes `/api/backend/stream`; multipart image parts carry `X-Project-PTS-US`.
+The Task 2 candidate packs the eligible 45-still fixture into 3 lanes. Its native sink is near
+nominal 30 fps (final exact-source estimate 29.9991931271 fps); final normal-production page
+RAF observations are **29.999238216104732 fps**, 513 distinct frames, no observed source-PTS
+gaps. This is strictly below the unchanged ≥30 condition: **B1 has not passed**.
+The latest candidate uses one standard `threading.Event` frame-ready wait and retains the
+selected immutable frame across worker handoff; it adds no native frame-history queue.
+The existing client can still coalesce frames. Snapshot polling supplies transport state,
+and its clock estimate is not native master-clock or physical presentation proof.
+See `task-2-report.md` and its exact-head raw files (§9); no measurement is relabelled as release.
 
 ### 1.1B. Video branch P1b (fallback if the P1a spike fails) — a PRODUCT CHANGE
 
-If Phase A cannot bound T1 (§4) at ≤ headroom, the display switches to a presentation-timed
+If Phase A cannot bound T1 (§4) at ≤ headroom, the proposed fallback would switch the display to a presentation-timed
 path: **`<video>` fed by an MSE stream of MLT frames**, restoring the original rVFC design
 (`expectedDisplayTime` + `mediaTime`, §4-T1 as originally cited, drop detection via
 `presentedFrames`).
 
 Concrete entailment (checked against the repo):
 
-* The transport exists: `/api/backend/stream` already pulls `pull_frame()` from the backend and
-  emits per-frame parts with PTS headers — P1b replaces the PNG/multipart body with **fragmented
+* The transport exists: `/api/backend/stream` uses the candidate private `_pull_stream_frame` path and
+  emits per-frame parts with PTS headers — P1b would replace the JPEG/multipart body with **fragmented
   MP4 (H.264)** produced from the same pull (server-side encoder: MLT `avformat`/openh264 pipe),
   fed to `MediaSource`/`SourceBuffer.appendBuffer` on the page; `mediaTime` = frame PTS →
   `project_frame` identity is exact (`first_frame_at_or_after` on the fMP4 timeline + the same
@@ -105,12 +109,11 @@ Concrete entailment (checked against the repo):
   risk. **Rough effort: 2–4 sessions** (server encode+endpoint ~1–2, page MSE/rVFC ~1,
   validation ~1).
 * **Scope: requires plan-level approval** (it changes preview display mechanics — coordinator/
-  user decision, not an instrument-only decision). P1b is *designed here, built only if P1a's
-  spike fails and the change is approved.*
+  user decision, not an instrument-only decision). P1b is *designed here; no MSE/rVFC P1b implementation was authorized.*
 
 ### 1.2. Audio side — server-side device-position timestamping (page-WebAudio design removed)
 
-**Verified fact:** plan line 371 *"normal browser URL and local MLT audio sink"* is adopted —
+**Verified fact:** plan Task 6 Step 1 *"normal browser URL and local MLT audio sink"* is adopted —
 calibration pulses exit via the MLT SDL sink on the **server** (`SDL_AUDIODRIVER=dsound` is the
 code default in the MLT lane, evidence `5f180f5`). No browser API can timestamp that path.
 
@@ -137,10 +140,14 @@ guarantees here):**
    **write→hardware delivery jitter** (Lock-to-play-cursor holding variation on the dsound ring).
 2. **Direct device play-position** (preferred if 1's delivery jitter exceeds headroom): a
    DirectSound play-cursor query (`IDirectSoundBuffer::GetCurrentPosition`) against the sink's
-   buffer — play position is the actual emission position; granularity is driver/mixer
-   granularity on Windows' dsound-over-WASAPI path (also unmeasured — same probe).
+   buffer — play position is a device-position estimate requiring emission validation; granularity is driver/mixer
+   granularity on Windows' dsound-over-WASAPI path must be measured against physical emission.
+   Historical cursor steps were 10 ms; interpolation does not supply a physical beacon.
 
-**Honest statement:** the *write-instant* detection is under our control (poll cadence); the
+**Current T4 evidence:** critical query gaps of **2.66/2.89 ms exceed 500 µs**.
+Ten-millisecond DirectSound steps and interpolation are not a beacon. The ≤500 µs
+cadence budget is neither achieved nor re-priced; **T2 physical emission remains unverified**.
+The *write-instant* query is scheduled by the instrument; the
 *write→emission* jitter is a property of the driver/sink and is **NEEDS-SPIKE** with a cited
 worst of one device mix period. If neither candidate bounds it, the audio side does not reach
 the budget and the gate reports `unverified` — the spike, not this document, decides. Zero-return
@@ -154,42 +161,53 @@ observation in the server process), shipped over existing transports (CDP for pa
 server's own clock for audio). What it is *not*: no consumer-clock callbacks, no HTTP arrival
 timestamps, no `image.onload`/`onload` as the capture observation (arrival/decode are used only
 for *identity*; presentation is the rAF anchor + validated constant on video, and device position
-+ beacon constant on audio) — the plan's line-371 ban list is respected (§3).
++ beacon constant on audio) — the plan's Task 6 Step 1 ban list is respected (§3).
 
 ---
 
-## 2. One clock
+## 2. One clock — conservative T3 method, not a passed gate
 
-* **Capture clock = the server monotonic clock.** Audio events are native to it (no mapping at
-  all). Video events live on the page's `performance.now()` and are mapped to it by the CDP
-  handshake: `offset_i = (S0_i + S1_i)/2 − p_i`, uncertainty ≤ `RTT/2` (same host, sub-ms;
-  budgeted 500 µs). **Simplification vs rev.1:** there is now exactly one mapping (page→server)
-  instead of per-device mappings; audio needs none.
-* **The mapping now enters the gate delta** (video−audio crosses clocks, unlike rev.1 where both
-  sides were page-clock and the offset cancelled). It enters as a **constant**: on Windows,
-  Chromium's `performance.now()` and the server's monotonic source are both derived from QPC
-  (verify server source in Phase A — Python `time.monotonic`/Node `hrtime` on Windows = QPC), so
-  the offset has no run drift, and its *value* is absorbed into `video_display_constant` because
-  the external spot-check compares post-mapping `video_capture_us` against photon time (§3). T3's
-  residual is therefore origin stability (≈ same hardware counter → ~0) + handshake measurement
-  error (provenance only), cited ≤ 500 µs. **If the server clock source is not QPC-derived, a
-  drift term must be added and T3 re-priced** — Phase A checks this.
-* **Device latency is a constant, not per-pair noise:** `emission holding` from one loopback/mic
-  beacon (tone at a known server write-instant, recorded through the default output device);
-  `video_display_constant` from the one-time external spot-check (§3). Re-measured only on the
-  plan's recapture triggers (playback code / native runtime / output device change, line 406).
-* **Drift:** both clocks are QPC-family over one machine over 30 s (no cross-crystal drift in
-  the clock mapping itself). Audio emission instants are observed live (no long extrapolation);
-  video anchors are per-frame.
+Capture clock is server monotonic; video observations use the same document's
+`performance.now()` and require a bounded page→server conversion. RTT/2 medians or
+bootstrap repeatability do not prove absolute ≤500 µs precision. The previous fetch-derived
+bound was **±799.6 µs**; no new T3 capture was performed for this correction.
+
+The independent `temp/superpowers/sdd/2026-10-03-playback-remaining/t3-method.md` specifies,
+in µs, browser endpoints T0/T1, server endpoints S0/S1, endpoint errors qT/qS,
+reference time tref and drift allowance D:
+
+```
+I_i = [S1-T1-qS1-qT1-D(T1,tref), S0-T0+qS0+qT0+D(T0,tref)]
+L = max(lower endpoints); U = min(upper endpoints)
+require L <= U; offset = (L+U)/2; parameter bound = (U-L)/2
+```
+
+Expand timestamp quantization/error **before** intersecting. A truly empty expanded
+intersection fails; samples must not be discarded to improve the bound. Chromium's ordinary
+100 µs randomized-clamp buckets do not justify ±50 µs. **qT=101 µs is conditional** on
+validating the installed Chromium clamp/high-resolution implementation and runtime provenance
+(version, timer increments, isolation, unchanged document origin). The fixed clamped origin is
+absorbed in the effective same-document offset; do not add Unix `performance.timeOrigin` again.
+Record QPF, server `time.get_clock_info` resolution and integer conversion. Python Windows uses
+QPC, while Chromium can choose QPC or millisecond `RolloverProtectedNow`; common provenance
+must be verified. Same-QPC implies no independent oscillator drift, but pre/post agreement
+alone cannot bound an interior excursion without provenance.
+
+The expanded radius already includes calibration endpoint errors. A **new** rAF/performance.now
+event adds its qT exactly once; a new server timestamp adds qS if applicable. Include the drift
+bound from reference to event exactly once. The **complete new-event conversion** must meet
+the unchanged T3 ceiling **500 µs**; constant calibration does not erase an unproved bound.
+T3 remains unverified. Video display and audio emission constants still require physical
+calibration and recapture on playback-code/runtime/output-device changes.
 
 ---
 
 ## 3. The "displayed pixels" objection — addressed honestly
 
-Plan line 371 bans substitutes: *"Internal consumer callbacks, `image.onload`, DOM-reported PTS,
+Plan Task 6 Step 1 bans substitutes: *"Internal consumer callbacks, `image.onload`, DOM-reported PTS,
 and HTTP arrival timestamps are not substitutes for this capture."* Two questions:
 
-1. **Authorization.** Line 406 orders *this* design on measured failure. Adopting it is the
+1. **Authorization.** Task 6 Step 6 orders *this* design on measured failure. Adopting it is the
    documented escalation path, not a quiet substitution.
 
 2. **In-band timestamps never observe photons** — and **P1a sits closer to the banned category
@@ -197,8 +215,8 @@ and HTTP arrival timestamps are not substitutes for this capture."* Two question
    scheduling observation, not a compositor-present API. The gap is closed by the same deliberate
    split, with the external check doing *more* of the work:
 
-   * **Per-pair precision comes from the channel** (event-exact anchors, no cadence, no polling
-     noise), and
+   * **Per-pair precision must be established by the channel** (bounded event anchors,
+     timestamp conversion and audio query cadence), and
    * **correctness of the constants comes from one coarse external measurement**: a single phone
      recording (target ≥ 240 fps, one device framing screen + audible output at marker instants)
      measures `photon_time − channel_video_estimate` and `audible_time − channel_audio_estimate`
@@ -213,39 +231,37 @@ and HTTP arrival timestamps are not substitutes for this capture."* Two question
 
 ---
 
-## 4. Uncertainty budget (rev.2, re-totaled)
+## 4. Uncertainty budget (allocations preserved, current status corrected)
 
 Budget: `uncertainty_us ≤ 8,333` (`uncertainty_us * 4 * num ≤ 1_000_000 * den`), 30 fps, one
 30 s run. Terms with no spec/measurement backing are marked **NEEDS-SPIKE** and excluded from the
-"known" subtotal; they draw from a stated pool.
+"allocated" subtotal; they draw from a stated pool.
 
 | # | term | worst-case (µs) | basis / status |
 |---|---|---|---|
-| **T1** | **Video paint-commit/present jitter (P1a)**: decode→rAF→actual-present residual after the calibrated constant; frame-slip under load; DWM scheduling. Cited worst = **one refresh (16,667 @ 60 Hz)** for an undetected slip | **NEEDS-SPIKE** | No API observes `<img>` presentation; Phase A measures the paint chain vs headroom; external spot-check validates the constant. (P1b would replace this with rVFC `expectedDisplayTime`, same cited worst until measured) |
+| **T1** | **Video paint-commit/present jitter (P1a)**: decode→rAF→actual-present residual after the calibrated constant; frame-slip under load; DWM scheduling. Cited worst = **one measured hardware refresh (~6.1–7.7 ms at 130–165 Hz)** for an undetected slip | **NEEDS-SPIKE** | No API observes `<img>` presentation; Phase A measures the paint chain vs headroom; external spot-check validates the constant. (P1b would replace this with rVFC `expectedDisplayTime`, pending its own measured bound) |
 | **T2** | **Audio write→hardware delivery jitter** (device-position estimate vs actual emission after the beacon constant): SDL queue-step→dsound play-cursor holding variation, driver scheduling. Cited worst = **one device mix period** (unknown until probed; SDL default period would be 85,333 µs @ 48 kHz — would be RED) | **NEEDS-SPIKE** | SDL2 guarantees only byte counts, not step cadence or emission correlation (§1.2); Phase A probes queued-accounting fidelity and, if needed, the DirectSound play-cursor candidate |
-| T3 | Clock mapping page(video)→server: handshake error ≤ `RTT/2`; enters the delta as a constant → absorbed by `video_display_constant`; residual = origin stability (both QPC-family, verify) | ≤ 500 | same-host CDP exchange; verify server clock source in Phase A |
-| T4 | Audio pulse **write-instant detection**: server-side device-position query cadence around marker instants (tight poll) | ≤ 500 | controlled by us (poll cadence); probe confirms query cost |
+| T3 | Complete page→server new-event conversion: expanded endpoint-error intervals, drift and new-event quantization (§2) | ≤ 500 ceiling | **UNVERIFIED**; previous fetch bound ±799.6 µs; runtime clock/clamp provenance pending |
+| T4 | Audio pulse **write-instant detection**: device-position query cadence | ≤ 500 ceiling | **NOT ACHIEVED**; historical critical gaps 2.66/2.89 ms; 10 ms steps/interpolation do not prove emission |
 | T5 | One-time constant calibration residual: video external 240 fps half-frame 2,083 + audio loopback/mic beacon onset ±500 | 2,583 | instrument quantization (phone frame period; 48 kHz WAV onset) |
-| T6 | Marker/pulse identity quantization: server frame PTS (`X-Backend-PTS-US`, exact µs; P1b: fMP4 `mediaTime`) and `first_frame_at_or_after` integer arithmetic on sample offsets | 0 | exact by construction (plan lines 20/124) |
+| T6 | Marker/pulse identity quantization: server frame PTS (`X-Project-PTS-US`, exact µs; P1b: fMP4 `mediaTime`) and `first_frame_at_or_after` integer arithmetic on sample offsets | 0 | exact by construction (FrameRate integer arithmetic) |
 | | **Known subtotal T3–T6** | **3,583** | |
 | | **Budget** | **8,333** | |
 | | **Spike pool shared by T1 + T2** | **4,750** | split decided by measured values; the gate needs the *sum* |
 
-**Plain verdict: the honest total does NOT reach 8,333 as cited today — now for TWO terms.**
-Known terms sum to 3,583 µs. **T1** (video paint/present jitter, P1a) and **T2** (audio
-device-delivery jitter) are both unmeasured; their cited worst cases (16,667 + one device mix
-period ≥ 5–20 ms plausible, SDL default 85,333) blow the budget individually. The design reaches
-`uncertainty_us ≤ 8,333` **only if the Phase A spikes validate `T1 + T2 ≤ 4,750 µs` together**,
-with each reported at its measured value — the gate arithmetic is applied to the measured sum,
-never to a hoped-for split. If either spike fails: P1a fails → P1b path (needs approval); T2
-fails → the DirectSound play-cursor candidate must be tried, and if that also fails, the gate
-reports `unverified` and escalation returns to the coordinator. **No friendlier number exists.**
+**Current verdict: the total uncertainty is unverified.** The unchanged bookkeeping subtotal
+T3–T6 is **3,583 µs**, with **4,750 µs** reserved for T1+T2 against the **8,333 µs** budget.
+This is an allocation, not an achieved measurement: T3 is unverified and T4's cadence ceiling
+has not been achieved. The observed panel range is **130–165 Hz (~6.1–7.7 ms per refresh)**,
+specific to this hardware and derived from page observation, **not external-camera evidence**.
+T1 actual present jitter and T2 physical emission still need proof. Their measured sum must fit
+4,750 µs while all other ceilings hold. No arithmetic, ceiling or pool has been relaxed.
+Failure remains `unverified`; P1b requires separate authorization.
 
 Cross-check of the per-pair gate (unchanged arithmetic): at `uncertainty_us = 8,333` the plan
-requires `|video_capture_us − audio_capture_us| ≤ 25,000 µs` per pair at 30 fps. Channel jitter
-post-constant is expected at sub-ms scale on video and ≤ one poll/delivery quantum on audio; the
-old instrument's 92,043 µs worst residual came from load + polling and does not exist here.
-Claimed only from the gate run's own numbers.
+requires `|video_capture_us − audio_capture_us| ≤ 25,000 µs` per pair at 30 fps. The gate must use the run's measured complete uncertainty. Historical
+92,043 µs worst residual remains failed evidence; the replacement instrument has not yet
+proved that its own error terms close.
 
 ---
 
@@ -256,7 +272,10 @@ Claimed only from the gate run's own numbers.
 
 ```json
 {
-  "frame_rate": [30, 1],
+  "frame_rate": {
+    "num": 30,
+    "den": 1
+  },
   "runtime": "mlt:<runtime id> | browser: chrome/<ver> | os: windows <ver> | device: <output device>",
   "capture_method": "timestamped-channel-v1",
   "raw_capture": "temp/timestamped-channel/",
@@ -265,22 +284,51 @@ Claimed only from the gate run's own numbers.
     {
       "mode": "normal",
       "duration_us": 30000000,
-      "observed_dropped_frames": 0,
+      "dropped_frames": 0,
       "events": [
-        { "project_frame": 30, "video_capture_us": 8116450200, "audio_capture_us": 8116407700 },
-        { "project_frame": 60, "video_capture_us": 8117450900, "audio_capture_us": 8117407600 }
+        {
+          "project_frame": 30,
+          "video_capture_us": 8116450200,
+          "audio_capture_us": 8116407700
+        },
+        {
+          "project_frame": 60,
+          "video_capture_us": 8117450900,
+          "audio_capture_us": 8117407600
+        }
+      ]
+    },
+    {
+      "mode": "dropped_video",
+      "duration_us": 30000000,
+      "dropped_frames": 1,
+      "drops": [
+        61
+      ],
+      "events": [
+        {
+          "project_frame": 60,
+          "video_capture_us": 8117450900,
+          "audio_capture_us": 8117407600
+        }
       ]
     }
   ]
 }
 ```
 
+**This fragment illustrates field shapes only and is not valid full evidence.** Full evidence
+requires both `normal` and `dropped_video`, each ≥30 s and exactly 29 events,
+with dropped-video `dropped_frames >= 1` and `drops: [project_frame, ...]`, including a drop
+within one frame of a marker. Every event has **exactly** three integer keys:
+`project_frame`, `video_capture_us`, `audio_capture_us`; diagnostics stay in raw logs.
+
 (29 events per run, `k = 1..29`, `project_frame = rate.first_frame_at_or_after(k * 1_000_000)`
 (= 30k at 30 fps); `uncertainty_us` = the measured §4 sum; examples illustrative.)
 
 * `capture_method` = **"timestamped-channel-v1"** (kept).
 * `video_capture_us` / `audio_capture_us`: integer µs **on the server capture clock** after the
-  two documented constants (`video_display_constant` incl. the clock-map absorption, §2;
+  two documented constants (`video_display_constant`, with the bounded clock conversion in §2;
   `emission holding`); raw pre-constant values + constants live in `raw_capture` —
   "documented capture-skew correction".
 * `raw_capture` directory (under `temp/`, per plan): handshake record (offset, RTT, server clock
@@ -289,16 +337,16 @@ Claimed only from the gate run's own numbers.
   both calibration records; probe artifacts from Phase A consumed by the run; device/backend/
   browser provenance; frame/drop schedule; anomaly counters; external spot-check artifacts.
 * **Dropped-video mode, honest identity (P1a):** identity comes from the frame's server PTS
-  (`X-Backend-PTS-US`), which travels with the image — no float timeline involved. For marker
+  (`X-Project-PTS-US`), which travels with the image — no float timeline involved. For marker
   *k*, `video_capture_us` = paint anchor of the first *painted* part with PTS ≥ `k·1e6`; identity
   holds iff that PTS < `(k+1)·1e6` (one-second held marker windows: a skipped part inside the
   window cannot falsify identity — same argument as rev.1). Whole-window loss ⇒ marker missing ⇒
-  **run fails** per plan. `observed_dropped_frames` = missing PTS slots in the expected 30 fps
-  cadence, split into *not received* vs *received but not painted* (both logs exist), annotated
-  `frames_skipped_before` per event for "record actual drops, including near markers". (Under
+  **run fails** per plan. `dropped_frames` = missing PTS slots in the expected 30 fps
+  cadence, split into *not received* vs *received but not painted* (both logs exist), recorded
+  in run-level `drops` and separate raw diagnostics; no extra event keys are accepted. (Under
   P1b this reverts to the rev.1 `presentedFrames`/`mediaTime` accounting, which MDN explicitly
   endorses for missed-frame detection.)
-* `max_presented_av_delta_frames` (plan line 365) is derived by the acceptance script from these
+* `max_presented_av_delta_frames` (Task 6 playback metric) is derived by the acceptance script from these
   events including uncertainty; recorded separately, not an evidence-JSON field.
 
 ---
@@ -351,9 +399,10 @@ Order is prescribed: **P1a first (it is free), audio second.**
   write-instant detection quality at marker instants, **write→emission delivery jitter** (vs a
   loopback beacon recording); if queued-accounting jitter exceeds headroom → prototype the
   DirectSound play-cursor query. Go/no-go: **can T2 be bounded ≤ the agreed share of 4,750 µs?**
-* **A3 — clock provenance:** verify server monotonic source is QPC-family (else T3 re-priced);
-  ≥100 handshake exchanges → offset median + max RTT/2; confirm `ctx`-free (no browser audio
-  dependency anywhere in the path).
+* **A3 — clock provenance:** validate installed server/browser clock and clamp implementation;
+  expand endpoint errors before interval intersection, include drift and new-event quantization
+  once, and bound complete conversion against the existing 500 µs ceiling (§2). RTT/2 medians
+  alone cannot pass. No new T3 capture has been performed.
 * Deliverable: `temp/design/phase-a-spike.md` with measured values into the §4 table and a
   **combined go/no-go: T1 + T2 ≤ 4,750 or not**. If A1 fails → P1b proposal to the coordinator
   (§1.1B, 2–4 sessions, product-change approval required) before any implementation.
@@ -361,10 +410,10 @@ Order is prescribed: **P1a first (it is free), audio second.**
 **Phase B — implement + calibrate + external spot-check + side-by-side (effort: 1–3 sessions,
 ~2–3 working days).**
 * Hour 0 preconditions: **B1** (display cadence of the acceptance head ≥ 30 fps stream-consumed
-  parts — the main worktree is still GStreamer-tagged with an unconsumed stream endpoint; run
-  against the MLT acceptance head), sink-clause adoption already granted (§9), P1a/P1b decision
+  parts — consumer exists, but candidate 204e731 is 29.999238216104732fps<30;
+  hold remains), sink-clause adoption already granted (§9), P1a/P1b decision
   from Phase A.
-* Channel implementation: page stream reader + paint anchors + read-out over CDP; server audio
+* Channel work: existing page stream reader + proposed paint anchors + read-out over CDP; server audio
   timestamp hook (position query + write-instant log); calibration scripts (audio beacon,
   display constant); bracketing external spot-checks.
 * Run §6 side-by-side twice; write the comparison analysis. **Only on PASS does Phase C start.**
@@ -382,7 +431,7 @@ re-runs).**
   `py -3.14 -m jypreview.tools.test_mlt_acceptance --av-evidence temp/mlt-av-evidence.json`
   with **unchanged** validator arithmetic; then the coordinator decides on Task 7. Keep old
   files until the gate passes; recapture on playback-code / native-runtime / output-device
-  change (line 406).
+  change (Task 6 Step 6).
 
 ---
 
@@ -392,27 +441,28 @@ re-runs).**
    exceeding the 4,750 pool ⇒ `unverified`, escalation back to the coordinator. T1's known
    fallback is P1b (approval needed); T2's is the DirectSound play-cursor probe; if both fail,
    the design honestly reports failure rather than a friendlier number.
-2. **B1 — display cadence:** current worktree shows only a 100 ms snapshot poll and an
-   unconsumed stream endpoint; if the acceptance head does not deliver ≥ 30 fps painted frames,
-   P1a cannot resolve marker boundaries at all → Phase B cannot start.
-3. **Backend head mismatch:** main worktree native path is GStreamer-tagged
-   (`X-Backend: gstreamer-ges`, `audio_sink: "autoaudiosink"`); the MLT/SDL head lives in the
-   evidence worktrees. All probes must run against the acceptance runtime; dsound/SDL numbers
-   from one head do not transfer silently.
+2. **B1 — display cadence:** the normal application consumes the native stream, but the
+   final exact 204e731 page measurement is 29.999238216104732fps<30. No observed source gaps
+   does not change this strict condition. Phase B remains on hold.
+3. **Release/candidate provenance:** main release is f0ef7da (Task1/1b); Task2 production
+   is 204e731 candidate, with subsequent test-only 25ebffa. Runtime/device/fixture/source
+   evidence must remain tied to each original commit; never transfer candidate measurements
+   silently to release.
+
 4. **SDL2/dsound fidelity** (§1.2): byte counts are guaranteed, timing fidelity is not; period
    defaults can be pathologically large; driver-side delivery jitter is unmeasured. Fail-closed
    on unavailable/zero position data.
 5. **rAF-anchor semantics under load:** P1a depends on the paint chain staying timely; Phase A
    must test at realistic page load, and raw capture must retain anomaly counters so a slipped
    frame is disclosed, not averaged away.
-6. **Audio-sink scope (resolved):** line 371's "local MLT audio sink" is adopted — measured audio
+6. **Audio-sink scope (resolved):** Task 6 Step 1's "local MLT audio sink" is adopted — measured audio
    *is* the product sink now (rev.1's deviation is gone). Residual scope note: the browser's own
    legacy `<audio>` scheduler (`media.js`) is not exercised by the acceptance — same as plan.
 7. **Dropped-mode:** full-second marker freeze = planned failure; drop injection must produce
    skips near markers without total stalls; near-marker drops are the hard case.
 8. **Hardware acceleration / display topology:** GPU vs software compositing, VRR, multi-monitor,
    refresh changes alter the present path → constants invalidated → recalibrate; disclose
-   topology in `raw_capture` (line 406 triggers cover this).
+   topology in `raw_capture` (Task 6 Step 6 triggers cover this).
 9. **Side-by-side floor:** agreement beyond the old instrument's 9,394 µs is not demonstrable —
    do not claim more.
 
@@ -422,7 +472,7 @@ re-runs).**
 
 **Plan clauses this extends/supersedes (quoted):**
 
-* Line 371 (Task 6 Step 1, capture clause): *"Capture the displayed browser pixels and actual
+* Task 6 Step 1 (capture clause): *"Capture the displayed browser pixels and actual
   audio output on one capture clock, using synchronized screen/audio-output recording with
   measured capture latency/skew, or an external recording of the screen and audible output.
   Internal consumer callbacks, `image.onload`, DOM-reported PTS, and HTTP arrival timestamps are
@@ -430,7 +480,7 @@ re-runs).**
   boundary timestamps + one-time external constant check; §3 addresses the ban list and P1a's
   proximity to it honestly). *"Run it through the normal browser URL and local MLT audio sink"* —
   **adopted as-is in rev.2** (audio stays the MLT sink; rev.1's page-audio deviation withdrawn).
-* Line 406 (Task 6 Step 6, authorization): *"If measured playback fails, stop and write a
+* Task 6 Step 6 (fallback, authorization): *"If measured playback fails, stop and write a
   follow-up design for one timestamped browser A/V channel. Keep the old files until this gate
   passes; recapture if playback code, native runtime, or output device changes."* — this
   document is that design; keep-old-files and recapture rules remain in force.
@@ -439,29 +489,23 @@ re-runs).**
 same per-pair `(abs(video−audio) + uncertainty_us) * num <= 1_000_000 * den`, same 29-pair /
 both-modes / ≥30 s requirements.
 
-**Coordinator precondition verification: 2026-10-02** (same day as this revision), against the
-repo — the two verified facts and their effect:
+**Current source/evidence check: 2026-10-03.** Stable symbols were checked in the
+index-free 024e checkout (current 25ebffa; zero production delta from 204e731 for the cited paths):
+`web/app.js` nativeFrame/renderMltAt/mlt.startStream; `web/backend.js`
+MltPlaybackClient.#startStream; `server/handlers_backend.py` _frame_headers/_encode_jpeg/
+stream; `mlt_backend.py` PlaybackController._pull_stream_frame and _frame_ready;
+`tools/test_mlt_acceptance.py` validate_av_evidence. All paths are under `scripts/jypreview/`.
+Source line numbers from rev.2 are removed; the older main CodeGraph index is not candidate proof.
+Release f0ef7da contains reviewed seek/ownership work; candidate 204e731 adds the 3-lane,
+JPEG q85 and Event readiness changes. P1b MSE/rVFC remains unauthorized.
 
-1. **P1 confirmed:** native display = `<img>` (`scripts/jypreview/web/app.js:17`
-   `const nativeFrame = document.createElement("img")`, appended at line 21); the `render.js`
-   `<video>` elements are the legacy GES source-clip path, not native MLT frames → rVFC does not
-   apply as the product exists → **revised: P1 split into P1a (no product change, spike-first)
-   and P1b (product change, needs plan-level approval)**.
-2. **Audio ownership confirmed:** plan line 371's *"local MLT audio sink"* clause is adopted;
-   pulses exit via the server MLT SDL/dsound sink → **revised: the rev.1 page-`AudioContext`/
-   `AudioBuffer` pulse design (measuring a nonexistent path) is removed; audio is timestamped
-   server-side; T2 re-derived as device-position estimation and marked NEEDS-SPIKE; T3 simplified
-   to one page→server mapping that now enters the gate delta but is constant-absorbed (§2).**
+The runtime helper at `temp/superpowers/sdd/2026-10-03-playback-remaining/task-1-live/runtime.ps1`
+uses editor stub `C:/Users/cbsjz/.codex/worktrees/integration-preview/jianying-preview/temp/mlt-capture/editor-stub`.
+That fixture stub cannot decrypt the supplied real encrypted project.
 
-**Discoveries from this revision's code check (reported to coordinator):** `/api/backend/stream`
-exists (multipart PNG + `X-Backend-PTS-US`, `handlers_backend.py:146`) but has **no page
-consumer** (`native.streamUrl` assigned at `app.js:158`, never read; play-time display is a
-100 ms snapshot poll) → new precondition **B1**; `frame-store.js` is IR window storage, not frame
-delivery; main-worktree native backend is still GStreamer-tagged while the MLT/SDL head lives in
-the evidence worktrees → probe-target precondition **3**.
-
-**User decision date:** 2026-10-02 (design authored and revised today under the plan's Step-6
-fallback; adoption = coordinator/user review; P1b additionally requires product-change approval).
+**2026-10-03 handoff:** `docs/native-backend-evaluation/2026-10-03-playback-remaining-status.md`
+records exact candidate evidence, retained failures and external/decryption blockers.
+Original user decision date is 2026-10-02; this correction authorizes documentation only.
 
 **Evidence trail (what this design is built on):**
 `temp/capture-rea/reassessment.md` — WASAPI→dsound fix recovered punctuality 0.7056× →
@@ -474,7 +518,6 @@ residual), calibration flash/beep pair method, +251 ms presentation constant, pe
 
 **UNVERIFIED until Phase C passes:** the Task 6 cutover gate itself
 (`test_mlt_acceptance --av-evidence temp/mlt-av-evidence.json` with both modes green); **every
-spike-measured term — T1 and T2 above all** (their sum must fit 4,750 µs); T3's server-clock
-source assumption; precondition B1 (display cadence on the acceptance head); P1a-vs-P1b outcome;
+spike-measured term — T1 and T2 above all** (their sum must fit 4,750 µs); T3's complete conversion bound and runtime provenance; T4's query cadence; precondition B1 (display cadence on the acceptance head); P1a-vs-P1b outcome;
 drop-injection sufficiency for `dropped_video`; the external spot-check constants.
 **Task 7 deletion remains blocked until the unchanged gate passes on this channel's evidence.**
