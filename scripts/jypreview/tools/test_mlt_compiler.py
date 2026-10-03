@@ -152,6 +152,11 @@ def still_lane_regressions(compiler, red, green, blue):
                                    Track("B","image",(replace(second,id="c"),))))
     assert graph.tractor.multitrack().count() == 3
     color(graph,15,(0,0,255)); graph.close()
+    # Same ID text must not merge disjoint clips from distinct original tracks.
+    graph = compiler.compile(model(Track("same-id","image",(first,)),
+                                   Track("same-id","image",(second,))))
+    assert graph.tractor.multitrack().count() == 3, "original track index is a lane boundary"
+    color(graph,14,(255,0,0)); color(graph,15,(0,0,255)); graph.close()
     # Sorted row order may contain backwards time; keep that painter order unchanged.
     graph = compiler.compile(model(Track("stills","image",(second,first))))
     assert graph.tractor.multitrack().count() == 3
