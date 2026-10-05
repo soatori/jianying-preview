@@ -49,6 +49,7 @@
 
 - [ ] **Step 1: 写门槛失败测试**
   - test_wrong_dll_hash_fails_closed：错误哈希必须返回版本错误，不能加载 DLL。
+  - test_wrong_version_fails_closed、test_missing_dependency_fails_closed、test_initialization_rejected_fails_closed：三种启动错误都返回明确错误，不崩溃、不打开预览、不回退。
   - test_playerwin_random_timeline_frames：YASHIDA 活动“成片”时间线的 100 个跨时间请求都返回非空 RGBA、当前 generation，PTS 偏差不超过一帧。
   - PlayerWin 未通过时才运行 test_framereader_random_source_frames：C0308.MP4 的 100 个分散素材时刻和连续 3 秒均返回有效帧；否则记录具体阻塞并停止后续任务。
 
@@ -83,6 +84,7 @@
 - 新增 JianyingDllBackend；保持现有 open(draft, timeline, *, profile) / close / snapshot 操作。
 - seek(t_us, generation)、play(rate, generation)、pause(generation)、render_at(t_us, generation)、pull_frame(timeout_ms, generation) 传递 generation。
 - render_at 返回 {generation, pts_us, width, height, format, buffer}；pull_frame 超时返回 None。
+- snapshot 返回当前 generation/phase/video PTS；只有能取得真实音频时钟时才报告 audio_pts_us，否则为 null，不用 timeline t_us 冒充音频时钟。
 - capability 保留 exact_frame/audio/transitions/effects 并按真实运行结果填写；新增 render_path（playerwin 或 frame-reader-compositor）、video_decoder（videoeditor.dll）、compositor（videoeditor.dll 或 jypreview）、audio_path（videoeditor.dll、browser-audio-scheduler 或 none）及 unsupported_effects。
 - 复用单线程 NativeHandle 串行 IPC；open 的 profile 携带 draft_root、timeline_path、timeline_id、完整 timeline IR 和 duration_us，不传只含媒体片段的旧 GES profile。
 
@@ -128,7 +130,7 @@
 
 - [ ] **Step 3: 实现 TimelineState 并接入现有 UI**
 
-  将 Stage.timeAt/primaryAt 的纯时间计算迁入新类；Stage 继续负责渲染。属性栏、选中层、主视频层和 window.__snapshot() 使用同一 at(t_us) 结果，不读取 DOM/媒体节点推断时间线状态。
+  将 Stage.timeAt/primaryAt 的纯时间计算迁入新类；Stage 继续负责渲染。属性栏、选中层、主视频层、音频活动片段和 window.__snapshot() 使用同一 at(t_us) 结果，不读取 DOM/媒体节点推断时间线状态。
 
 - [ ] **Step 4: 运行 Node 查询测试并提交本任务文件**
 
@@ -137,12 +139,14 @@
 ### Task 4: 让 seek 和连续 stream 丢弃旧帧
 
 **Files:**
-- Modify: scripts/jypreview/web/app.js:35-161, 700-740, 920-940
+- Modify: scripts/jypreview/web/app.js:35-170, 491-510, 673-681, 700-740, 920-940
 - Modify: scripts/jypreview/web/playback.js:202-253
 - Modify: scripts/jypreview/tools/test_native_preview.py
 
 **Interfaces:**
 - PlaybackController 是 generation 唯一来源；native seek/render/stream 请求都携带该 generation。
+- app.js 的 seek() 和 window.__renderAt 统一调用 PlaybackController.seek()；renderTimelineAt(t_us, context) 将 context.generation 交给 nativeRenderAt(t_us, generation)。nativeRenderAt 校验响应 generation，不自行递增 generation 或用 syncExternal 覆盖 controller 状态。
+- activateNativeBackend 的首帧使用 controller 当前 generation；togglePlay 的 play/pause 请求及 stream URL 也传递当前 generation。
 - 新 generation 开始时先移除旧 img src 以中止旧 stream、隐藏旧画面，再以新 generation 重开；只有新请求首帧到达后显示。
 - 服务器及前端均拒绝 generation 不匹配或 PTS 超过一帧的帧。
 
@@ -156,7 +160,7 @@
 
 - [ ] **Step 3: 将 controller generation 传到 API 和 img stream**
 
-  seek 先发带 generation 的控制请求；新 stream 替换旧 stream；close 时中止 stream、清空帧并关闭 object URL。
+  renderTimelineAt 的 native 分支带 context.generation 调用 nativeRenderAt；seek 与 window.__renderAt 都经过 PlaybackController.seek()。启动、play/pause 和 stream URL 使用同一 controller generation；新 seek 替换旧 stream；close 时中止 stream、清空帧并关闭 object URL。
 
 - [ ] **Step 4: 重跑 native preview 回归并提交本任务文件**
 
@@ -168,6 +172,7 @@
 - Create: scripts/jypreview/native_compositor.py
 - Modify: scripts/jypreview/playback_backend.py
 - Modify: scripts/jypreview/web/media.js:16-89
+- Modify: scripts/jypreview/web/app.js:117-141, 495-510, 713-730
 - Test: scripts/jypreview/tools/test_dll_compositor.py
 - Test: scripts/jypreview/tools/test_playback_kernel.mjs
 
@@ -175,6 +180,8 @@
 - 此任务只在 Task 1 选中 frame-reader-compositor 时执行；PlayerWin 路径直接使用 DLL 完整合成帧并跳过本任务。
 - compose_frame(ir, t_us, decode_frame) -> {width, height, format, buffer}；decode_frame(path, source_time_us) 只能通过 FrameReaderWin 取得视频源帧。
 - Reader 路径的 capability 为 video_decoder=videoeditor.dll、compositor=jypreview、audio_path=browser-audio-scheduler。
+- activateNativeBackend 保存返回的 capabilities。app.js 只在 audio_path=browser-audio-scheduler 时按原生 snapshot 的 t_us/phase 驱动 AudioScheduler；pause/close 时停音。PlayerWin 使用 DLL 音频时清掉浏览器音频，避免重复播放。
+- window.__snapshot 暴露 Reader AudioScheduler 的当前素材位置；PlayerWin 从 backend snapshot 暴露 audio_pts_us。没有独立音频位置时，Task 6 的同步门槛不通过。
 
 - [ ] **Step 1: 写合成与音频行为测试**
 
@@ -186,7 +193,7 @@
 
 - [ ] **Step 3: 用 Pillow 合成 Reader 帧并补齐 AudioScheduler**
 
-  复用现有 Pillow，不新增依赖；按 IR 的复合映射解码源帧，绘制文字/变换/图层及 YASHIDA 实际效果。只对 Reader 路径启用浏览器音频补充，不替代 DLL 视频解码。
+  复用现有 Pillow，不新增依赖；按 IR 的复合映射解码源帧，绘制文字/变换/图层及 YASHIDA 实际效果。只对 Reader 路径启用浏览器音频补充，不替代 DLL 视频解码；将原生 snapshot 的时间和播放状态接入 app.js 音频调度，PlayerWin 不重复播放浏览器音频。
 
 - [ ] **Step 4: 运行两组测试并提交本任务文件**
 
@@ -211,6 +218,8 @@
 
   运行：从 scripts/ 执行 python -X utf8 -m jypreview.tools.test_native_preview；图像比较运行 python -X utf8 -m jypreview.tools.compare_native_export --draft $env:JY_PREVIEW_TEST_DRAFT --timeline active --export $env:JY_PREVIEW_TEST_EXPORT。
 
+  扩展 test_native_preview.py：30 秒内记录 multipart 每帧的 generation、X-Backend-PTS-US、单调时钟到达时间及帧数；同时从选中的音频路径记录实际媒体位置/时间戳，并用同一单调时钟关联音频与视频事件，不得只用 state.tUs 同时推导两侧。以时间线帧率计算丢帧率，以音频/视频事件时间计算同步偏差；任一侧缺少可测时钟时，该门槛保持未通过。
+
   预期：请求代次有效、PTS 偏差不超过一帧、丢帧率低于 1%、音画同步不超过一帧；无黑帧、错层、缺字或未报告效果缺口；有匹配音频参考时比较波形/能量分布，无参考时只报告内容检查，不判相似度。
 
 - [ ] **Step 4: 验证源文件哈希不变并提交验收工具**
@@ -223,6 +232,7 @@
 - Modify: scripts/jypreview/playback_backend.py
 - Modify: scripts/jypreview/server/handlers_backend.py
 - Modify: scripts/jypreview/web/backend.js
+- Modify: scripts/jypreview/web/app.js
 - Modify: scripts/jypreview/web/render.js
 - Modify: scripts/jypreview/web/media.js
 - Remove only tests/tools that exclusively validate deleted GES/browser render paths.
@@ -233,7 +243,7 @@
 
 - [ ] **Step 2: 删除旧后端和其专用测试/工具**
 
-  仅在 Task 6 全部门槛通过后删除；保留草稿读取/解密、TimelineState、属性与轨道 UI、PlaybackController、Reader 路径 AudioScheduler 及通用回归工具。GStreamer/browser 只能作为显式诊断，原生错误不能自动切回它们。
+  仅在 Task 6 全部门槛通过后删除；保留草稿读取/解密、TimelineState、属性与轨道 UI、PlaybackController、Reader 路径 AudioScheduler 及通用回归工具。activateNativeBackend 启动失败时显示错误并停止，不自动转 browser；只有用户显式选择 backend=browser 诊断模式时才启用旧渲染路径。
 
 - [ ] **Step 3: 运行最终回归并提交清理**
 
