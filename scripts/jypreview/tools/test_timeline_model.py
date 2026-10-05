@@ -183,6 +183,19 @@ def adapter_assertions():
         assert half_model.tracks[0].clips[0].time_mapping == TimeMapping(1, 2)
         assert evaluate(half_model, 3).video[0].source_us == 2_000_001
 
+        for speed, expected in (
+            (0.47145, TimeMapping(9429, 20000)),
+            (0.60215, TimeMapping(12043, 20000)),
+            (0.3936, TimeMapping(246, 625)),
+            (0.5172, TimeMapping(1293, 2500)),
+        ):
+            changed = deepcopy(value)
+            changed["tracks"][0]["segments"][0].update(speed=speed, reverse=False)
+            mapped = build(changed, config).tracks[0].clips[0]
+            assert mapped.time_mapping == expected
+            assert not mapped.placeholder
+            assert "speed_unsupported" not in mapped.warnings
+
         unsupported = deepcopy(value)
         unsupported["materials"]["video_effects"] = [{"id": "fx", "type": "unknown"}]
         unsupported["materials"]["material_animations"] = [{"id": "anim", "animations": [{"start": 100_000, "duration": 200_000}]}]

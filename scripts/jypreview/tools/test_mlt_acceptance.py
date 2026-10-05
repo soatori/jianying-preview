@@ -194,6 +194,9 @@ def three_layer_geometry() -> str:
         for i, media in enumerate((red, green, blue))))))
     for x, expected in ((50, (255, 0, 0)), (150, (0, 255, 0)), (250, (0, 0, 255))):
         color(bands, 0, expected, x)
+    # Verify width as well as center; center-only probes miss undersized affine layers.
+    for x, expected in ((90, (255, 0, 0)), (190, (0, 255, 0)), (290, (0, 0, 255))):
+        color(bands, 0, expected, x)
     bands.close()
     scaled = compiler.compile(compiled_model(Track("s", "video", (
         picture("r", red, transform=_transform(150, 90, 150, 90, scale_x=0.5, scale_y=0.5)),))))

@@ -196,9 +196,6 @@ class DraftAdapter:
         except (ValueError, TypeError, ZeroDivisionError, OverflowError):
             warnings.append("speed_invalid")
             return TimeMapping(), True
-        if not curve and rate not in (Fraction(1, 2), Fraction(1), Fraction(2)):
-            warnings.append("speed_unsupported")
-            return TimeMapping(rate.numerator, rate.denominator), True
         return TimeMapping(rate.numerator, rate.denominator,
                            "reverse" if segment.get("reverse") else "forward",
                            "average_curve" if curve else "constant"), False
@@ -260,6 +257,16 @@ class DraftAdapter:
             warnings.append("text_metrics_estimated")
         if any(item.get("flower") for item in payload["runs"]):
             warnings.append("text_effect_unsupported")
+        if any(any(isinstance(shadow, dict) and _number(shadow.get("alpha")) > 0
+                       for shadow in (run.get("shadows") or [])) for run in payload["runs"]):
+            warnings.append("text_shadow_unsupported")
+        if any(len(run.get("strokes") or []) > 1 or
+               any(stroke.get("render_type") != "solid" and _number(stroke.get("alpha")) > 0
+                   for stroke in (run.get("strokes") or []) if isinstance(stroke, dict))
+               for run in payload["runs"]):
+            warnings.append("text_outline_unsupported")
+        if len(payload["runs"]) > 1:
+            warnings.append("text_runs_unsupported")
         text = TextPayload(payload["text"], run["font"]["family"], run["font"]["path"],
                            run["em_px"], str(_dict(run.get("fill")).get("css") or "#ffffff"),
                            (rect["cx_px"], rect["cy_px"], lines["box_w_px"], lines["box_h_px"]),

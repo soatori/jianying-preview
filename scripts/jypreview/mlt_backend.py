@@ -8,10 +8,12 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
-from math import log10
+from fractions import Fraction
+from math import isfinite, log10
 from typing import Any
 
 from .model.content import DEFAULT_RI
+from .model.layout import fit_contain
 from .model.timeline import FrameRate, TimelineModel, Transform
 
 # SDL2's default WASAPI backend faults with a native access violation when
@@ -66,6 +68,43 @@ _cache_purge = None
 _sink_name = None
 _libmlt_cache = None
 _natives_configured = False
+_pango_font_lock = threading.Lock()
+_pango_registered_fonts: set[str] = set()
+_pango_fontconfig = None
+
+
+def _pango_font_family(path: str) -> tuple[str | None, bool, bool]:
+    """Register a resolved font file with Pango and return its embedded family."""
+    global _pango_fontconfig
+    if not path or not os.path.isfile(path):
+        return None, False, False
+    try:
+        from PIL import ImageFont
+        family = ImageFont.truetype(path, 32).getname()[0]
+    except (ImportError, OSError, TypeError, ValueError, AttributeError):
+        return None, False, False
+    key = os.path.normcase(os.path.abspath(path))
+    with _pango_font_lock:
+        if key in _pango_registered_fonts:
+            return family, True, False
+        try:
+            loader = ctypes.WinDLL if os.name == "nt" else ctypes.CDLL
+            library = _pango_fontconfig or loader(
+                "libfontconfig-1.dll" if os.name == "nt" else "fontconfig")
+            library.FcConfigGetCurrent.restype = ctypes.c_void_p
+            library.FcConfigAppFontAddFile.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            library.FcConfigAppFontAddFile.restype = ctypes.c_int
+            library.FcConfigBuildFonts.argtypes = [ctypes.c_void_p]
+            library.FcConfigBuildFonts.restype = ctypes.c_int
+            config = library.FcConfigGetCurrent()
+            if not config or not library.FcConfigAppFontAddFile(
+                    config, os.fsencode(os.path.abspath(path))) or not library.FcConfigBuildFonts(config):
+                return family, False, False
+            _pango_fontconfig = library
+            _pango_registered_fonts.add(key)
+            return family, True, True
+        except (OSError, AttributeError, TypeError):
+            return family, False, False
 
 # (properties, listener_data, event_data) as MLT fires it; event_data carries the frame.
 _Listener = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
@@ -206,6 +245,22 @@ class MltCompiler:
     @staticmethod
     def _profile(mlt, model, rate=None):
         rate = rate or model.frame_rate
+        int_max = (1 << 31) - 1
+        if rate.num > int_max or rate.den > int_max:
+            # SWIG exposes MLT's profile rate as two C ints. Timewarp can
+            # produce a valid rate whose exact rational exceeds that range.
+            exact = Fraction(rate.num, rate.den)
+            max_den = int_max - 1
+            if exact > 1:
+                max_den = min(max_den, (int_max - 1) * exact.denominator // exact.numerator)
+            if max_den < 1:
+                raise BackendUnavailable(f"MLT profile rate is out of range: {rate.num}/{rate.den}")
+            bounded = exact.limit_denominator(max_den)
+            if bounded.numerator > int_max or bounded.denominator > int_max:
+                raise BackendUnavailable(f"MLT profile rate is out of range: {rate.num}/{rate.den}")
+            if bounded.numerator <= 0:
+                raise BackendUnavailable(f"MLT profile rate is below supported precision: {rate.num}/{rate.den}")
+            rate = FrameRate(bounded.numerator, bounded.denominator)
         width, height = model.canvas
         profile = mlt.Profile()
         profile.set_frame_rate(rate.num, rate.den)
@@ -241,7 +296,8 @@ class MltCompiler:
                 owned.append(value)
                 return value
 
-            background = keep(mlt.Producer(profile, "color", "#000000"))
+            background = keep(mlt.Producer(profile, "color",
+                                           "0x00000000" if depth else "#000000"))
             background.set("set.test_audio", 1)
             background.set("length", count)
             background.set_in_and_out(0, count - 1)
@@ -313,6 +369,7 @@ class MltCompiler:
                         broken = True
                 producer = None
                 title_size = None
+                decoded_size = None
                 if not broken and clip.nested is not None:
                     if depth >= 2:
                         warnings.append("max_nest_depth")
@@ -329,14 +386,30 @@ class MltCompiler:
                             warnings.append("nested_time_mapping")
                 elif not broken and clip.kind == "text" and clip.text_payload:
                     text = clip.text_payload
+                    native_family, font_registered, reload_fontmap = _pango_font_family(text.font_path)
+                    if text.font_path and not font_registered:
+                        warnings.append(f"text_font_native_unavailable:{clip.id}")
                     producer = keep(mlt.Producer(profile, "loader", "pango:"))
-                    for key, value in {"text": text.text, "family": text.font_family or "Sans",
+                    if reload_fontmap:
+                        producer.fire_event("fontmap-reload")
+                    for key, value in {"text": text.text, "family": native_family or text.font_family or "Sans",
                                        "size": round(text.font_size), "fgcolour": text.color,
                                        "bgcolour": "0x00000000", "align": "centre"}.items():
                         producer.set(key, value)
                     for key, value in text.style:
                         if key in ("weight", "style", "underline", "strikethrough", "align"):
                             producer.set(key, value)
+                    style = dict(text.style)
+                    stroke = style.get("runs.0.strokes.0.width_em", 0)
+                    if isinstance(stroke, (int, float)) and isfinite(stroke) and stroke > 0 \
+                            and style.get("runs.0.strokes.0.render_type") == "solid":
+                        producer.set("outline", round(text.font_size * stroke))
+                        color = style.get("runs.0.strokes.0.color") or "#000000"
+                        alpha = style.get("runs.0.strokes.0.alpha", 1.0)
+                        if isinstance(alpha, (int, float)) and isfinite(alpha) \
+                                and isinstance(color, str) and color.startswith("#") and len(color) == 7:
+                            color = f"0x{color[1:]}{round(255 * max(0, min(1, alpha))):02x}"
+                        producer.set("olcolour", color)
                     producer.get_frame().get_image(mlt.mlt_image_rgba, *model.canvas)
                     title_size = (producer.get_int("meta.media.width"), producer.get_int("meta.media.height"))
                 elif not broken and clip.media_ref and clip.media_ref.exists:
@@ -369,6 +442,13 @@ class MltCompiler:
                         else:
                             data = frame.get_image(mlt.mlt_image_rgba, *model.canvas)
                             broken = data is None or frame.get_int("test_image") != 0
+                            decoded_size = (producer.get_int("meta.media.width"),
+                                            producer.get_int("meta.media.height"))
+                            if min(decoded_size) <= 0:
+                                decoded_size = None
+                            elif not broken and min(clip.media_ref.width, clip.media_ref.height) > 0 \
+                                    and decoded_size != (clip.media_ref.width, clip.media_ref.height):
+                                warnings.append(f"media_dimensions_mismatch:{clip.id}")
                         owned.append(producer)
                     else:
                         broken = True
@@ -500,17 +580,30 @@ class MltCompiler:
                     blend = keep(mlt.Transition(profile, "frei0r.cairoaffineblend"))
                     width, height = model.canvas
                     t = clip.transform
-                    if t == Transform():
+                    default_transform = t == Transform()
+                    if default_transform:
                         tw, th = title_size or (width, height)
                         t = Transform(width/2, height/2, tw or width, th or height)
+                    base_w, base_h = width, height
+                    if title_size is not None:
+                        base_w, base_h = fit_contain(*title_size, width, height)
+                    if not broken and not default_transform and title_size is None and clip.nested is None \
+                            and clip.media_ref is not None:
+                        dimensions = decoded_size or (clip.media_ref.width, clip.media_ref.height)
+                        base_w, base_h = fit_contain(*dimensions, width, height)
                     for key,value in {"0":.4+t.x/(5*width),"1":.4+t.y/(5*height),
-                                       "2":(t.width or width)*t.scale_x/(5*width),
-                                       "3":(t.height or height)*t.scale_y/(5*height),
+                                       "2":(t.width or base_w)*t.scale_x/(5*base_w),
+                                       "3":(t.height or base_h)*t.scale_y/(5*base_h),
                                        "4":(t.rotation%360)/360,"5":clip.opacity,"6":clip.blend_mode,
                                        "7":t.anchor_x,"8":t.anchor_y,"always_active":1}.items():
                         blend.set(key,value)
                     if linked:
                         blend.set("5", ";".join(f"{pos}={value}" for pos,value in weights.items()))
+                    if depth:
+                        # frei0r.cairoaffineblend writes its result onto A's frame.
+                        # Nested tractors can reuse that cached frame across seeks;
+                        # target B (the clip frame) to keep the transparent base fresh.
+                        blend.set("invert", 1)
                     tractor.plant_transition(blend, 0, index)
                 if audio:
                     mix = keep(mlt.Transition(profile, "mix"))
