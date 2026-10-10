@@ -20,8 +20,22 @@ agent 既能读 JSON，也能拿 PNG 截图，不必启动剪映。
 ## Quick start
 
 ```bash
-python <SKILL_ROOT>/scripts/preview.py serve         # 打开 http://127.0.0.1:8765/
+python <SKILL_ROOT>/scripts/preview.py serve         # 打开 http://127.0.0.1:8765/（只读 React 编辑器）
+python <SKILL_ROOT>/scripts/preview.py launch "草稿名"  # 启动一次性会话并打开浏览器
+python <SKILL_ROOT>/scripts/preview.py serve --no-browser --persistent  # Agent 长连接模式
+python <SKILL_ROOT>/scripts/preview.py close --session <session_id>     # 关闭一次性会话
 ```
+
+界面是一次 Vite 构建的 React 应用，源码在 `scripts/jypreview/web/src/`，产物在 `web/dist/`，
+由 Python 服务从 `/`（等价 `/editor`）与 `/web/dist/*` 提供。改过前端要先构建：
+
+```bash
+cd <SKILL_ROOT>/scripts/jypreview/web && npm install && npm run build   # 产物 dist/，Python 直接 serve
+cd <SKILL_ROOT>/scripts/jypreview/web && npm test && npm run typecheck  # 139 条无浏览器断言
+cd <SKILL_ROOT>/scripts/jypreview/web && npm run dev                    # 5173 端口热更新，代理到 8765
+```
+
+未构建时 `/` 返回 `editor_not_built` 并提示构建命令——不回退去 serve TS 源码。
 「打开草稿」→ 弹**系统资源管理器目录选择框**（`GET /api/pick-folder`，服务端 tkinter），选完即打开；
 不在网页里自建文件列表。头部只有：打开草稿 / 时间线下拉 / 刷新 / 走带时钟。未打开草稿时这句话
 显示在时间线区域里。
@@ -57,6 +71,7 @@ python <S>/preview.py shot "YASHIDA 9月24日" --t 12.4 --ratio 16:9 --out w.png
 | 需求 | 命令 / 端点 |
 |---|---|
 | 看整体节奏、找时间点 | `GET /api/trackmap` 或 UI 轨道泳道 |
+| 一次拿整条时间线（给前端/校验用） | `GET /api/editor-project?draft=<did>&timeline=<id>` → `jypreview/editor-project@1` |
 | 断言"某时刻屏上有什么" | `what-at` / `GET /api/what-at` |
 | 逐字段核对图层 | `frame --out a.json` + `ir-diff --a-file/--b-file` |
 | 视觉确认 | `shot`（`--view stage` 只出画面；`--view ui` 出整页含标注） |
@@ -81,7 +96,29 @@ python <S>/preview.py shot "草稿名" --t 7 --out after.png
 `ir-diff` 的 `summary.added/removed/changed` 就是改动的"爆炸半径"；`changed[].fields`
 给出每个字段的前后值。若出现计划外的图层变化，先停手检查，不要继续写回。
 
-## 只读保证（机器强制）
+## 包装 staging 审查
+
+对重点句 staging 使用“组首 / 组中 / 组尾”三点审查，而不是只看单帧：
+
+```bash
+python <S>/preview.py frame "草稿名" --timeline <tid> --t <group-start> --compact
+python <S>/preview.py frame "草稿名" --timeline <tid> --t <group-middle> --compact
+python <S>/preview.py frame "草稿名" --timeline <tid> --t <group-end> --compact
+python <S>/preview.py shot "草稿名" --timeline <tid> --t <group-end> --out review.png
+```
+
+每一点核对：
+
+- 预期文本是否完整出现，`句N/M` 对应的行是否齐全；
+- `layer_count` 是否符合同画面组的预期，是否出现计划外新增/消失图层；
+- 同一文本轨内是否有时间重叠，跨轨文本是否遮挡主体或超出安全区；
+- 手工修改的 `clip.transform` 是否保留；
+- 源时间线原文本是否仍可见；只有获准的 clone 才能出现 `"visible": false`；
+- 组尾是否确实延长到最后一条文本结束。
+
+写回后先 `frame --out before/after` 并运行 `ir-diff`，再截图复核。出现文本不一致、计划外图层变化、碰撞、源时间线变化或备份缺失时停止进入 final。
+
+## 只读保证（机器强制）## 只读保证（机器强制）
 
 - 服务器进程永不加载 `videoeditor.dll`：解密在短命子进程 `jypreview.decrypt.worker` 里完成，
   结果写文件后 `TerminateProcess`（DLL 会漏堆、刷 banner，不能常驻）。
@@ -106,7 +143,7 @@ python <S>/preview.py shot "草稿名" --t 7 --out after.png
 | 素材像素 | 新草稿基本齐全；老草稿大量路径失效 → 出带名称/编码/原路径的占位瓦片，UI 明示"N 个素材缺失" |
 | 复合片段 | 递归渲染内层内容（媒体按 `draft_file_path` 所在目录解析）；内层不可解析时退回剪映自己的 `draft_cover_path` 封面 |
 | 音频 | 播放时挂 `<audio>` 按 IR 的 `source_time_us`/`volume` 对齐（不做多轨混音/淡变曲线）；轨道静音与无路径的仍只列标签 |
-| 播放 | **窗口驱动**：一次 `GET /api/frame?window_us=` 取回与窗口相交的**全部**图层（不只可见层），前端建成图层池后跨帧保活；播放期间**不再发请求**，片段切换/字幕变化/上层素材滚动都是已存在节点上的 CSS 开关。走带时钟是墙钟 + **主轨素材漂移校正**（`correctClock`，`CATCHUP_US` 内才回写），不再由 `currentTime` 反推。可见视频按绘制序取前 `LIVE_LIMIT=5` 个一起跑（即"最下一条画面轨 + 上层 overlay 一起动"），超出预算的用 `SEEK_GAP_MS=180` 的人类节奏刷新而不是每帧 seek |
+| 播放 | **窗口驱动 + 状态机**：`PlaybackController` 只在有效窗口覆盖当前 `t_us` 时推进时钟；窗口请求使用 generation 丢弃旧结果，`FrameStore` 区分 point/window IR，`SceneGraph` 决定可见层，`MediaScheduler` 管理解码预算/预取/释放，`EffectRenderer` 按 `t_us` 应用文字和媒体动画。视频 `currentTime` 不再反向修改时间线 |
 | 播放开关的隐式写操作 | `t` 深链在被打开草稿后只做一次：`start()` 读的是模块加载时快照的 `deepLink`，因为 `openDraft`/`selectTimeline` 会把选中的 timeline 写回 `params` —— 若直接读 `params`，同一时间线会被选第二次，把刚建好的图层池 `clear()` 掉，表现为"按下播放有 1 帧空白" |
 | 蒙版 / LUT / curve_speed / 复合片段>2 层 | 不渲染，见 references |
 
@@ -143,7 +180,7 @@ python <S>/preview.py shot "草稿名" --t 7 --out after.png
 | 点「打开草稿」没弹选择框 | 服务跑在无人登录的会话里时 tkinter 无法显示桌面窗口；直接用 `?draft=<草稿文件夹路径>` |
 | 画面全黑但有图层 | 多半是素材路径失效；看 `media.placeholder_reason` 与 UI 瓦片文字 |
 | 复合片段只有字幕没有画面 | 先 `frame --compact` 确认内层 `media.path_served` 有值且 `exists:true`，那就是渲染序问题，比对 `Stage.paint` 与 DOM `z-index` |
-| 改了 `web/*` 界面没变 | `/web/*` 已带 `Cache-Control: no-cache` 且 import 统一打 `?v=<mtime>`；仍不生效就硬刷新一次 |
+| 改了前端界面没变 | 忘了 `npm run build`：`/` serve 的是 `web/dist/`，`hash` 资源带 `immutable`，只有 `editor.html` 是 `no-cache` |
 | 截图报 `page never became ready` | 确认 `serve` 在跑（`shot` 默认复用服务器持有的浏览器）；或加 `--no-server` |
 | `browser exited during startup` | 规范 profile 被上一次被杀的浏览器占住；`BrowserSession` 会自动换同级新 profile 重试，日志里会带 `retry with msedge-<ts>-0` |
 | 视频区不显示 | 用于截图的浏览器需带 H.264：Playwright 自带 chromium/headless_shell **不带**，默认已优先用 Edge |
@@ -154,7 +191,9 @@ python <S>/preview.py shot "草稿名" --t 7 --out after.png
 
 ```bash
 python <SKILL_ROOT>/scripts/preview.py selfcheck --milestone all   # M0/M1/M2 共 40 项断言
-python -m jypreview.tools.audit_playback "<草稿>" --seconds 24     # 需要 serve：真机播放逐帧比对
+python -m jypreview.tools.test_editor_ui "<草稿>"                    # 自带服务+浏览器：9 项验收
+python -m jypreview.tools.test_editor_project                          # editor-project 契约（离线）
+python -m jypreview.tools.test_editor_integration                      # 构建产物 / 静态服务 / SSE（离线）
 ```
 
 ## Resources
@@ -164,4 +203,4 @@ python -m jypreview.tools.audit_playback "<草稿>" --seconds 24     # 需要 se
 - `references/effect-catalog.md` — 对照表三层来源、`render_class` 判定、真实覆盖率
 - `references/calibration-and-oracle.md` — 文字尺寸/fit 模型的标定方法与已知残差
 - `references/agent-verification-loop.md` — 改前留档 → 写回 → 重载 → ir-diff → 截图 的完整 SOP，
-  含"验播放"一节：`__snapshot()` 读 DOM 池 + `python -m jypreview.tools.audit_playback` 真机逐帧比对
+  含"验播放"一节：页面 `__editorScene()` / `__editorSeek()` 钩子 + `python -m jypreview.tools.test_editor_ui` 真机逐时刻比对与草稿字节不变性
