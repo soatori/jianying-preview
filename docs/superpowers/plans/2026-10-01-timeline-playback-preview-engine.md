@@ -16,22 +16,26 @@
 - Keep decrypted/plain draft content, `Timelines/`, and draft metadata read-only; write only existing `.jypreview`, user-cache, `temp/`, and documentation locations.
 - Use integer microseconds and half-open ranges `[start_us, end_us)` throughout the model/API; convert to MLT frame positions only inside `MltCompiler` and `PlaybackController`.
 - Represent project frame rate as exact `{num, den}` values; default missing FPS to `30/1` with a warning, and normalize common NTSC values such as `29.97` to `30000/1001`.
-- Quantize with `frame = floor(t_us * num / (1_000_000 * den))` and `sample_us = floor(frame * 1_000_000 * den / num)`; never accumulate floating-point frame durations.
+- Quantize with `frame = floor(t_us * num / (1_000_000 * den))`; its canonical integer timestamp is `sample_us = ceil(frame * 1_000_000 * den / num)`, implemented as `(frame * 1_000_000 * den + num - 1) // num`. This is the first representable microsecond at or after the exact frame start and must round-trip to the same frame; never accumulate floating-point frame durations.
+- For a nonnegative boundary `b_us`, the first frame whose canonical sample is not earlier than it is `first_frame_at_or_after(b_us) = 0` for zero, otherwise `((b_us - 1) * num) // (1_000_000 * den) + 1`. Compile `[start_us, end_us)` to `[first_frame_at_or_after(start_us), first_frame_at_or_after(end_us))`; convert its exclusive end to an inclusive MLT out only for a nonempty frame range. `frame_count(duration_us)` uses the same helper and returns zero for an empty timeline.
 - Keep `FrameDescriptor` as a structural/time oracle only; it must not feed backend scheduling or the compiled MLT graph.
 - Support only positive rational clip rates 0.5x, 1x, and 2x plus an independent forward/reverse direction in the first implementation; approximate readable curves by their average and warn, otherwise render a placeholder.
 - Keep preview transport at 1x; clip source speed is independent of global transport speed.
 - Serialize all MLT calls through the existing one-worker pattern; MLT objects never enter HTTP payloads or browser state.
+- Bind commands and frames to a fresh `playback_id` for each open, monotonic client seek `request_id`, and server `generation`; capture frame identity when produced, never by reading a later snapshot during HTTP encoding.
+- Keep FrameDescriptor unchanged as a limited legacy comparison, not the authority for newly corrected source mapping, visibility, transitions, placeholders, or nested IDs. Independent expected values define those semantics.
 - Do not add MLT to `scripts/requirements.txt`; it is an isolated native runtime whose interpreter/plugin provenance is recorded by Task 1.
 - Launch the preview server and every MLT-dependent check with the gate-approved `JY_PREVIEW_MLT_PYTHON`; do not mix its native DLL/plugin paths with the default interpreter.
 - Do not implement draft write-back, final export, a general edit-command layer, or private Jianying effect recreation.
 
 ## Review Focus
 
-- A duration or clip boundary between project frames must select the first sample not earlier than the boundary, and `t_us >= duration_us` must return `ended` without pulling a frame (Task 2 tests).
+- Canonical samples must round-trip at 30 and NTSC FPS; boundaries use the same helper for evaluation, compiler intervals, and duration, and `t_us >= duration_us` returns `ended` without pulling a frame (Tasks 2-3 tests).
 - Invalid/negative ranges, empty media references, unavailable source handles, and undecodable clips must preserve interval and z order as warnings/placeholders instead of disappearing (Tasks 2-3 tests).
-- Disabled tracks, invisible clips, muted tracks, clip gains greater than 1, same-track overlaps, and equal-z ties must produce deterministic visibility/audio/order (Tasks 2-3 tests).
+- Disabled tracks, invisible clips, muted tracks, clip gains greater than 1, same-track overlaps, equal-z ties, and adjacent clips whose z crosses another track must produce deterministic visibility/audio/order (Tasks 2-3 tests).
 - Repeated child IDs in different compound clips and recursion beyond `config.max_nest_depth` must not collide or recurse indefinitely (Task 2 tests).
-- Rapid out-of-order seeks, late frames from an old generation, consumer/plugin failures, EOS, and dropped video frames must not move the audio-derived clock backward (Tasks 4 and 6 tests).
+- Out-of-order seek requests must preserve the latest client intent; late frames/responses and reopened handles must not overwrite it. Clock monotonicity applies within a generation; explicit backward seek may change time (Tasks 4-6 tests).
+- Internal PCM/video PTS agreement is distinct from captured audible audio versus the browser's displayed video. Missing or inconclusive end-to-end capture evidence blocks legacy deletion (Task 6).
 
 ---
 
@@ -58,7 +62,7 @@
 **Interfaces:**
 - Consumes: `JY_PREVIEW_TEST_VIDEO`, `JY_PREVIEW_TEST_AUDIO`, and the absolute Python executable in `JY_PREVIEW_MLT_PYTHON`.
 - Produces: CLI `python -m jypreview.tools.test_mlt_runtime --video PATH --audio PATH --json temp/mlt-runtime-gate.json`; exit 0 means Tasks 2-7 may run, any nonzero exit stops this plan.
-- Produces JSON keys: `python`, `mlt_version`, `repository`, `plugins`, `decoded_media`, `frame_positions`, `audio_sink`, `three_layer_rgba`, `timewarp`, `max_av_delta_frames`, and `ok`.
+- Produces JSON keys: `python`, `mlt_version`, `repository`, `plugins`, `decoded_media`, `frame_positions`, `audio_sink`, `three_layer_rgba`, `timewarp`, `max_internal_av_delta_frames`, and `ok`. This runtime gate measures graph PCM/video timestamps only; browser presentation is gated separately in Task 6.
 
 - [ ] **Step 1: Confirm the current default interpreter does not accidentally satisfy the gate**
 
@@ -88,7 +92,7 @@ $env:PYTHONPATH='scripts'
   --json temp/mlt-runtime-gate.json
 ```
 
-Expected: PASS, JSON has `"ok": true`, all required plugin names, nonempty RGBA/audio output, exact requested project-frame positions, and `max_av_delta_frames <= 1`.
+Expected: PASS, JSON has `"ok": true`, all required plugin names, nonempty RGBA/audio output, exact requested project-frame positions, and `max_internal_av_delta_frames <= 1`.
 
 If it fails: write the failure and missing capability to the gate report, commit only the probe/report, and stop. Create a separate libopenshot comparison spec/plan; do not continue with a partial MLT replacement.
 
@@ -117,6 +121,7 @@ git -C docs commit -m "docs: record MLT runtime gate"
 - Consumes: `TimelineContent`, draft root, `Config`, `FileRegistry`, font/catalog/media helpers, and `config.max_nest_depth`.
 - Produces in `timeline.py`: frozen values `FrameRate`, `TimeRange`, `TimeMapping`, `MediaRef`, `AudioSpec`, `Transform`, `TextPayload`, `EffectSpec`, `Clip`, `Track`, `Transition`, `TimelineModel`, `SceneItem`, and `ExpectedScene`.
 - Produces: `FrameRate.quantize(t_us: int) -> tuple[int, int]` returning `(frame_index, sample_us)`.
+- Produces on `FrameRate`: `sample_us(frame_index: int) -> int`, `first_frame_at_or_after(t_us: int) -> int`, and `frame_count(duration_us: int) -> int` using the global integer formulas; validate nonnegative inputs and a positive rational frame rate with at most one frame per microsecond.
 - Produces: `TimeMapping.source_us(local_us: int, source: TimeRange) -> int | None`.
 - Produces: `evaluate(model: TimelineModel, t_us: int) -> ExpectedScene`; `ExpectedScene.state` is `"active"` or `"ended"` and separates ordered `video` and `audio` tuples.
 - Produces in `draft_adapter.py`: `DraftAdapter(config, registry, font_index, catalog, probe_cache).build(content: TimelineContent, *, draft_root: Path, did: str, timeline_info: dict[str, Any]) -> TimelineModel`.
@@ -128,14 +133,23 @@ Add assertions equivalent to:
 
 ```python
 rate = FrameRate(30_000, 1_001)
-assert rate.quantize(1_000_000) == (29, 967_633)
+assert rate.quantize(1_000_000) == (29, 967_634)
+assert rate.quantize(rate.sample_us(29)) == (29, 967_634)
+rate30 = FrameRate(30, 1)
+assert rate30.sample_us(1) == 33_334
+assert rate30.quantize(33_334) == (1, 33_334)
+assert rate30.first_frame_at_or_after(33_334) == 1
+assert rate30.first_frame_at_or_after(33_335) == 2
+assert rate30.frame_count(0) == 0
+assert rate30.frame_count(33_334) == 1
+assert rate30.frame_count(33_335) == 2
 assert evaluate(model, model.duration_us).state == "ended"
 assert evaluate(model, model.duration_us).video == ()
 assert forward.source_us(250_000, TimeRange(2_000_000, 1_000_000)) == 2_500_000
 assert reverse.source_us(250_000, TimeRange(2_000_000, 1_000_000)) == 2_499_999
 ```
 
-Also cover negative/zero ranges, a boundary between frame samples, adjacent seams, a same-track overlap, equal-z stable ordering, 0.5x/1x/2x, source clamping warnings, `visible:false`, disabled/muted tracks, and volume `1.5`.
+Also cover negative/zero ranges, a boundary between frame samples, adjacent seams, a same-track overlap, equal-z stable ordering, 0.5x/1x/2x, source clamping warnings, `visible:false`, disabled/muted tracks, and volume `1.5`. For 24/25/30/60 and `24000/1001`, `30000/1001`, `60000/1001`, test repeated quantization and frame/sample round-trips. At 30 FPS assert `[33_334, 33_335)` includes frame 1 and `[33_335, 66_667)` includes no sample; derive expected active IDs from canonical samples, not another quantization implementation.
 
 - [ ] **Step 2: Run the model test to verify it fails**
 
@@ -157,7 +171,7 @@ Reuse `media.resolve()`/`media.probe()`, `layout.layer_geometry()`, `paint.build
 
 - [ ] **Step 6: Add FrameDescriptor parity assertions**
 
-For fixture sample times, call existing `DraftView.frame(tid, sample_us)` and compare active clip IDs, track IDs, source times, and z order to `evaluate(DraftView.timeline_model(tid), sample_us)`. Do not compare at the unquantized request time.
+Keep `DraftView.frame()` and `model/timing.py` unchanged. Use valid, enabled, visible, unnested clips without transitions or source clamping for legacy parity: compare active clip IDs, track IDs, and z at the same canonical `sample_us`; compare source times only for forward 1x/2x, where old and new formulas agree. Reverse, fractional rates, disabled/muted tracks, transition handles, malformed placeholders, speed approximations, and qualified nested IDs use independent explicit expected values. Pin the known difference: for local `250_000`, source `[2_000_000, 3_000_000)`, reverse 2x, the legacy oracle returns `2_500_000`, while the new model must return `2_499_999`; at forward 0.5x/local `3`, require offset `1`, regardless of legacy rounding. Never weaken these assertions to match legacy output or feed FrameDescriptor into the model/compiler.
 
 - [ ] **Step 7: Run the test and commit**
 
@@ -179,7 +193,7 @@ git commit -m "feat: add deterministic timeline model"
 
 **Interfaces:**
 - Consumes: `TimelineModel`; no `TimelineContent`, raw JSON, `FrameDescriptor`, or HTTP values.
-- Produces: `BackendUnavailable(RuntimeError)` and frozen `RenderedFrame(frame_index: int, pts_us: int, width: int, height: int, rgba: bytes)`.
+- Produces: `BackendUnavailable(RuntimeError)` and frozen `RenderedFrame(playback_id: str, generation: int, seek_request_id: int, frame_index: int, pts_us: int, width: int, height: int, rgba: bytes)`. The controller stamps identity before enqueueing a produced frame; compiler-only tests can pull directly from the tractor without a transport envelope.
 - Produces: `CompiledTimeline(model: TimelineModel, profile: object, tractor: object, duration_frames: int, warnings: tuple[str, ...])` with `close() -> None`; MLT objects remain private to this module.
 - Produces: `MltCompiler().available() -> tuple[bool, str]` and `MltCompiler().compile(model: TimelineModel) -> CompiledTimeline`.
 
@@ -189,12 +203,14 @@ Construct a model with background plus three simultaneous visual clips, one same
 
 ```python
 compiled = MltCompiler().compile(model)
-assert compiled.duration_frames == model.frame_rate.quantize(model.duration_us - 1)[0] + 1
+assert compiled.duration_frames == model.frame_rate.frame_count(model.duration_us)
 assert compiled.tractor is not None
 assert "transition_handle_clamped" in compiled.warnings
 ```
 
 Pull frames at the overlap and transition positions from the compiled tractor and assert RGBA dimensions/position; pull mixed PCM and assert muted audio is absent while gain `1.5` is not clamped to `1.0`.
+
+Add two adjacent clips on logical track A with effective z=0 then z=2, plus a continuous clip on track B at z=1. Use solid colors with a shared opaque pixel and assert B wins before the seam and A wins after it. Cover equal-z ties and same-track overlaps separately, plus the canonical boundary/frame-count examples from Task 2; empty compiled timelines contain no valid frame and cannot pull one.
 
 - [ ] **Step 2: Run the compiler test to verify it fails**
 
@@ -204,7 +220,7 @@ Expected: FAIL with missing `jypreview.mlt_backend`.
 
 - [ ] **Step 3: Implement `MltCompiler.compile()`**
 
-Create one project `Profile`, background producer, per-track playlists, extra lanes only for real same-track overlaps, and a final `Tractor`. Convert target/source ranges to project/source frames only here; wrap changed-speed/reverse media with signed `timewarp`; use the gate-verified affine blend for position/scale/rotation/anchor/crop/flip/opacity/blend; reverse MLT priority at this boundary only.
+Create one project `Profile`, background producer, and a final `Tractor`. Initially give each visual clip its own lane, ordered by `(effective_render_index, original_track_index, original_segment_index)`; resolve effective z from clip, then track, then existing type defaults. This preserves cross-track z changes, stable ties, same-track overlaps, and transition handles while retaining logical IDs; defer lane reuse until profiling justifies it and the same pixel tests prove ordering. Audio playlists may follow logical tracks, with parallel lanes for actual overlaps. Convert target intervals with Task 2's boundary helpers; use source FPS/PTS for source frames. Wrap changed-speed/reverse media with signed `timewarp`; use the gate-verified affine blend for position/scale/rotation/anchor/crop/flip/opacity/blend; reverse MLT priority at this boundary only.
 
 - [ ] **Step 4: Add still, text, audio, transition, nesting, and placeholder compilation**
 
@@ -231,13 +247,16 @@ git commit -m "feat: compile timeline model to MLT"
 
 **Interfaces:**
 - Consumes: `TimelineModel`, `MltCompiler`, one verified MLT audio sink, and existing draft/timeline selectors.
-- Produces: `PlaybackController.open(model: TimelineModel) -> dict[str, Any]`, `play() -> dict[str, Any]`, `pause() -> dict[str, Any]`, `seek(t_us: int) -> dict[str, Any]`, `snapshot() -> dict[str, Any]`, `pull_frame(timeout_ms: int = 100) -> RenderedFrame | None`, and `close() -> None`.
-- Produces snapshot keys: `backend`, `phase`, `generation`, `frame_index`, `t_us`, `duration_us`, `playing`, `error`, and `open`; `t_us` is always the selected project frame's `sample_us` derived from the MLT/audio clock.
-- Preserves HTTP routes: `/api/backend/capabilities`, `open`, `render`, `play`, `pause`, `seek`, `stream`, `snapshot`, and `close`; response backend name becomes `mlt`.
+- Produces: `PlaybackController.open(model: TimelineModel) -> dict[str, Any]`, `play() -> dict[str, Any]`, `pause() -> dict[str, Any]`, `seek(t_us: int, *, playback_id: str, request_id: int) -> dict[str, Any]`, `snapshot() -> dict[str, Any]`, `pull_frame(timeout_ms: int = 100) -> RenderedFrame | None`, and `close() -> None`.
+- Produces snapshot keys: `backend`, `phase`, `playback_id`, `seek_request_id`, `generation`, `frame_index`, `t_us`, `duration_us`, `playing`, `error`, and `open`; `t_us` is always the selected project frame's canonical `sample_us` derived from the MLT/audio clock. Each open creates a fresh opaque `playback_id`; request IDs start at 1 and the initial accepted ID is 0.
+- Preserves HTTP route names: `/api/backend/capabilities`, `open`, `render`, `play`, `pause`, `seek`, `stream`, `snapshot`, and `close`; response backend name becomes `mlt`. Handle operations carry `playback_id`; `/seek` additionally requires positive integer `request_id` and integer `t_us`. `/render` retrieves the selected frame for the accepted `request_id` (0 is valid immediately after open) and does not issue another seek; mismatched identity returns a structured 409 instead of a PNG. End render returns an `ended` JSON response without a PNG.
+- Produces render/multipart headers: `X-Playback-ID`, `X-Playback-Generation`, `X-Seek-Request-ID`, `X-Project-Frame`, and `X-Project-PTS-US`, all copied from the immutable frame envelope. Never label an old frame using a current snapshot.
 
 - [ ] **Step 1: Write failing state, generation, and clock tests**
 
-Test `idle -> ready -> playing -> paused/seeking/buffering/ended/error`, seek quantization, seek-at-end without a frame pull, resume-after-seek, close/timeline-switch cleanup, and a consumer failure. Delay two render results and assert the older generation cannot overwrite the newer frame. Feed frame positions with a dropped video frame and assert snapshot time follows monotonic audio/project positions and never regresses.
+Test `idle -> ready -> playing -> paused/seeking/buffering/ended/error`, seek quantization, seek-at-end without a frame pull, resume-after-seek, close/timeline-switch cleanup, and a consumer failure. Submit client requests `(3, 30s)`, `(1, 10s)`, `(2, 20s)` in that arrival order: only ID 3 is accepted, later lower IDs do not seek or increment generation, and the final selected frame is the quantized 30s frame. Repeating ID 3 is idempotent; invalid/nonpositive IDs are rejected. Reopen the same timeline and reject commands/frames from its old `playback_id`.
+
+Delay a produced frame through encoding and transport, then accept a newer seek; assert its original playback ID/generation/request ID remain attached and the client discards it. Feed audio/project positions with dropped video frames and assert monotonic snapshot time within a generation; explicit backward seek starts a new generation and may lower project time.
 
 - [ ] **Step 2: Run the controller test to verify it fails**
 
@@ -247,15 +266,15 @@ Expected: FAIL because `PlaybackController` is absent.
 
 - [ ] **Step 3: Implement `PlaybackController` in `mlt_backend.py`**
 
-Compile once in `open()`, keep one consumer per timeline, make local MLT audio the master clock, derive frame/sample time through `FrameRate`, drop stale generation results, and release consumer/tractor resources on EOS, close, error, and timeline switch. Do not expose a global transport rate other than 1x.
+Compile once in `open()`, keep one consumer per timeline, make local MLT audio the master clock, and derive frame/sample time through `FrameRate`. On the serialized worker, reject wrong playback IDs and accept a seek only if its request ID exceeds the last accepted one; an older/equal seek returns the current snapshot without mutation. Increment generation only for an accepted seek, flush queued video, and stamp immutable frame identity before enqueueing it. Drop stale generation results and release consumer/tractor resources on EOS, close, error, and timeline switch. Do not expose a global transport rate other than 1x.
 
 - [ ] **Step 4: Replace GES/window-IR construction in `handlers_backend.py`**
 
-Rename `NativeHandle` to `PlaybackHandle`, retain its one-thread executor, and instantiate `PlaybackController`. `open_backend()` must call `view.timeline_model(tid)` directly; delete the full-duration `view.frame(...window=...)` call and `clips_from_frame_ir()`. Return quantized frame/PTS headers from render/stream and readable error payloads for initialization, plugin, consumer, and decode failures.
+Rename `NativeHandle` to `PlaybackHandle`, retain its one-thread executor, and instantiate `PlaybackController`. `open_backend()` must call `view.timeline_model(tid)` directly; delete the full-duration `view.frame(...window=...)` call and `clips_from_frame_ir()`. Validate integer request IDs and playback identity before dispatch; `/render` checks the accepted request/generation when retrieving the frame and returns 409 if a newer seek superseded it. Copy frame-envelope headers verbatim through PNG encoding/stream writes. Return readable error payloads for initialization, plugin, consumer, and decode failures.
 
 - [ ] **Step 5: Update app ownership and endpoint tests**
 
-Keep `app["native_backends"]` only if renaming it would touch unrelated code; otherwise rename it once to `playback_backends`. Ensure application shutdown closes every handle. Exercise open/render/play/pause/seek/snapshot/stream/close against the representative timeline and assert end seek returns `ended` without a PNG.
+Keep `app["native_backends"]` only if renaming it would touch unrelated code; otherwise rename it once to `playback_backends`. Ensure application shutdown closes every handle. Exercise open/render/play/pause/seek/snapshot/stream/close against the representative timeline, including request arrival order 3/1/2, an old playback ID after reopen, delayed encoding across seek, and end seek/render returning `ended` without a PNG. Validate playback identity before closing a handle so a late old client cannot close its replacement.
 
 - [ ] **Step 6: Run tests and commit**
 
@@ -284,14 +303,14 @@ git commit -m "feat: control MLT playback through backend API"
 - Modify: `scripts/jypreview/tools/test_playback_state.py:15-106`
 
 **Interfaces:**
-- Consumes: unchanged backend HTTP routes and snapshots from Task 4.
-- Produces in `backend.js`: `MltPlaybackClient.open(draft, timeline)`, `play()`, `pause()`, `seek(tUs)`, `snapshot()`, `startStream(onFrame)`, and `close()`; each multipart frame passed to `onFrame` contains `{blob, frameIndex, ptsUs, generation}`.
+- Consumes: backend route names and the playback/request/frame identity contract from Task 4.
+- Produces in `backend.js`: `MltPlaybackClient.open(draft, timeline)`, `play()`, `pause()`, `seek(tUs)`, `renderAt(tUs)`, `snapshot()`, `startStream(onFrame)`, and `close()`; each multipart frame passed to `onFrame` contains `{blob, playbackId, seekRequestId, generation, frameIndex, ptsUs}`. `renderAt(tUs)` performs an ordered seek then retrieves `/render` using that same request ID, without another seek.
 - Produces: UI play/pause/seek state derived only from backend snapshots; point `/api/frame` remains diagnostic and never advances playback.
-- Produces: `window.__state()` and `window.__snapshot()` with `backend: "mlt"`, quantized `frameIndex`, `tUs`, state, warning/error, and displayed video-frame PTS.
+- Produces: `window.__state()` and `window.__snapshot()` with `backend: "mlt"`, `playbackId`, `seekRequestId`, `generation`, quantized `frameIndex`, `tUs`, state, warning/error, and displayed video-frame PTS. Displayed PTS is a UI diagnostic, not proof of hardware presentation timing.
 
 - [ ] **Step 1: Rewrite the JavaScript client and browser acceptance tests first**
 
-In `test_playback_kernel.mjs`, feed a synthetic multipart stream with `X-Project-Frame`, `X-Project-PTS-US`, and generation headers; assert parsing preserves them, an old generation is dropped, and `close()` aborts the reader. In `test_playback_state.py`, open the normal URL without `?backend=browser`; assert backend is `mlt`, exact seek reports the requested quantized frame/PTS, rapid 10s/20s/30s seeks settle on the last generation, play timestamps are monotonic, pause freezes the frame, end seek becomes `ended`, and backend failure does not activate DOM media playback.
+In `test_playback_kernel.mjs`, feed a synthetic multipart stream with all Task 4 identity/frame headers; assert parsing preserves them, old playback IDs/generations are dropped, and `close()` aborts the reader. Delay HTTP request dispatch to deliver IDs 3/1/2, reorder their responses, and finish an old image decode after a newer seek: only the last issued intent may update state or display. In `test_playback_state.py`, open the normal URL without `?backend=browser`; assert backend is `mlt`, exact seek reports the requested canonical frame/PTS, rapid 10s/20s/30s seeks settle on the last issued request, playback timestamps are monotonic within a generation, pause freezes the frame, end seek becomes `ended`, and backend failure does not activate DOM media playback. Reopen the same timeline and assert old identity cannot update the new selection.
 
 - [ ] **Step 2: Run it to verify the old path fails the new contract**
 
@@ -306,7 +325,7 @@ Expected: FAIL because `MltPlaybackClient` is absent and state still reports `gs
 
 - [ ] **Step 3: Replace `BrowserPlaybackBackend` with `MltPlaybackClient`**
 
-Reuse `backend.js` as the transport seam. Call the existing endpoints, parse `multipart/x-mixed-replace` incrementally with `ReadableStream`, keep at most two decoded frames, expose part PTS/project-frame headers, and abort/clear the stream on seek, timeline switch, error, or close. Add no transport dependency.
+Reuse `backend.js` as the transport seam. Allocate a monotonic request ID at the moment each seek is issued, before awaiting/dispatching HTTP; send it with the current playback ID. Reject responses whose accepted request ID predates the latest issued intent. Use a local selection epoch to ignore late open/close responses after a timeline switch. Parse `multipart/x-mixed-replace` incrementally with `ReadableStream`, keep at most two decoded frames, preserve the immutable identity headers, and abort/clear the stream immediately on seek, timeline switch, error, or close. Add no transport dependency.
 
 - [ ] **Step 4: Remove browser clock/window scheduling from `app.js`**
 
@@ -314,7 +333,7 @@ Remove `PlaybackController`, `BrowserPlaybackBackend`, `FrameStore`, `AudioSched
 
 - [ ] **Step 5: Make backend state authoritative**
 
-Open MLT on timeline selection; render/seek through the client; play its multipart stream; poll snapshots only for state/playhead; compare each parsed frame PTS to the audio-derived snapshot clock and drop expired frames before swapping the image URL. Never write timeline time from decoder PTS or HTTP arrival time. On backend failure, enter `error` with the server message and do not silently activate the old scheduler.
+Open MLT on timeline selection; render/seek through the client; play its multipart stream; poll snapshots only for state/playhead. Resume streaming only after the latest seek acknowledgment establishes the expected generation. Check playback/request/generation identity both before image decode and before swapping the image URL; compare PTS to the audio-derived snapshot clock and drop expired frames. Never write timeline time from decoder PTS or HTTP arrival time. On backend failure, enter `error` with the server message and do not silently activate the old scheduler.
 
 - [ ] **Step 6: Run browser acceptance and commit**
 
@@ -341,12 +360,17 @@ git commit -m "feat: switch preview UI to MLT clock"
 - Create: `docs/native-backend-evaluation/2026-10-01-mlt-acceptance.md`
 
 **Interfaces:**
-- Consumes: the existing 64-second/105-clip sample, representative trim/reverse/transition/text/image/audio drafts, Jianying-export reference frames, and `mtime_snapshot()` from `cli/selfcheck.py`.
-- Produces: executable acceptance result plus `temp/mlt-benchmark.json`; records cold-open latency, seek samples, sustained output FPS, dropped frames, monotonicity failures, and maximum A/V delta in project frames without inventing a fixed throughput threshold.
+- Consumes: the existing 64-second/105-clip sample, representative trim/reverse/transition/text/image/audio drafts, Jianying-export reference frames, `mtime_snapshot()` from `cli/selfcheck.py`, and measured `temp/mlt-av-evidence.json` from the synchronized capture below.
+- Produces: `python -m jypreview.tools.test_mlt_acceptance --av-evidence temp/mlt-av-evidence.json`; missing, inconclusive, or failed capture evidence returns nonzero. Emit acceptance evidence under `temp/` and benchmark samples in `temp/mlt-benchmark.json`.
+- Records separately `max_internal_av_delta_frames` (graph PCM/video PTS) and `max_presented_av_delta_frames` (captured audio output versus displayed browser pixels, including measurement uncertainty). Also record cold-open latency, seek samples, sustained output FPS, dropped frames, and monotonicity failures without inventing a fixed throughput threshold.
 
 - [ ] **Step 1: Write the acceptance script**
 
-Assert repeated and shuffled `evaluate()` calls are identical; FrameDescriptor parity uses the same `sample_us`; three-layer geometry covers order, z, opacity, position, scale, rotation, crop, and canvas ratio; still/text/sticker/fade/crossfade intervals match; missing transition handles clamp and warn; mixed audio trim/offset/mute/gain match video; A/V delta is at most one project frame even when video frames are deliberately dropped.
+Assert repeated and shuffled `evaluate()` calls are identical; FrameDescriptor parity stays within Task 2's explicit compatible subset; three-layer geometry covers order, z, opacity, position, scale, rotation, crop, and canvas ratio, including Task 3's adjacent z=0/z=2 clips across a continuous z=1 clip. Assert still/text/sticker/fade/crossfade intervals and canonical frame counts, missing-handle warnings/clamping, mixed audio trim/offset/mute/gain, and internal A/V PTS agreement. Keep internal PTS results distinct from end-to-end capture results.
+
+Build a 30-second calibration timeline at project FPS with identifiable numbered visual markers and corresponding audio pulses at `frame_rate.first_frame_at_or_after(k * 1_000_000)` for every integer `k` from 1 through 29. Run it through the normal browser URL and local MLT audio sink. Capture the displayed browser pixels and actual audio output on one capture clock, using synchronized screen/audio-output recording with measured capture latency/skew, or an external recording of the screen and audible output. Internal consumer callbacks, `image.onload`, DOM-reported PTS, and HTTP arrival timestamps are not substitutes for this capture. Record device, capture method, runtime, URL, project FPS, frame/drop schedule, latency calibration, and measurement uncertainty; retain raw capture under `temp/`.
+
+Create `temp/mlt-av-evidence.json` with `frame_rate`, `runtime`, `capture_method`, `raw_capture`, `uncertainty_us`, and `runs`. Each run records `mode` (`normal` or `dropped_video`), `duration_us`, observed `dropped_frames`, and paired `events` with `project_frame`, `video_capture_us`, and `audio_capture_us` on that common clock after documented capture-skew correction. Both modes run at least 30 seconds and include exactly the 29 expected marker/pulse pairs; the dropped mode must record actual drops, including near markers. A missing marker/pulse is a failure, not an omitted sample. Require nonnegative uncertainty no greater than one quarter of a project frame and, for every pair, `(abs(video_capture_us - audio_capture_us) + uncertainty_us) * num <= 1_000_000 * den`. Missing capture/calibration or insufficient precision is `unverified` and fails the cutover gate. Record UI diagnostics separately to prove monotonicity within generations; do not use them to synthesize capture observations.
 
 - [ ] **Step 2: Add the non-mutation check**
 
@@ -354,7 +378,7 @@ Snapshot source draft/`Timelines/` metadata before open/seek/play/close and comp
 
 - [ ] **Step 3: Add the benchmark runner**
 
-Measure cold open, random seeks, 30 seconds of continuous output, output FPS, and drops on the 64-second/105-clip sample. Emit hardware/runtime/plugin provenance alongside raw samples; report observed values only.
+Measure cold open, random seeks, 30 seconds of continuous output, output FPS, drops, and internal A/V PTS on the 64-second/105-clip sample. Emit hardware/runtime/plugin provenance alongside raw samples; report observed values only. These measurements cannot replace the browser/captured-audio acceptance above.
 
 - [ ] **Step 4: Run the full acceptance set**
 
@@ -365,12 +389,13 @@ $env:PYTHONPATH='scripts'
 py -3.14 -m jypreview.tools.test_timeline_model
 & $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_mlt_compiler
 & $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_mlt_controller
-& $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_mlt_acceptance
+& $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_mlt_acceptance --av-evidence temp/mlt-av-evidence.json
 & $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.benchmark_mlt --json temp/mlt-benchmark.json
+& $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_playback_state
 node scripts/jypreview/tools/test_playback_kernel.mjs
 ```
 
-Expected: all tests PASS; benchmark completes with zero timestamp regressions, `max_av_delta_frames <= 1`, and recorded—not predeclared—performance values.
+Expected: all tests PASS, including the normal-URL browser check and both capture modes; zero within-generation timestamp regressions, `max_internal_av_delta_frames <= 1`, and `max_presented_av_delta_frames <= 1` with uncertainty included. Benchmark records observed performance values. Graph tests passing while capture is missing/unverified is not acceptance success.
 
 - [ ] **Step 5: Compare representative MLT frames with Jianying exports**
 
@@ -378,7 +403,7 @@ Reuse the existing calibration/image comparison helpers to capture identical pro
 
 - [ ] **Step 6: Apply the cutover gate**
 
-Proceed to Task 7 only if model/composition/continuous A/V/read-only checks pass. If local audio plus multipart video cannot stay within one project frame in the target UI, stop and write a follow-up design for one timestamped browser A/V channel; do not delete the old code yet.
+Proceed to Task 7 only if model/composition/normal-URL browser/read-only checks pass and the synchronized capture proves local audio plus displayed video stay within one project frame in both normal and dropped-video runs. Missing, unverified, or inconclusive capture blocks deletion; record the missing evidence. If measured playback fails, stop and write a follow-up design for one timestamped browser A/V channel. Keep the old files until this gate passes; recapture if playback code, native runtime, or output device changes.
 
 - [ ] **Step 7: Commit acceptance code and report separately**
 
@@ -419,10 +444,11 @@ Delete the GES adapter/probes and browser backend/clock/window/audio modules lis
 Run:
 
 ```powershell
-rg -n "GstGesBackend|clips_from_frame_ir|gstreamer-ges|window_us|BrowserPlaybackBackend|PlaybackController|FrameStore|AudioScheduler" scripts
+rg -n "GstGesBackend|clips_from_frame_ir|gstreamer-ges|BrowserPlaybackBackend|FrameStore|AudioScheduler" scripts
+rg -n "window_us|loadWindowAt|prefetchWindow|advanceTimeline|MediaScheduler|new PlaybackController" scripts/jypreview/web/app.js scripts/jypreview/web/backend.js scripts/jypreview/web/render.js
 ```
 
-Expected: no matches except an intentional historical comment; remove that comment if it describes current behavior.
+Expected: both searches have no matches (`rg` exit 1 means success for this absence check; exit 2 is a search failure). The second search is restricted to current UI playback files. Python `mlt_backend.PlaybackController` and `/api/frame`'s diagnostic `window_us` support remain valid; do not include them in a repository-wide zero-match requirement. Historical evaluation documents remain untouched.
 
 - [ ] **Step 4: Run the final regression set**
 
@@ -434,12 +460,12 @@ py -3.14 scripts/preview.py selfcheck
 py -3.14 -m jypreview.tools.test_timeline_model
 & $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_mlt_compiler
 & $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_mlt_controller
-& $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_mlt_acceptance
+& $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_mlt_acceptance --av-evidence temp/mlt-av-evidence.json
 & $env:JY_PREVIEW_MLT_PYTHON -m jypreview.tools.test_playback_state
 node scripts/jypreview/tools/test_playback_kernel.mjs
 ```
 
-Expected: all PASS, source-draft mutation count is zero, and UI state reports only `mlt`.
+Expected: all PASS, including capture-evidence validation, source-draft mutation count is zero, and UI state reports only `mlt`. Reuse Task 6 capture only if playback behavior/runtime/output device did not change during cleanup; otherwise recapture before marking cutover passed.
 
 - [ ] **Step 5: Update acceptance status and commit code/docs separately**
 
