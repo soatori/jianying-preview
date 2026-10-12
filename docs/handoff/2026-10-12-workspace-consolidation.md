@@ -2,7 +2,7 @@
 
 ## 1. 本轮已落地
 
-- `main` 已从 `83db567` 快进并推送至 `d542d0886ee7c44cc4e77fdaee4b2f9ed38d056a`。
+- `main` 已从 `83db567` 快进并推送；本报告提交前的远端点为 `d542d0886ee7c44cc4e77fdaee4b2f9ed38d056a`，报告提交后的最终 `refs/heads/main` 以 `git ls-remote` 为准。
 - `release` 的 42 个历史提交，加上本轮 `.gitignore`、播放计划/规格修正和 EOF 整理，已合并到 `main`。
 - `origin` 新增两个可继续执行的工作分支：
   - `codex/dll-native-preview` → `0ba421761fb38078c731a8bfe7fb9fbfe350330c`
