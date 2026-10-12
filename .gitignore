@@ -3,6 +3,7 @@ assets/generated/
 
 # Local scratch: throwaway probes and pre-refactor snapshots.
 temp/
+test/
 
 # Python.
 __pycache__/
@@ -19,3 +20,8 @@ node_modules/
 
 # Tool state that is not part of the skill.
 .workbuddy/
+.codegraph/
+.pi/
+nul
+scripts/jypreview/native/bin/
+scripts/jypreview/native/obj/
