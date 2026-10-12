@@ -1,10 +1,10 @@
 // preview_host.cpp — isolated Jianying DLL preview host (IPC v1).
 //
 // Loads the version-locked videoeditor.dll from the installed JianyingPro
-// directory only after verifying version + SHA-256, and serves two render
-// paths over a length-prefixed JSON protocol (RGBA bytes follow the metadata):
-//   * playerwin          — Server/Session/VeWrapper/PlayerWin timeline frames
-//   * frame-reader-compositor — lvve::FrameReaderWin source frames
+// directory only after verifying version + SHA-256. It fails PlayerWin closed
+// until its private configuration, project-open, and frame-output contracts
+// are evidenced; FrameReader source frames use the length-prefixed JSON
+// protocol (RGBA bytes follow the metadata).
 // Failure modes are explicit {code,message,detail}; there is no silent
 // fallback to any other renderer, and no JianyingPro UI is ever started.
 #define WIN32_LEAN_AND_MEAN
@@ -81,95 +81,314 @@ void append_utf8(uint32_t cp, std::string* out) {
   }
 }
 
-// Finds `"key"` at any nesting depth and returns the scalar that follows.
-// Strings are returned unquoted with \" \\ \n \r \t and \uXXXX decoded.
-bool find_scalar(const std::string& json, const std::string& key, std::string* out) {
-  const std::string needle = "\"" + key + "\"";
-  size_t pos = 0;
-  while ((pos = json.find(needle, pos)) != std::string::npos) {
-    size_t i = pos + needle.size();
-    while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n' || json[i] == '\r')) ++i;
-    if (i < json.size() && json[i] == ':') {
-      ++i;
-      while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n' || json[i] == '\r')) ++i;
-      if (i >= json.size()) return false;
-      if (json[i] == '"') {
-        std::string value;
-        ++i;
-        while (i < json.size() && json[i] != '"') {
-          if (json[i] == '\\' && i + 1 < json.size()) {
-            char n = json[i + 1];
-            if (n == 'u') {
-              size_t j = i + 2;
-              uint32_t cp = 0;
-              int digits = 0;
-              for (; digits < 4 && j < json.size(); ++digits, ++j) {
-                char h = json[j];
-                int d;
-                if (h >= '0' && h <= '9') d = h - '0';
-                else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
-                else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
-                else break;
-                cp = cp * 16 + static_cast<uint32_t>(d);
-              }
-              if (digits == 4) {
-                if (cp >= 0xD800 && cp <= 0xDBFF && j + 6 <= json.size() && json[j] == '\\' &&
-                    json[j + 1] == 'u') {
-                  size_t k = j + 2;
-                  uint32_t lo = 0;
-                  int low_digits = 0;
-                  for (; low_digits < 4 && k < json.size(); ++low_digits, ++k) {
-                    char h = json[k];
-                    int d;
-                    if (h >= '0' && h <= '9') d = h - '0';
-                    else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
-                    else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
-                    else break;
-                    lo = lo * 16 + static_cast<uint32_t>(d);
-                  }
-                  if (low_digits == 4 && lo >= 0xDC00 && lo <= 0xDFFF) {
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                    j = k;
-                  }
-                }
-                append_utf8(cp, &value);
-                i = j;
-                continue;
-              }
-            }
-            if (n == 'n') value += '\n';
-            else if (n == 'r') value += '\r';
-            else if (n == 't') value += '\t';
-            else value += n;
-            i += 2;
-          } else {
-            value += json[i++];
-          }
+// Reads one JSON string literal. `*i` must point at the opening quote and is
+// advanced past the closing quote. Only RFC 8259 escapes are accepted
+// (\" \\ \/ \b \f \n \r \t \uXXXX with a valid surrogate pair), raw control
+// characters are rejected, and the input must end with the closing quote.
+bool read_json_string(const std::string& json, size_t* i, std::string* out) {
+  if (*i >= json.size() || json[*i] != '"') return false;
+  size_t k = *i + 1;
+  out->clear();
+  while (k < json.size() && json[k] != '"') {
+    if (static_cast<unsigned char>(json[k]) < 0x20) return false;  // raw control char
+    if (json[k] == '\\') {
+      if (k + 1 >= json.size()) return false;
+      char n = json[k + 1];
+      if (n == 'u') {
+        size_t j = k + 2;
+        uint32_t cp = 0;
+        int digits = 0;
+        for (; digits < 4; ++digits, ++j) {
+          if (j >= json.size()) return false;
+          char h = json[j];
+          int d;
+          if (h >= '0' && h <= '9') d = h - '0';
+          else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+          else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+          else return false;  // \u must be followed by exactly four hex digits
+          cp = cp * 16 + static_cast<uint32_t>(d);
         }
-        *out = value;
-        return true;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+          // High surrogate: a matching low surrogate must follow.
+          if (j + 6 > json.size() || json[j] != '\\' || json[j + 1] != 'u') return false;
+          size_t lo_i = j + 2;
+          uint32_t lo = 0;
+          int low_digits = 0;
+          for (; low_digits < 4; ++low_digits, ++lo_i) {
+            if (lo_i >= json.size()) return false;
+            char h = json[lo_i];
+            int d;
+            if (h >= '0' && h <= '9') d = h - '0';
+            else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
+            else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
+            else return false;
+            lo = lo * 16 + static_cast<uint32_t>(d);
+          }
+          if (lo < 0xDC00 || lo > 0xDFFF) return false;
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          j = lo_i;
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+          return false;  // lone low surrogate
+        }
+        append_utf8(cp, out);
+        k = j;
+        continue;
       }
-      size_t start = i;
-      while (i < json.size() && json[i] != ',' && json[i] != '}' && json[i] != ']' && json[i] != ' ') ++i;
-      *out = json.substr(start, i - start);
+      if (n == '"') *out += '"';
+      else if (n == '\\') *out += '\\';
+      else if (n == '/') *out += '/';
+      else if (n == 'b') *out += '\b';
+      else if (n == 'f') *out += '\f';
+      else if (n == 'n') *out += '\n';
+      else if (n == 'r') *out += '\r';
+      else if (n == 't') *out += '\t';
+      else return false;  // invalid escape sequence (e.g. \x, \q)
+      k += 2;
+    } else {
+      *out += json[k++];
+    }
+  }
+  if (k >= json.size()) return false;  // unterminated string literal
+  *i = k + 1;
+  return true;
+}
+
+// find_scalar/find_string/find_int were removed on review: a depth-blind
+// search is exactly the confusion this host must not have. Envelope fields use
+// scan_object_level(); payload fields use payload_string()/payload_int().
+
+// --------------------------------------------------------------------------
+// Scoped JSON readers
+//
+// The IPC envelope (protocol_version / request_id / generation / op) is read
+// with scan_object_level(), which walks exactly one object level and never
+// descends, so a key that only exists inside `payload` can never drive the
+// host. Payload fields use payload_string()/payload_int(), which read the
+// payload object at its own top level — never the whole request.
+// --------------------------------------------------------------------------
+
+struct JsonField {
+  std::string key;
+  std::string value;  // decoded for strings, raw token otherwise
+  std::string raw;    // raw token (quoted for strings)
+  std::string span;   // raw span for object/array values
+  bool is_string = false;
+  bool scalar = false;
+};
+
+// Strict JSON number (RFC 8259): -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?
+// No leading '+', no leading zeros, no bare '.', no trailing '.'.
+bool is_json_number(const std::string& text) {
+  size_t i = 0;
+  if (i < text.size() && text[i] == '-') ++i;
+  if (i >= text.size() || text[i] < '0' || text[i] > '9') return false;
+  if (text[i] == '0') {
+    ++i;
+  } else {
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') ++i;
+  }
+  if (i < text.size() && text[i] == '.') {
+    ++i;
+    if (i >= text.size() || text[i] < '0' || text[i] > '9') return false;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') ++i;
+  }
+  if (i < text.size() && (text[i] == 'e' || text[i] == 'E')) {
+    ++i;
+    if (i < text.size() && (text[i] == '+' || text[i] == '-')) ++i;
+    if (i >= text.size() || text[i] < '0' || text[i] > '9') return false;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') ++i;
+  }
+  return i == text.size();
+}
+
+// A primitive JSON value: number, true, false or null — nothing else. Tokens
+// such as `not_json`, `NaN`, `Infinity` or `0x10` are rejected.
+bool is_json_literal(const std::string& text) {
+  return text == "true" || text == "false" || text == "null" || is_json_number(text);
+}
+
+// Parses and validates one complete JSON value starting at json[i] (skipping
+// leading whitespace). On success *i is advanced past the value.
+//
+// Unlike a bracket counter this validates the *contents*: nested objects and
+// arrays are walked recursively, so `"payload":{"a":not_json}` is rejected
+// even though its braces balance.
+bool parse_value_strict(const std::string& json, size_t* i) {
+  auto ws = [&]() {
+    while (*i < json.size() && std::isspace(static_cast<unsigned char>(json[*i]))) ++(*i);
+  };
+  ws();
+  if (*i >= json.size()) return false;
+  const char c = json[*i];
+  if (c == '{') {
+    ++(*i);
+    ws();
+    if (*i < json.size() && json[*i] == '}') {
+      ++(*i);
       return true;
     }
-    pos = pos + needle.size();
+    for (;;) {
+      ws();
+      if (*i >= json.size() || json[*i] != '"') return false;
+      std::string key;
+      if (!read_json_string(json, i, &key)) return false;
+      ws();
+      if (*i >= json.size() || json[*i] != ':') return false;
+      ++(*i);
+      if (!parse_value_strict(json, i)) return false;
+      ws();
+      if (*i >= json.size()) return false;
+      if (json[*i] == ',') {
+        ++(*i);
+        continue;
+      }
+      if (json[*i] == '}') {
+        ++(*i);
+        return true;
+      }
+      return false;
+    }
   }
-  return false;
+  if (c == '[') {
+    ++(*i);
+    ws();
+    if (*i < json.size() && json[*i] == ']') {
+      ++(*i);
+      return true;
+    }
+    for (;;) {
+      if (!parse_value_strict(json, i)) return false;
+      ws();
+      if (*i >= json.size()) return false;
+      if (json[*i] == ',') {
+        ++(*i);
+        continue;
+      }
+      if (json[*i] == ']') {
+        ++(*i);
+        return true;
+      }
+      return false;
+    }
+  }
+  if (c == '"') {
+    std::string text;
+    return read_json_string(json, i, &text);
+  }
+  const size_t start = *i;
+  while (*i < json.size() && json[*i] != ',' && json[*i] != '}' && json[*i] != ']' &&
+         !std::isspace(static_cast<unsigned char>(json[*i])))
+    ++(*i);
+  if (*i == start) return false;
+  return is_json_literal(json.substr(start, *i - start));
 }
 
-std::string find_string(const std::string& json, const std::string& key, const std::string& fallback = "") {
-  std::string v;
-  return find_scalar(json, key, &v) ? v : fallback;
+// Scans exactly one JSON object level (nested values are not extracted, but
+// their *contents* are validated by parse_value_strict — a balanced document
+// with invalid JSON inside is still rejected). Returns false on malformed input.
+bool scan_object_level(const std::string& json, std::vector<JsonField>* out) {
+  size_t i = 0;
+  auto ws = [&]() {
+    while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i]))) ++i;
+  };
+  ws();
+  if (i >= json.size() || json[i] != '{') return false;
+  ++i;
+  ws();
+  if (i < json.size() && json[i] == '}') {
+    ++i;
+    ws();
+    return i == json.size();
+  }
+  for (;;) {
+    ws();
+    if (i >= json.size() || json[i] != '"') return false;
+    JsonField field;
+    if (!read_json_string(json, &i, &field.key)) return false;
+    ws();
+    if (i >= json.size() || json[i] != ':') return false;
+    ++i;
+    ws();
+    if (i >= json.size()) return false;
+    const size_t vstart = i;
+    if (json[i] == '"') {
+      if (!read_json_string(json, &i, &field.value)) return false;
+      field.raw = json.substr(vstart, i - vstart);
+      field.is_string = true;
+      field.scalar = true;
+    } else if (json[i] == '{' || json[i] == '[') {
+      size_t vend = i;
+      if (!parse_value_strict(json, &vend)) return false;
+      field.span = json.substr(vstart, vend - vstart);
+      i = vend;
+      field.scalar = false;
+    } else {
+      size_t j = i;
+      while (j < json.size() && json[j] != ',' && json[j] != '}' && json[j] != ']' &&
+             !std::isspace(static_cast<unsigned char>(json[j])))
+        ++j;
+      if (j == i) return false;
+      field.raw = field.value = json.substr(i, j - i);
+      if (!is_json_literal(field.value)) return false;  // reject not_json / NaN / 0x10
+      field.scalar = true;
+      i = j;
+    }
+    out->push_back(field);
+    ws();
+    if (i >= json.size()) return false;
+    if (json[i] == ',') {
+      ++i;
+      continue;
+    }
+    if (json[i] == '}') {
+      ++i;
+      break;
+    }
+    return false;
+  }
+  ws();
+  return i == json.size();
 }
 
-long long find_int(const std::string& json, const std::string& key, long long fallback = -1) {
-  std::string v;
-  if (!find_scalar(json, key, &v)) return fallback;
+// First occurrence of `key` at the scanned level plus its occurrence count.
+const JsonField* find_field(const std::vector<JsonField>& fields, const std::string& key, int* count) {
+  const JsonField* first = nullptr;
+  *count = 0;
+  for (const JsonField& field : fields) {
+    if (field.key == key) {
+      if (!first) first = &field;
+      ++*count;
+    }
+  }
+  return first;
+}
+
+bool parse_ll(const std::string& text, long long* out) {
+  if (text.empty()) return false;
   char* end = nullptr;
-  long long n = std::strtoll(v.c_str(), &end, 10);
-  return end && *end == 0 ? n : fallback;
+  const long long value = std::strtoll(text.c_str(), &end, 10);
+  if (!end || *end != 0) return false;
+  *out = value;
+  return true;
+}
+
+// Payload lookups: the payload object's own top level only, so a same-named
+// envelope key or a deeper nested key can never be picked up by mistake.
+// `count` reports how often the key occurred, so callers can reject duplicates
+// on consumed fields instead of silently taking the first match.
+std::string payload_string(const std::vector<JsonField>& payload, const std::string& key,
+                           const std::string& fallback, int* count) {
+  const JsonField* field = find_field(payload, key, count);
+  if (!field || !field->is_string) return fallback;
+  return field->value;
+}
+
+long long payload_int(const std::vector<JsonField>& payload, const std::string& key,
+                      long long fallback, int* count) {
+  const JsonField* field = find_field(payload, key, count);
+  if (!field) return fallback;
+  long long value = 0;
+  return parse_ll(field->value, &value) ? value : fallback;
 }
 
 // --------------------------------------------------------------------------
@@ -222,40 +441,130 @@ struct ErrorSpec {
   std::string detail;
 };
 
-// Returns the raw JSON scalar token (quoted string or number/bool/null) for a
-// key so request_id round-trips with the caller's original type.
-bool find_raw_token(const std::string& json, const std::string& key, std::string* out) {
-  const std::string needle = "\"" + key + "\"";
-  size_t pos = 0;
-  while ((pos = json.find(needle, pos)) != std::string::npos) {
-    size_t i = pos + needle.size();
-    while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n' || json[i] == '\r')) ++i;
-    if (i < json.size() && json[i] == ':') {
-      ++i;
-      while (i < json.size() && (json[i] == ' ' || json[i] == '\t' || json[i] == '\n' || json[i] == '\r')) ++i;
-      size_t start = i;
-      if (i < json.size() && json[i] == '"') {
-        ++i;
-        while (i < json.size() && json[i] != '"') {
-          if (json[i] == '\\') ++i;
-          ++i;
-        }
-        if (i < json.size()) ++i;
-      } else {
-        while (i < json.size() && json[i] != ',' && json[i] != '}' && json[i] != ']' && json[i] != ' ' &&
-               json[i] != '\n' && json[i] != '\r' && json[i] != '\t')
-          ++i;
-      }
-      *out = json.substr(start, i - start);
-      return !out->empty();
-    }
-    pos = pos + needle.size();
+constexpr long long kProtocolVersion = 1;
+
+// IPC envelope: read from the top level only, every field exactly once.
+struct Envelope {
+  bool ok = false;
+  std::string request_id = "0";  // raw JSON token, echoed verbatim
+  long long generation = 0;
+  std::string op;
+  std::string payload;  // raw payload object span ("" when absent)
+  bool has_payload = false;
+  ErrorSpec error;
+};
+
+// Validates the envelope before any op runs. Nested copies of envelope keys
+// inside `payload` are ignored by construction (scan_object_level never
+// descends), so payload {"op":"close"} can never close a ping, and a missing
+// or duplicated envelope field is rejected instead of silently resolved.
+Envelope parse_envelope(const std::string& raw) {
+  Envelope env;
+  std::vector<JsonField> top;
+  if (!scan_object_level(raw, &top)) {
+    env.error = {"bad_request", "request must be one well-formed top-level JSON object",
+                 "malformed_request"};
+    return env;
   }
-  return false;
+
+  int count = 0;
+  // request_id is read first so later rejections can still echo the caller's
+  // id — the Python client checks request_id before the error code.
+  const JsonField* request_id = find_field(top, "request_id", &count);
+  if (count == 0) {
+    env.error = {"bad_request", "missing envelope field: request_id", "request_id"};
+    return env;
+  }
+  if (count > 1) {
+    env.error = {"bad_request", "duplicate envelope field: request_id", "request_id"};
+    return env;
+  }
+  if (request_id->is_string) {
+    env.request_id = "\"" + json_escape(request_id->value) + "\"";
+  } else if (request_id->value == "true" || request_id->value == "false" ||
+             request_id->value == "null" || is_json_number(request_id->value)) {
+    env.request_id = request_id->value;
+  } else {
+    env.error = {"bad_request", "invalid envelope field: request_id must be a string or number",
+                 "request_id"};
+    return env;
+  }
+
+  count = 0;
+  const JsonField* proto = find_field(top, "protocol_version", &count);
+  if (count == 0) {
+    env.error = {"unsupported_protocol_version", "protocol_version is missing",
+                 "protocol_version=-1 supported=" + std::to_string(kProtocolVersion)};
+    return env;
+  }
+  if (count > 1) {
+    env.error = {"bad_request", "duplicate envelope field: protocol_version", "protocol_version"};
+    return env;
+  }
+  long long version = -1;
+  const std::string proto_raw = proto->raw.empty() ? std::string("<non-scalar>") : proto->raw;
+  if (proto->is_string || !parse_ll(proto->value, &version) || version != kProtocolVersion) {
+    env.error = {"unsupported_protocol_version", "unsupported protocol_version",
+                 "protocol_version=" + proto_raw + " supported=" + std::to_string(kProtocolVersion)};
+    return env;
+  }
+
+  count = 0;
+  const JsonField* generation = find_field(top, "generation", &count);
+  if (count == 0) {
+    env.error = {"bad_request", "missing envelope field: generation", "generation"};
+    return env;
+  }
+  if (count > 1) {
+    env.error = {"bad_request", "duplicate envelope field: generation", "generation"};
+    return env;
+  }
+  if (generation->is_string || !parse_ll(generation->value, &env.generation)) {
+    env.error = {"bad_request", "invalid envelope field: generation must be an integer", "generation"};
+    return env;
+  }
+
+  count = 0;
+  const JsonField* op = find_field(top, "op", &count);
+  if (count == 0) {
+    env.error = {"bad_request", "missing envelope field: op", "op"};
+    return env;
+  }
+  if (count > 1) {
+    env.error = {"bad_request", "duplicate envelope field: op", "op"};
+    return env;
+  }
+  if (!op->is_string) {
+    env.error = {"bad_request", "invalid envelope field: op must be a string", "op"};
+    return env;
+  }
+  env.op = op->value;
+
+  count = 0;
+  const JsonField* payload = find_field(top, "payload", &count);
+  if (count > 1) {
+    env.error = {"bad_request", "duplicate envelope field: payload", "payload"};
+    return env;
+  }
+  if (count == 1) {
+    if (payload->scalar) {
+      env.error = {"bad_request", "invalid envelope field: payload must be a JSON object", "payload"};
+      return env;
+    }
+    env.payload = payload->span;
+    env.has_payload = true;
+  }
+  env.ok = true;
+  return env;
 }
+// Set by the close op: the response is flushed, then the main loop stops and
+// the short-lived host exits normally — private DLL destructors are never
+// invoked.
+bool g_close_and_exit = false;
 
 std::string make_meta(const std::string& request_id_token, long long generation, const std::string& op, bool ok) {
-  std::string meta = "{\"protocol_version\":1,\"request_id\":" + request_id_token +
+  std::string meta = "{\"protocol_version\":" + std::to_string(kProtocolVersion) +
+                     ",\"request_id\":" + request_id_token +
                      ",\"generation\":" + std::to_string(generation) + ",\"op\":\"" + json_escape(op) +
                      "\",\"ok\":" + (ok ? "true" : "false");
   return meta;
@@ -374,11 +683,6 @@ struct HostState {
   long long target_pts = -1;
   double source_fps = 0.0;
   std::string source_path;
-
-  // playerwin path state
-  void* player = nullptr;
-  std::string player_failure_step;
-  std::string player_failure_detail;
 };
 
 HostState g_state;
@@ -498,6 +802,7 @@ void capture_frame(const void* a1) {
   long long fd = *reinterpret_cast<const long long*>(b + 0x30);
   if (!readable_ptr(pixels) || width == 0 || height == 0 || width > 8192 || height > 8192) return;
   if (bytes != width * height * 4) return;
+  if (pts < 0) return;  // negative/invalid PTS: never record (stale-frame guard)
   g_state.last_pts = pts;
   long long dist = pts - (g_state.target_pts >= 0 ? g_state.target_pts : 0);
   long long ad = dist < 0 ? -dist : dist;
@@ -642,9 +947,9 @@ bool render_reader_at(long long t_us, ErrorSpec* err) {
     err->detail = "slot1 rc=" + std::to_string(rc);
     return false;
   }
-  if (g_state.best_pixels.empty()) {
+  if (g_state.best_pixels.empty() || g_state.best_pts < 0) {
     err->code = "frame_unavailable";
-    err->message = "no frame was delivered for the requested time";
+    err->message = "no frame with a valid pts was delivered for the requested time";
     err->detail = "deliveries=" + std::to_string(g_state.last_pts) + " target_pts=" +
                   std::to_string(g_state.target_pts) + " key_frame=" + std::to_string(key);
     return false;
@@ -663,308 +968,96 @@ bool render_reader_at(long long t_us, ErrorSpec* err) {
 }
 
 // --------------------------------------------------------------------------
-// PlayerWin path: Server/Session/VeWrapper/PlayerWin
+// PlayerWin path: fail closed until a legal ABI contract is recovered
 // --------------------------------------------------------------------------
-struct SharedPtr2 {
-  void* ptr;
-  void* ctrl;
-};
-
-unsigned char g_adapter[8192];
-unsigned char g_global[8192];
-void* g_server = nullptr;
-long g_sid = -1;
-void* g_session_slot = nullptr;
-void* g_wrapper_slot = nullptr;
-void* g_editor_slot = nullptr;
-char g_step_name[64] = "resolve_exports";
-char g_step_detail[256];
-
-LONG WINAPI log_exception(EXCEPTION_POINTERS* ex, const char* step) {
-  const auto* r = ex->ExceptionRecord;
-  const auto* c = ex->ContextRecord;
-  HMODULE mod = nullptr;
-  wchar_t path[MAX_PATH] = {};
-  char utf8[MAX_PATH * 4] = {};
-  std::snprintf(g_step_detail, sizeof(g_step_detail),
-                "exception=0x%08lx rva=0x%llx av_addr=%p", r->ExceptionCode,
-                0ull, r->ExceptionAddress);
-  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                         reinterpret_cast<LPCWSTR>(r->ExceptionAddress), &mod) &&
-      GetModuleFileNameW(mod, path, MAX_PATH)) {
-    WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), nullptr, nullptr);
-    std::snprintf(g_step_detail, sizeof(g_step_detail),
-                  "exception=0x%08lx module=%s rva=0x%llx av_addr=%p", r->ExceptionCode, utf8,
-                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(r->ExceptionAddress) -
-                                                  reinterpret_cast<uintptr_t>(mod)),
-                  r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2
-                      ? reinterpret_cast<void*>(r->ExceptionInformation[1])
-                      : nullptr);
-  }
-  logf("playerwin_av step=%s %s rcx=%p rdx=%p r8=%p r9=%p\n", step, g_step_detail,
-       reinterpret_cast<void*>(c->Rcx), reinterpret_cast<void*>(c->Rdx), reinterpret_cast<void*>(c->R8),
-       reinterpret_cast<void*>(c->R9));
-  return EXCEPTION_EXECUTE_HANDLER;
-}
-
-enum PlayerStep {
-  kInitVeAbConfig = 1,
-  kServerInstance = 2,
-  kServerStartup = 3,
-  kOpenSession = 4,
-  kGetSession = 5,
-  kInitVeWrapper = 6,
-  kGetVeWrapper = 7,
-  kOpenTimelineEditor = 8,
-  kTimelineEditor = 9,
-  kPlayerCtor = 10,
-  kSetOffscreen = 11,
-  kPrepare = 12,
-};
-
-struct PlayerCtx {
-  int which;
-  int arg;
-  long ret;
-  void* ptr;
-  bool use_two_strings;
-};
-
-void run_player_step(PlayerCtx* ctx) {
-  switch (ctx->which) {
-    case kInitVeAbConfig: {
-      using Fn = void(__fastcall*)(const void*);
-      auto fn = reinterpret_cast<Fn>(
-          GetProcAddress(g_state.dll, "?InitVEAbConfig@lvve@@YAXPEBUVEAdapterConfig@adapter@1@@Z"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      fn(g_adapter);
-      ctx->ret = 0;
-      break;
-    }
-    case kServerInstance: {
-      using Fn = void* (__cdecl*)();
-      auto fn = reinterpret_cast<Fn>(GetProcAddress(g_state.dll, "?instance@Server@lyra@@SAPEAU12@XZ"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      ctx->ptr = fn();
-      g_server = ctx->ptr;
-      ctx->ret = ctx->ptr ? 0 : -2;
-      if (!ctx->ptr) std::snprintf(g_step_detail, sizeof(g_step_detail), "Server::instance returned null");
-      break;
-    }
-    case kServerStartup: {
-      using Fn = void(__fastcall*)(void*, const void*);
-      auto fn = reinterpret_cast<Fn>(
-          GetProcAddress(g_state.dll, "?startup@Server@lyra@@QEAAXPEBUVEGlobalConfig@lvve@@@Z"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      fn(g_server, g_global);
-      ctx->ret = 0;
-      break;
-    }
-    case kOpenSession: {
-      std::string name = "jypreview-preview-host";
-      std::string addr;
-      if (ctx->use_two_strings) {
-        using Fn = long(__fastcall*)(void*, const void*, const std::string*, const std::string*);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(
-            g_state.dll,
-            "?openSession@Server@lyra@@QEAAJPEBUVEAdapterConfig@adapter@lvve@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@1@Z"));
-        if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-        ctx->ret = fn(g_server, g_adapter, &name, &addr);
-      } else {
-        using Fn = long(__fastcall*)(void*, const void*, const std::string*);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(
-            g_state.dll,
-            "?openSession@Server@lyra@@QEAAJPEBUVEAdapterConfig@adapter@lvve@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z"));
-        if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-        ctx->ret = fn(g_server, g_adapter, &name);
-      }
-      g_sid = ctx->ret;
-      break;
-    }
-    case kGetSession: {
-      using Fn = SharedPtr2(__fastcall*)(void*, void*, long);
-      auto fn = reinterpret_cast<Fn>(GetProcAddress(
-          g_state.dll, "?getSession@Server@lyra@@QEAA?AV?$shared_ptr@USession@lyra@@@std@@J@Z"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      fn(g_session_slot, g_server, ctx->arg);
-      ctx->ptr = *reinterpret_cast<void**>(g_session_slot);
-      ctx->ret = ctx->ptr ? 0 : -2;
-      if (!ctx->ptr) std::snprintf(g_step_detail, sizeof(g_step_detail), "getSession returned null");
-      break;
-    }
-    case kInitVeWrapper: {
-      using Fn = bool(__fastcall*)(void*, const void*);
-      auto fn = reinterpret_cast<Fn>(GetProcAddress(
-          g_state.dll, "?initVeWrapper@Session@lyra@@QEAA_NPEBUVEAdapterConfig@adapter@lvve@@@Z"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      void* session = *reinterpret_cast<void**>(g_session_slot);
-      if (!session) { std::snprintf(g_step_detail, sizeof(g_step_detail), "no session"); ctx->ret = -2; return; }
-      bool ok = fn(session, g_adapter);
-      ctx->ret = ok ? 0 : -3;
-      if (!ok) std::snprintf(g_step_detail, sizeof(g_step_detail), "initVeWrapper returned false");
-      break;
-    }
-    case kGetVeWrapper: {
-      using Fn = SharedPtr2(__fastcall*)(void*, void*);
-      auto fn = reinterpret_cast<Fn>(GetProcAddress(
-          g_state.dll, "?getVeWrapper@Session@lyra@@QEAA?AV?$shared_ptr@UVeWrapper@wrapper@lyra@@@std@@XZ"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      void* session = *reinterpret_cast<void**>(g_session_slot);
-      fn(g_wrapper_slot, session);
-      ctx->ptr = *reinterpret_cast<void**>(g_wrapper_slot);
-      ctx->ret = ctx->ptr ? 0 : -2;
-      if (!ctx->ptr) std::snprintf(g_step_detail, sizeof(g_step_detail), "getVeWrapper returned null");
-      break;
-    }
-    case kOpenTimelineEditor: {
-      using Fn = void(__fastcall*)(void*, long, bool);
-      auto fn = reinterpret_cast<Fn>(GetProcAddress(
-          g_state.dll, "?openTimelineEditor@VeWrapper@wrapper@lyra@@QEAAXJ_N@Z"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      void* wrapper = *reinterpret_cast<void**>(g_wrapper_slot);
-      if (!wrapper) { std::snprintf(g_step_detail, sizeof(g_step_detail), "no wrapper"); ctx->ret = -2; return; }
-      fn(wrapper, ctx->arg, true);
-      ctx->ret = 0;
-      break;
-    }
-    case kTimelineEditor: {
-      using Fn = SharedPtr2(__fastcall*)(void*, void*, long);
-      auto fn = reinterpret_cast<Fn>(GetProcAddress(
-          g_state.dll,
-          "?timelineEditor@VeWrapper@wrapper@lyra@@QEAA?AV?$shared_ptr@VVeTimelineEditor@wrapper@lyra@@@std@@J@Z"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      void* wrapper = *reinterpret_cast<void**>(g_wrapper_slot);
-      fn(g_editor_slot, wrapper, ctx->arg);
-      ctx->ptr = *reinterpret_cast<void**>(g_editor_slot);
-      ctx->ret = ctx->ptr ? 0 : -2;
-      if (!ctx->ptr) std::snprintf(g_step_detail, sizeof(g_step_detail), "timelineEditor returned null");
-      break;
-    }
-    case kPlayerCtor: {
-      using Fn = void* (__fastcall*)(void*, void*, const void*, long);
-      auto fn = reinterpret_cast<Fn>(
-          GetProcAddress(g_state.dll, "??0PlayerWin@lvve@@QEAA@PEAXPEBUVEAdapterConfig@adapter@1@J@Z"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      void* editor = *reinterpret_cast<void**>(g_editor_slot);
-      ctx->ptr = fn(nullptr, editor, g_adapter, ctx->arg);
-      g_state.player = ctx->ptr;
-      ctx->ret = ctx->ptr ? 0 : -2;
-      if (!ctx->ptr) std::snprintf(g_step_detail, sizeof(g_step_detail), "PlayerWin ctor returned null");
-      break;
-    }
-    case kSetOffscreen: {
-      using Fn = void(__fastcall*)(void*, bool);
-      auto fn = reinterpret_cast<Fn>(GetProcAddress(g_state.dll, "?SetOffscreen@PlayerWin@lvve@@UEAAAX_N@Z"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      fn(g_state.player, true);
-      ctx->ret = 0;
-      break;
-    }
-    case kPrepare: {
-      using Fn = void(__fastcall*)(void*, bool);
-      auto fn = reinterpret_cast<Fn>(GetProcAddress(g_state.dll, "?Prepare@PlayerWin@lvve@@UEAAAX_N@Z"));
-      if (!fn) { std::snprintf(g_step_detail, sizeof(g_step_detail), "export missing"); ctx->ret = -1; return; }
-      fn(g_state.player, true);
-      ctx->ret = 0;
-      break;
-    }
-    default:
-      ctx->ret = -999;
-      std::snprintf(g_step_detail, sizeof(g_step_detail), "unknown step");
-  }
-}
-
-bool guarded_player(PlayerCtx* ctx, const char* step) {
-  std::snprintf(g_step_name, sizeof(g_step_name), "%s", step);
-  g_step_detail[0] = 0;
-  __try {
-    run_player_step(ctx);
-    return true;
-  } __except (log_exception(GetExceptionInformation(), g_step_name)) {
-    ctx->ret = -1000;
-    return false;
-  }
-}
-
-bool open_player(ErrorSpec* err) {
-  std::memset(g_adapter, 0, sizeof(g_adapter));
-  std::memset(g_global, 0, sizeof(g_global));
-  g_session_slot = std::calloc(2, sizeof(void*));
-  g_wrapper_slot = std::calloc(2, sizeof(void*));
-  g_editor_slot = std::calloc(2, sizeof(void*));
-  g_sid = -1;
-
-  struct {
-    int which;
-    const char* step;
-    bool two_strings;
-  } plan[] = {
-      {kInitVeAbConfig, "InitVEAbConfig", false},
-      {kServerInstance, "Server::instance", false},
-      {kServerStartup, "Server::startup", false},
-      {kOpenSession, "Server::openSession", true},
-      {kGetSession, "Server::getSession", false},
-      {kInitVeWrapper, "Session::initVeWrapper", false},
-      {kGetVeWrapper, "Session::getVeWrapper", false},
-      {kOpenTimelineEditor, "VeWrapper::openTimelineEditor", false},
-      {kTimelineEditor, "VeWrapper::timelineEditor", false},
-      {kPlayerCtor, "PlayerWin ctor", false},
-      {kSetOffscreen, "PlayerWin::SetOffscreen", false},
-      {kPrepare, "PlayerWin::Prepare", false},
-  };
-  for (auto& p : plan) {
-    PlayerCtx ctx{};
-    ctx.which = p.which;
-    ctx.arg = g_sid;
-    ctx.use_two_strings = p.two_strings;
-    bool ok = guarded_player(&ctx, p.step);
-    if (!ok) {
-      err->code = "init_rejected";
-      err->message = std::string("PlayerWin initialization failed at ") + p.step;
-      err->detail = std::string("step=") + p.step + " " + g_step_detail +
-                    " (VEAdapterConfig/VEGlobalConfig construction contract is not exposed by the DLL)";
-      g_state.player_failure_step = p.step;
-      g_state.player_failure_detail = err->detail;
-      return false;
-    }
-    if (ctx.ret != 0) {
-      err->code = "init_rejected";
-      err->message = std::string("PlayerWin initialization rejected at ") + p.step;
-      err->detail = std::string("step=") + p.step + " ret=" + std::to_string(ctx.ret) + " " + g_step_detail;
-      g_state.player_failure_step = p.step;
-      g_state.player_failure_detail = err->detail;
-      return false;
-    }
-  }
-  return true;
+// Evidence (temp/dll-native-preview/evidence.md section 2 and
+// probes/initveabconfig-body.asm):
+//  * InitVEAbConfig(cfg) dereferences [cfg+0xb70], i.e. a live config tree;
+//    a zeroed config faults (0xc0000005, av_addr=0x0) at rva=0x156573b.
+//  * 34 exports mentioning VEAdapterConfig were reviewed: the DLL exposes no
+//    factory to construct VEAdapterConfig/VEGlobalConfig, and openSession
+//    with a zeroed config faults at +0x8.
+//  * PlayerWin's ctor
+//    (??0PlayerWin@lvve@@QEAA@PEAXPEBUVEAdapterConfig@adapter@1@J@Z) requires
+//    caller-provided storage ("this") whose contract is not evidenced;
+//    draft_root/timeline_id have no recovered load path and no render op
+//    (GetSpecificTimeImage) is wired.
+// Fabricating a config or passing a null "this" would be guessing a private
+// ABI, so no PlayerWin call is executed: the gate reports the blocker
+// explicitly instead of AV-ing or falling back to another renderer.
+bool open_player(const std::string& draft_root, const std::string& timeline_id, ErrorSpec* err) {
+  err->code = "init_rejected";
+  err->message = "PlayerWin initialization blocked: no legal ABI contract recovered";
+  err->detail = "step=VEAdapterConfig-construction "
+                "evidence=temp/dll-native-preview/evidence.md#2 draft_root=" + draft_root +
+                " timeline_id=" + timeline_id + " render_path=not-wired";
+  return false;
 }
 
 // --------------------------------------------------------------------------
 // Dispatch
 // --------------------------------------------------------------------------
-std::string read_all_payload(const std::string& request, size_t* payload_pos) {
-  (void)request;
-  (void)payload_pos;
-  return std::string();
+// Per-request frame state: cleared before every render_at so a failed or
+// near-zero seek can never emit a previous request's pixels.
+void clear_frame_state() {
+  g_state.best_pixels.clear();
+  g_state.width = 0;
+  g_state.height = 0;
+  g_state.best_pts = -1;
+  g_state.best_dist = -1;
+  g_state.last_pts = -1;
+  g_state.stop_batch = false;
+  g_state.target_pts = -1;
+}
+
+// Lifecycle: at most one render path is attached. `open` detaches the current
+// path *before* any attempt, so a failed path switch leaves the host with no
+// render path instead of silently serving the previous source's frames.
+// Private DLL destructors are never called (same rule as close): a detached
+// object is reclaimed at process exit.
+void clear_render_state() {
+  clear_frame_state();
+  g_state.reader = nullptr;
+  g_state.source_path.clear();
 }
 
 void handle(const std::string& raw) {
-  std::string request_id = "0";
-  if (!find_raw_token(raw, "request_id", &request_id) ||
-      !(request_id == "0" || (request_id[0] == '"') || (request_id[0] >= '0' && request_id[0] <= '9') ||
-        request_id[0] == '-' || request_id[0] == 't' || request_id[0] == 'f' || request_id[0] == 'n')) {
-    request_id = "0";
+  // Envelope first: protocol_version/request_id/generation/op are read from
+  // the top level only and must each appear exactly once; `payload` is scanned
+  // separately, so a nested op/generation/request_id can never drive the host
+  // (payload {"op":"close"} on a ping must not close the host).
+  Envelope env = parse_envelope(raw);
+  std::vector<JsonField> payload;
+  if (env.ok && env.has_payload && !scan_object_level(env.payload, &payload)) {
+    env.ok = false;
+    env.error = {"bad_request", "payload must be one well-formed JSON object", "payload"};
   }
-  long long generation = find_int(raw, "generation", 0);
-  std::string op = find_string(raw, "op", "");
+  if (!env.ok) {
+    send_error(env.request_id, env.generation, "", env.error, g_state.dll != nullptr);
+    return;
+  }
+  const std::string& request_id = env.request_id;
+  const long long generation = env.generation;
+  const std::string& op = env.op;
 
   if (op == "ping") {
-    send_ok(request_id, generation, op, ",\"protocol_version\":1");
+    send_ok(request_id, generation, op, "");  // make_meta already emits protocol_version
     return;
   }
 
   if (op == "open") {
-    std::string render_path = find_string(raw, "render_path", "");
+    // Any open attempt detaches the current render path first: a failed path
+    // switch must not leave the previous source reachable through render_at.
+    clear_render_state();
+    int render_count = 0;
+    std::string render_path = payload_string(payload, "render_path", "", &render_count);
+    if (render_count > 1) {
+      // A consumed payload field must be unambiguous: never pick by order.
+      send_error(request_id, generation, op,
+                 {"bad_request", "duplicate payload field: render_path", "render_path"},
+                 g_state.dll != nullptr);
+      return;
+    }
     if (render_path.empty()) {
       send_error(request_id, generation, op,
                  {"bad_request", "render_path is required", "render_path"}, g_state.dll != nullptr);
@@ -976,7 +1069,17 @@ void handle(const std::string& raw) {
       return;
     }
     if (render_path == "playerwin") {
-      if (!open_player(&err)) {
+      int draft_count = 0;
+      int timeline_count = 0;
+      std::string draft_root = payload_string(payload, "draft_root", "", &draft_count);
+      std::string timeline_id = payload_string(payload, "timeline_id", "", &timeline_count);
+      if (draft_count > 1 || timeline_count > 1) {
+        const char* dup = draft_count > 1 ? "draft_root" : "timeline_id";
+        send_error(request_id, generation, op,
+                   {"bad_request", std::string("duplicate payload field: ") + dup, dup}, true);
+        return;
+      }
+      if (!open_player(draft_root, timeline_id, &err)) {
         send_error(request_id, generation, op, err, true);
         return;
       }
@@ -984,7 +1087,14 @@ void handle(const std::string& raw) {
       return;
     }
     if (render_path == "frame-reader-compositor") {
-      g_state.source_path = find_string(raw, "source_path", "");
+      int source_count = 0;
+      const std::string source_path = payload_string(payload, "source_path", "", &source_count);
+      if (source_count > 1) {
+        send_error(request_id, generation, op,
+                   {"bad_request", "duplicate payload field: source_path", "source_path"}, true);
+        return;
+      }
+      g_state.source_path = source_path;
       if (g_state.source_path.empty()) {
         send_error(request_id, generation, op,
                    {"bad_request", "source_path is required for the frame reader path", "source_path"}, true);
@@ -1003,7 +1113,16 @@ void handle(const std::string& raw) {
   }
 
   if (op == "render_at") {
-    long long t_us = find_int(raw, "t_us", -1);
+    int t_us_count = 0;
+    long long t_us = payload_int(payload, "t_us", -1, &t_us_count);
+    if (t_us_count > 1) {
+      // Checked before any state is touched: a duplicate t_us must never
+      // resolve to "whichever came first".
+      send_error(request_id, generation, op,
+                 {"bad_request", "duplicate payload field: t_us", "t_us"},
+                 g_state.dll != nullptr);
+      return;
+    }
     ErrorSpec err;
     if (!g_state.dll) {
       err = {"host_not_open", "open must succeed before render_at", "no dll"};
@@ -1015,11 +1134,9 @@ void handle(const std::string& raw) {
       send_error(request_id, generation, op, err, true);
       return;
     }
-    if (g_state.player) {
-      err = {"init_rejected", "PlayerWin path produced no frame", "player present but GetSpecificTimeImage is not wired"};
-      send_error(request_id, generation, op, err, true);
-      return;
-    }
+    // Clear per-request frame state before any delivery so a failed or
+    // near-zero seek can never emit a previous request's pixels.
+    clear_frame_state();
     if (!g_state.reader) {
       err = {"host_not_open", "no render path is open", "open first"};
       send_error(request_id, generation, op, err, true);
@@ -1035,10 +1152,16 @@ void handle(const std::string& raw) {
   }
 
   if (op == "close") {
-    g_state.reader = nullptr;
-    g_state.player = nullptr;
-    g_state.best_pixels.clear();
+    // Reviewed close behaviour: private DLL destructors (~FrameReader,
+    // ~PlayerWin) are deliberately never called — their contracts are not
+    // evidenced and must not be guessed. Objects are reclaimed only at
+    // process exit; the render path is detached and frame state cleared so a
+    // later open cannot observe stale pixels.
+    clear_render_state();
     send_ok(request_id, generation, op, "");
+    // Response sent: end the process instead of guessing ~FrameReader/
+    // ~PlayerWin contracts.
+    g_close_and_exit = true;
     return;
   }
 
@@ -1097,6 +1220,7 @@ int main(int argc, char** argv) {
     std::string raw(len, '\0');
     if (!read_exact(&raw[0], len)) break;
     handle(raw);
+    if (g_close_and_exit) break;
   }
   logf("preview_host exiting\n");
   return 0;
