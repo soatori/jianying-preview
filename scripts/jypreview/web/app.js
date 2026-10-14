@@ -675,6 +675,12 @@ $("pick").onclick = async () => {
   $("clock").textContent = "等待选择文件夹…";
   try {
     const data = await api("/api/pick-folder", { path: state.lastFolder });
+    if (data.drafts_root_like) {
+      $("clock").textContent = "选的是 Drafts 根目录";
+      note("这是 Drafts 根目录（里面是一堆草稿），不是单个草稿。请在左侧列表里点要看的草稿，或进入某个草稿文件夹后再选。", true);
+      $("pick").disabled = false;
+      return;
+    }
     if (data.cancelled) {
       $("clock").textContent = state.did ? `${(state.tUs / 1e6).toFixed(3)}s` : "未打开草稿";
       return;

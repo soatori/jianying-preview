@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 from aiohttp import web
@@ -96,12 +99,71 @@ async def list_drafts(request: web.Request) -> web.Response:
                  "total": total, "offset": offset, "count": len(items), "items": items})
 
 
+def _is_drafts_root(chosen: str) -> bool:
+    """True when the picked folder is a *Drafts* container (children are drafts), not one draft.
+
+    Picking the root is the natural mistake with a folder browser, and it used to fail as an
+    unexplained "cannot open"; the page now says so instead.
+    """
+    folder = Path(chosen) if chosen else None
+    if folder is None or not folder.is_dir() or (folder / "draft_content.json").is_file():
+        return False
+    try:
+        children = list(folder.iterdir())
+    except OSError:
+        return False
+    return sum(1 for child in children
+               if child.is_dir() and (child / "draft_content.json").is_file()) >= 2
+
+
+_TK_SNIPPET = (
+    "import sys, tkinter, tkinter.filedialog as fd; "
+    "root = tkinter.Tk(); root.withdraw(); root.attributes('-topmost', True); "
+    "path = fd.askdirectory(title='选择剪映草稿文件夹', initialdir=sys.argv[1]) or ''; "
+    "root.destroy(); sys.stdout.buffer.write(path.encode('utf-8'))"
+)
+
+
+def _tkinter_python() -> list[list[str]]:
+    """Candidate interpreters that can show the dialog, best first.
+
+    The dialog path is written back as UTF-8 bytes on purpose: this box's locale codec is GBK and
+    a Chinese draft folder name coming from Explorer is not guaranteed to survive it, which is what
+    blew up the reader thread of the first version of this helper.
+
+    The server usually runs in the isolated MLT runtime, whose MSYS2 mingw Python has no tkinter
+    at all, so the dialog is delegated to an interpreter that does. That restores the picker people
+    had before the MLT runtime existed instead of dropping the feature.
+    """
+    candidates = [[sys.executable, "-c", _TK_SNIPPET]]
+    if os.name == "nt":
+        candidates.insert(0, ["py", "-3", "-c", _TK_SNIPPET])
+    return [entry for entry in candidates if entry[0]]
+
+
+def _pick_with_tkinter(initial: str) -> str:
+    """Run the Tk folder dialog in a helper interpreter and return the chosen path ('' = cancel)."""
+    last_error = "no usable interpreter"
+    for command in _tkinter_python():
+        try:
+            result = subprocess.run(command + [initial], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=600, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            continue
+        if result.returncode == 0:
+            return (result.stdout or "").strip()
+        last_error = (result.stderr or "").strip()[-200:] or "dialog helper exited nonzero"
+    raise RuntimeError(last_error)
+
+
 async def pick_folder(request: web.Request) -> web.Response:
     """Open the OS folder picker and return what the user chose ("" if cancelled)."""
     session = session_of(request)
     initial = request.query.get("path") or str(session.config.drafts_root or Path.home())
 
     def dialog() -> str:
+        return _pick_with_tkinter(initial)
         import tkinter
         from tkinter import filedialog
 
@@ -116,9 +178,10 @@ async def pick_folder(request: web.Request) -> web.Response:
 
     try:
         chosen = await offload(dialog)
-    except ImportError as exc:
-        return error_payload("no_folder_dialog", f"tkinter unavailable: {exc}", status=501)
-    return JSON({"path": chosen, "cancelled": not chosen})
+    except (ImportError, RuntimeError) as exc:
+        return error_payload("no_folder_dialog", f"no interpreter with tkinter is available: {exc}",
+                             status=501)
+    return JSON({"path": chosen, "cancelled": not chosen, "drafts_root_like": _is_drafts_root(chosen)})
 
 
 async def rescan(request: web.Request) -> web.Response:

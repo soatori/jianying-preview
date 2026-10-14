@@ -150,6 +150,14 @@ async def run(config: Config, open_browser: bool = True,
     await runner.setup()
     site = web.TCPSite(runner, config.host, config.port)
     await site.start()
+    if config.host == "127.0.0.1":
+        # Browsers resolving `localhost` often try ::1 first and then report a dead page, so the
+        # loopback is served on both families. A machine without IPv6 just fails this extra bind,
+        # which is why it is best-effort and never fatal.
+        try:
+            await web.TCPSite(runner, "::1", config.port).start()
+        except OSError:
+            pass
     actual_port = site._server.sockets[0].getsockname()[1]  # noqa: SLF001
     url = f"http://{config.host}:{actual_port}/"
     print(json.dumps({"ok": True, "code": "serving", "reason": "",
