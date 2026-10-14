@@ -85,12 +85,32 @@ def _frame_headers(frame) -> dict[str, str]:
             "X-Project-PTS-US": str(frame.pts_us)}
 
 
+def _preview_factor(model, raw: str) -> float:
+    """?longest=N compiles the whole session against a smaller, geometrically equivalent
+    canvas (TimelineModel.rescale) instead of rendering at full size and shrinking each
+    frame afterwards. The cost lives inside the MLT graph -- with the serial sink nothing
+    is dropped, so per-frame wall time *is* the delivered rate, and per-frame RGBA
+    buffers, compositing and decode queues all scale with the canvas (1080x1920 = 8.3 MB
+    per frame -> 540x960 = 2 MB). Frames therefore arrive at the browser already at the
+    requested size and the stream has exactly one resize path: this one. An unparseable
+    value keeps the full canvas, so every pre-existing caller is untouched.
+    """
+    try:
+        longest = _int_param(raw, "longest", minimum=16)
+    except ValueError:
+        return 1.0
+    return min(1.0, longest / max(model.canvas)) if longest else 1.0
+
+
 def _encode_png(frame) -> bytes:
     from PIL import Image
 
     image = Image.frombytes("RGBA", (frame.width, frame.height), frame.rgba)
     output = io.BytesIO()
-    image.save(output, format="PNG")
+    # Level 1, not the default 6: a preview frame is still ~1M pixels at the reduced
+    # canvas and zlib level 6 costs more than a third of the per-frame budget. PNG is
+    # lossless either way, so the pixels are identical and only the wall clock cares.
+    image.save(output, format="PNG", compress_level=1)
     return output.getvalue()
 
 
@@ -105,6 +125,13 @@ async def open_backend(request: web.Request) -> web.Response:
     view = await offload(lambda: session.view(selector(request)))
     tid = await offload(lambda: view.resolve_timeline(request.query.get("timeline") or "active")["id"])
     model = await offload(lambda: view.timeline_model(tid))
+    # Only a real ?longest= touches the model, so callers that omit it see the exact
+    # pre-rescale code path (and the lifecycle mocks keep passing non-model values).
+    raw = request.query.get("longest")
+    if raw:
+        factor = _preview_factor(model, raw)
+        if factor < 1.0:
+            model = model.rescale(factor)  # pure value transform; the session model stays intact
     key = _key(view.did, tid)
     # ponytail: one registry mutation lock; split by key if open/close throughput matters.
     async with request.app["playback_lifecycle_lock"]:
@@ -259,6 +286,8 @@ async def stream(request: web.Request) -> web.StreamResponse:
                 await asyncio.sleep(0.02)
                 continue
             last = stamp
+            # The frame already carries the session canvas (open's ?longest rescaled the
+            # graph), so the only encode cost left here is zlib itself.
             payload = await offload(_encode_png, frame)
             headers = "".join(f"{name}: {value}\r\n" for name, value in _frame_headers(frame).items())
             await response.write(

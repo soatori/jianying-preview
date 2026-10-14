@@ -122,13 +122,16 @@ def _find_by_name(draft_root: Path, name: str) -> str | None:
 def probe(path: str, cache_dir: Path, timeout: float = 8.0) -> dict[str, Any]:
     """ffprobe JSON, cached by path identity. Never raises."""
     record = {"path": path, "codec": None, "width": None, "height": None,
-              "duration_us": None, "frame_rate": None, "audio_codec": None, "error": None}
+              "duration_us": None, "frame_rate": None, "audio_codec": None, "error": None,
+              "rotation": 0}
     target = Path(path)
     if not target.is_file():
         record["error"] = "missing"
         return record
     info = target.stat()
-    key = f"{os.path.normcase(str(target))}|{info.st_mtime_ns}|{info.st_size}"
+    # The version suffix invalidates records written before this probe learned about
+    # container rotation, so an old cache cannot silently report rotation 0.
+    key = f"{os.path.normcase(str(target))}|{info.st_mtime_ns}|{info.st_size}|v2"
     import hashlib
 
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
@@ -156,15 +159,38 @@ def probe(path: str, cache_dir: Path, timeout: float = 8.0) -> dict[str, Any]:
     video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
     audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), {})
     fmt = data.get("format", {})
+    # Container/display rotation. Phone footage is commonly coded landscape with a
+    # -90/90 display angle; ffprobe reports it as side data (or a legacy `rotate` tag).
+    # MLT's avformat producer exposes neither the angle nor a rotated frame, so anything
+    # that composites these files has to apply the turn itself.
+    rotation = 0
+    for side in video.get("side_data_list") or []:
+        if side.get("rotation") is not None:
+            try:
+                rotation = int(float(side["rotation"]))
+            except (TypeError, ValueError):
+                rotation = 0
+            break
+    if not rotation:
+        tagged = (video.get("tags") or {}).get("rotate") or (fmt.get("tags") or {}).get("rotate")
+        try:
+            rotation = int(float(tagged)) if tagged else 0
+        except (TypeError, ValueError):
+            rotation = 0
+    width = int(video["width"]) if video.get("width") else 0
+    height = int(video["height"]) if video.get("height") else 0
     record.update({
         "codec": video.get("codec_name") or (audio.get("codec_name") if not video else None),
-        "width": int(video["width"]) if video.get("width") else None,
-        "height": int(video["height"]) if video.get("height") else None,
+        "width": width or None,
+        "height": height or None,
         "pix_fmt": video.get("pix_fmt"),
         "duration_us": int(round(float(fmt["duration"]) * 1e6)) if fmt.get("duration") else None,
         "frame_rate": _rate(video.get("avg_frame_rate") or video.get("r_frame_rate")),
         "audio_codec": audio.get("codec_name"),
         "channels": int(audio["channels"]) if audio.get("channels") else None,
+        "rotation": rotation,
+        "display_width": (height if abs(rotation) == 90 else width) if width and height else width,
+        "display_height": (width if abs(rotation) == 90 else height) if width and height else height,
     })
     try:
         cached.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")

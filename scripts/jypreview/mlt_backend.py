@@ -9,7 +9,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from fractions import Fraction
-from math import isfinite, log10
+from math import exp, isfinite, log, log10
 from typing import Any
 
 from .model.content import DEFAULT_RI
@@ -25,6 +25,10 @@ from .model.timeline import FrameRate, TimelineModel, Transform
 # an explicit operator override authoritative — overriding back to WASAPI
 # re-exposes the crash.
 os.environ.setdefault("SDL_AUDIODRIVER", "dsound")
+
+# JianYing 调节/美化 scalar -> weight in ln(gamma). See _grade_gamma for the fit.
+GRADE_LIFT = {"smart_color_adjust": 0.149, "light_sensation": 0.452,
+              "brightness": 0.152, "contrast": -0.234}
 
 
 class BackendUnavailable(RuntimeError):
@@ -161,6 +165,57 @@ def _start_consumer(consumer) -> int:
     return _natives().mlt_consumer_start(int(consumer.get_consumer()))
 
 
+def _curve_gamma(color_curve):
+    """Fit a sampled JianYing tone curve to one gamma exponent.
+
+    avfilter.* options are inert in this MLT build, so the monotone curve is fitted to the
+    core "gamma" filter (out = in ** (1/gamma)). Endpoints are skipped (log(0)); implausible
+    fits are rejected rather than applied.
+    """
+    points = dict(color_curve or ()).get("master") or ()
+    ratios = [log(y) / log(x) for x, y in points if 0.03 <= x <= 0.97 and 0.03 <= y <= 0.97]
+    if len(ratios) < 3:
+        return None
+    exponent = sum(ratios) / len(ratios)
+    if exponent <= 0:
+        return None
+    gamma = 1.0 / exponent
+    return round(gamma, 4) if 0.2 <= gamma <= 5.0 else None
+
+
+def _grade_gamma(grade):
+    """Fold JianYing 调节/美化 scalars into one gamma exponent.
+
+    Only a midtone lift can be expressed here: this MLT build has no working `avfilter.*`
+    (curves/eq/lift_gamma_gain are inert), and the core "gamma" filter is the one primitive
+    that reproduces "the exported picture is brighter than the raw source" without touching
+    black or white clip. Coefficients come from a proportional (intercept-free) least-squares
+    fit against the 1012-1626 export fixture, where inverting each sampled frame's per-channel
+    mean gave the gamma that reproduces the export; the fit lifted median pixel similarity from
+    0.783 to 0.814. Kinds without a listed coefficient (saturation, temperature, highlight,
+    shadow, clear, sharpen) are carried on the model but not applied -- they are not tone-only.
+    """
+    total = 0.0
+    for kind, value in grade or ():
+        coefficient = GRADE_LIFT.get(kind)
+        if coefficient and isinstance(value, (int, float)) and isfinite(value):
+            total += coefficient * value
+    if abs(total) < 0.01:
+        return None
+    gamma = exp(total)
+    return round(min(2.5, max(0.5, gamma)), 4)
+
+
+def _merge_grade(*grades):
+    """Sum JianYing grading scalars along a clip's ancestor chain."""
+    merged: dict[str, float] = {}
+    for grade in grades:
+        for kind, value in grade or ():
+            if isinstance(value, (int, float)) and isfinite(value):
+                merged[kind] = merged.get(kind, 0.0) + value
+    return tuple(sorted(merged.items()))
+
+
 def _stop_consumer(consumer) -> int:
     """Stop the sink and join its frame-show threads (see _natives)."""
     return _natives().mlt_consumer_stop(int(consumer.get_consumer()))
@@ -277,7 +332,7 @@ class MltCompiler:
             raise TypeError("MltCompiler requires TimelineModel")
         return self._compile(model, 0)
 
-    def _compile(self, model, depth):
+    def _compile(self, model, depth, inherited_grade=()):
         mlt = self._runtime()
         profile = self._profile(mlt, model)
         count = model.frame_rate.frame_count(model.duration_us)
@@ -367,6 +422,9 @@ class MltCompiler:
                     if max(clip.source_range.start_us, available.start_us) >= min(clip.source_range.end_us, available.end_us):
                         warnings.append("source_range_unavailable")
                         broken = True
+                # Grading lives on the compound, but a filter on a child tractor is only partly
+                # honoured by this build, so the scalars are inherited down to leaf producers.
+                grade = _merge_grade(inherited_grade, clip.grade)
                 producer = None
                 title_size = None
                 decoded_size = None
@@ -375,7 +433,7 @@ class MltCompiler:
                         warnings.append("max_nest_depth")
                         broken = True
                     else:
-                        child = self._compile(clip.nested, depth + 1)
+                        child = self._compile(clip.nested, depth + 1, grade)
                         owned.append(child)
                         warnings.extend(child.warnings)
                         producer = child.tractor
@@ -460,6 +518,21 @@ class MltCompiler:
                     producer = keep(mlt.Producer(profile, "color", "#e040a0"))
                     audio, still = False, True
                 producer.set_speed(1)
+                if visual and not broken:
+                    # One gamma stage carries both tone treatments: the clip's own 调节/美化
+                    # scalars (plus any inherited from enclosing compounds) and any sampled
+                    # colour curve (gammas multiply in log space).
+                    gamma = _curve_gamma(clip.color_curve)
+                    if clip.nested is None:
+                        tone_gamma = _grade_gamma(grade)
+                        if gamma and tone_gamma:
+                            gamma = round(gamma * tone_gamma, 4)
+                        elif tone_gamma:
+                            gamma = tone_gamma
+                    if gamma:
+                        curve = keep(mlt.Filter(profile, "gamma"))
+                        curve.set("gamma", gamma)
+                        producer.attach(curve)
                 decoder = None
                 if audio and clip.media_ref is not None:
                     producer.seek(0)
@@ -1052,8 +1125,14 @@ class PlaybackController:
             consumer = mlt.Consumer(compiled.profile, name)
             if not consumer.is_valid():
                 continue
-            consumer.set("real_time", 1)
+            # real_time=0 renders serially. With the default per-core pre-threading every producer
+            # keeps its own decode queue, and the 1012-1626 fixture's 98 clips of 1080x1920 RGBA
+            # (8.3 MB per frame) committed ~9.5 GB on open -- on a 15.8 GB machine that is what made
+            # "reopen the draft" fail. Set JY_PREVIEW_MLT_REALTIME=1 to opt the threaded sink back
+            # in; at the reduced preview canvas that is measurable again (see temp/mem_probe.py).
+            consumer.set("real_time", int(os.environ.get("JY_PREVIEW_MLT_REALTIME", "0")))
             consumer.set("loop", 0)
+            consumer.set("buffer", 4)   # frames held by the sink; default scales with threads
             if consumer.connect(compiled.tractor) != 0:
                 continue
             if self._drives(consumer):

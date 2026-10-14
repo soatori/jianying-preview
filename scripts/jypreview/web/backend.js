@@ -259,7 +259,13 @@ export class MltPlaybackClient {
       throw new Error("backend previous playback could not be closed");
     }
     if (epoch !== this.epoch) return { applied: false, stale: true };
-    const { res, data } = await this.#request("POST", "/api/backend/open", { draft, timeline });
+    // Compile the whole session against a reduced canvas: nothing here displays at
+    // 1080x1920, and with the serial sink the per-frame graph cost *is* the delivered
+    // rate, while per-frame RGBA buffers and decode queues scale with the canvas
+    // (the 11.4 GB open-time working set is what maxed the 16 GB machine). Frames
+    // arrive at this size already, so no stream-side resize exists anymore.
+    const { res, data } = await this.#request("POST", "/api/backend/open",
+      { draft, timeline, longest: 960 });
     const body = data && data.snapshot && typeof data.snapshot === "object" ? data.snapshot : data;
     const ident = identityOf(res, body);
     this.owner = { playbackId: ident.playbackId,
@@ -481,6 +487,9 @@ export class MltPlaybackClient {
     this.streamAbort = abort;
     let res = null;
     try {
+      // No size params here: open compiled the graph at the reduced preview canvas, so the
+      // multipart parts already arrive at the size the page displays. The frame itself is
+      // the cost -- shrinking it after the graph rendered it changed nothing measurable.
       res = await fetch(this.#url("/api/backend/stream", { playback_id: this.playbackId }),
         { cache: "no-store", signal: abort.signal });
     } catch (error) {

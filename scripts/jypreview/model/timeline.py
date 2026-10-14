@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import gcd, isfinite
 
 from .content import DEFAULT_RI
@@ -112,12 +112,17 @@ class MediaRef:
     has_audio: bool | None = None
     width: int = 0
     height: int = 0
+    rotation: int = 0
 
     def __post_init__(self) -> None:
         if self.duration_us is not None:
             _integer(self.duration_us, "media duration")
         _integer(self.width, "media width")
         _integer(self.height, "media height")
+        # Container display rotation is signed (-90/90/180 are all seen in phone footage),
+        # so it must not go through _integer's nonnegative check.
+        if not isinstance(self.rotation, int) or isinstance(self.rotation, bool):
+            raise ValueError("media rotation must be an integer")
 
 
 @dataclass(frozen=True)
@@ -195,11 +200,18 @@ class Clip:
     nested: TimelineModel | None = None
     warnings: tuple[str, ...] = ()
     placeholder: bool = False
+    # JianYing colour curves: ((channel, ((x, y), ...)), ...) with x/y normalised to 0..1,
+    # already sampled from the draft's Bezier control points. Empty means "no grading curve".
+    color_curve: tuple[tuple[str, tuple[tuple[float, float], ...]], ...] = ()
+    # JianYing 调节/美化 scalars from `materials.effects` ((kind, value), ...) with value in
+    # -1..1, summed per kind over this clip's own effect labels. Nested compounds keep their
+    # own grade, so a compound and its leaf clip each contribute one gamma stage.
+    grade: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self) -> None:
         if not isfinite(self.opacity) or not 0 <= self.opacity <= 1:
             raise ValueError("opacity must be between zero and one")
-        for name in ("crop", "effects", "animations", "warnings"):
+        for name in ("crop", "effects", "animations", "warnings", "color_curve", "grade"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
 
@@ -252,6 +264,47 @@ class TimelineModel:
             object.__setattr__(self, name, tuple(getattr(self, name)))
         if len(self.canvas) != 2 or any(type(size) is not int or size <= 0 for size in self.canvas):
             raise ValueError("canvas must have positive integer width and height")
+
+    def rescale(self, factor: float) -> "TimelineModel":
+        """Return a geometrically equivalent model rendering at ``factor`` of canvas size.
+
+        The interactive browser session compiles against a reduced canvas: per-frame RGBA
+        buffers, compositing and affine scaling all shrink with it (8.3 MB/frame at
+        1080x1920 -> 2 MB at 540x960), which is the lever for the ~11.4 GB private working
+        set a full-canvas open costs on a 16 GB machine. This is the one place the scale
+        lives: every canvas-pixel value (canvas size, Clip.transform cx/cy/w/h, pango text
+        em size and text box) is multiplied here, so downstream consumers -- the MLT
+        profile, producer probe sizes and blend geometry -- need no knowledge of it.
+        Unit-less values (crop, anchors, scale multipliers, opacity, blend, em-relative
+        strokes) and every time value are untouched, so frame identity is unchanged.
+        Validation and the export-match harness keep calling this with no rescale at all.
+        """
+        if not 0 < factor < 1.0:
+            raise ValueError("rescale factor must be in (0, 1)")
+        width, height = self.canvas
+        return replace(self,
+                       canvas=(max(1, round(width * factor)), max(1, round(height * factor))),
+                       tracks=tuple(replace(track, clips=tuple(_rescaled_clip(clip, factor)
+                                                                for clip in track.clips))
+                                    for track in self.tracks))
+
+
+def _rescaled_clip(clip: Clip, factor: float) -> Clip:
+    """Scale one clip's canvas-pixel fields; compounds recurse through ``nested``."""
+    updates: dict[str, object] = {}
+    t = clip.transform
+    if t != Transform():  # the identity default is already scale-invariant
+        updates["transform"] = replace(t, x=t.x * factor, y=t.y * factor,
+                                       width=t.width * factor, height=t.height * factor)
+    text = clip.text_payload
+    if text is not None:
+        # font_size is the pango em in canvas px; box is (cx, cy, w, h) in canvas px.
+        # Stroke widths ride in as em-relative params and follow font_size for free.
+        updates["text_payload"] = replace(text, font_size=text.font_size * factor,
+                                          box=tuple(value * factor for value in text.box))
+    if clip.nested is not None:
+        updates["nested"] = clip.nested.rescale(factor)
+    return replace(clip, **updates) if updates else clip
 
 
 @dataclass(frozen=True)
