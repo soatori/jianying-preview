@@ -108,8 +108,8 @@ python <S>/preview.py shot "草稿名" --t 7 --out after.png
 | 画面特效/滤镜/美颜 | 占位标注（美颜 `figure` 本机无任何名字来源，只出一个聚合角标） |
 | 素材像素 | 新草稿基本齐全；老草稿大量路径失效 → 出带名称/编码/原路径的占位瓦片，UI 明示"N 个素材缺失" |
 | 复合片段 | 递归渲染内层内容（媒体按 `draft_file_path` 所在目录解析）；内层不可解析时退回剪映自己的 `draft_cover_path` 封面 |
-| 音频 | 播放时挂 `<audio>` 按 IR 的 `source_time_us`/`volume` 对齐（不做多轨混音/淡变曲线）；轨道静音与无路径的仍只列标签 |
-| 播放 | **窗口驱动 + 状态机**：`PlaybackController` 只在有效窗口覆盖当前 `t_us` 时推进时钟；窗口请求使用 generation 丢弃旧结果，`FrameStore` 区分 point/window IR，`SceneGraph` 决定可见层，`MediaScheduler` 管理解码预算/预取/释放，`EffectRenderer` 按 `t_us` 应用文字和媒体动画。视频 `currentTime` 不再反向修改时间线 |
+| 音频 | **两条路径不同**：MLT 内核的声音由服务端 `sdl2_audio` 混音后输出到本机喇叭（音频轨与画面片段自带原声都在图里，2026-10-14 修复了原声被漏掉的一条 lane；淡变与音量关键帧用 `volume` 滤镜近似）；浏览器回退只把"最底部那个可见 video"取消静音，`web/media.js` 的 `AudioScheduler` 还没接线，`audio_labels` 也只列音频轨片段 → 回退路径没有多轨混音 |
+| 播放 | **窗口驱动 + 状态机**：`PlaybackController` 只在有效窗口覆盖当前 `t_us` 时推进时钟；窗口请求使用 generation 丢弃旧结果，`FrameStore` 区分 point/window IR，`SceneGraph` 决定可见层，`MediaScheduler` 管理解码预算/预取/释放，`EffectRenderer` 按 `t_us` 应用文字和媒体动画。视频 `currentTime` 不再反向修改时间线。**MLT 内核模式下画面层与字幕层一律隐藏**（服务端帧里已经烧好 pango 字幕，叠着画会一句两遍，样式还不一致）；`POST /api/backend/open?longest=N` 让整条会话按预览尺寸编译（`TimelineModel.rescale`，几何等价），定格校验与 `export_match` 仍走全画幅 |
 | 播放开关的隐式写操作 | `t` 深链在被打开草稿后只做一次：`start()` 读的是模块加载时快照的 `deepLink`，因为 `openDraft`/`selectTimeline` 会把选中的 timeline 写回 `params` —— 若直接读 `params`，同一时间线会被选第二次，把刚建好的图层池 `clear()` 掉，表现为"按下播放有 1 帧空白" |
 | 蒙版 / LUT / curve_speed / 复合片段>2 层 | 不渲染，见 references |
 
