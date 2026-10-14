@@ -5,6 +5,14 @@ assets/generated/
 temp/
 test/
 
+# Test fixtures: a copied JianYing draft (hundreds of MB, private media references) and the
+# real export it gets compared against. Both live outside the repo — the draft copy sits in
+# the corpus, the export under the user state dir — and must never be staged from wherever
+# they happen to land. See docs/handoff/2026-10-13-export-match-fixture.md.
+fixtures/
+*jianying-draft-fixture*/
+*1012-1626-fixture/
+
 # Python.
 __pycache__/
 *.py[cod]
