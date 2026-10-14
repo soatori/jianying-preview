@@ -16,6 +16,13 @@ from .timeline import (AudioSpec, Clip, EffectSpec, FrameRate, MediaRef, Params,
                        Transform, Transition)
 
 
+# JianYing stores the 调节/美化 panel scalars as `materials.effects` entries carrying a single
+# -1..1 `value`. These kinds are pure per-pixel tone operations, so the adapter keeps the numbers
+# on the clip (Clip.grade) and lets the render backends express them with their own primitives.
+GRADE_KINDS = frozenset(("brightness", "contrast", "saturation", "temperature", "highlight",
+                         "shadow", "light_sensation", "smart_color_adjust", "clear", "sharpen"))
+
+
 def _dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
@@ -75,6 +82,46 @@ def _range(value: Any, name: str, warnings: list[str]) -> TimeRange:
     return TimeRange(max(start, 0), max(0, start + max(duration, 0) - max(start, 0)))
 
 
+def _sample_curve(nodes: Any, steps: int = 8) -> tuple[tuple[float, float], ...]:
+    """Turn JianYing's Bezier colour-curve nodes into sampled (x, y) points.
+
+    Each node carries an ``anchor`` plus ``left_control``/``right_control``; the segment
+    between two nodes is the cubic through ``right_control`` of the first and
+    ``left_control`` of the second. Coordinates are already normalised to 0..1.
+    """
+    items = [node for node in (nodes or []) if isinstance(node, dict)]
+    if len(items) < 2:
+        return ()
+
+    def point(node: dict, key: str) -> tuple[float, float] | None:
+        spot = _dict(node.get(key))
+        if "x" not in spot or "y" not in spot:
+            return None
+        return (_number(spot.get("x")), _number(spot.get("y")))
+
+    sampled: list[tuple[float, float]] = []
+    for first, second in zip(items, items[1:]):
+        start = point(first, "anchor")
+        end = point(second, "anchor")
+        handle_out = point(first, "right_control") or start
+        handle_in = point(second, "left_control") or end
+        if not (start and end and handle_out and handle_in):
+            continue
+        for index in range(steps):
+            t = index / steps
+            u = 1.0 - t
+            x = (u ** 3 * start[0] + 3 * u * u * t * handle_out[0]
+                 + 3 * u * t * t * handle_in[0] + t ** 3 * end[0])
+            y = (u ** 3 * start[1] + 3 * u * u * t * handle_out[1]
+                 + 3 * u * t * t * handle_in[1] + t ** 3 * end[1])
+            sampled.append((round(min(1.0, max(0.0, x)), 5), round(min(1.0, max(0.0, y)), 5)))
+    last = point(items[-1], "anchor")
+    if last:
+        sampled.append((round(min(1.0, max(0.0, last[0])), 5), round(min(1.0, max(0.0, last[1])), 5)))
+    sampled.sort(key=lambda pair: pair[0])
+    return tuple(sampled)
+
+
 class DraftAdapter:
     def __init__(self, config, registry, font_index, catalog, probe_cache):
         self.config = config
@@ -87,7 +134,12 @@ class DraftAdapter:
               timeline_info: dict[str, Any]) -> TimelineModel:
         return self._build(content, Path(draft_root), did, timeline_info, "", 0)
 
-    def _build(self, content, root, did, info, prefix, depth):
+    def _build(self, content, root, did, info, prefix, depth, base_root=None):
+        # ``##_draftpath_placeholder_<guid>_##/...`` means "the draft folder" -- for a
+        # compound clip the guid is still the *outer* draft, so nested material that points
+        # at the parent's Resources/ must be able to fall back to the outer root instead of
+        # only the subdraft folder.
+        base_root = Path(base_root) if base_root is not None else Path(root)
         warnings, tracks, transitions = [], [], []
         rate = _rate(content.value.get("fps"))
         if rate is None:
@@ -122,7 +174,7 @@ class DraftAdapter:
                 seen_clips.add(ident)
                 try:
                     clip, transition = self._clip(content, segment, kind, ident, root,
-                                                  did, (width, height), depth)
+                                                  did, (width, height), depth, base_root)
                 except (TypeError, ValueError, KeyError, AttributeError, OverflowError, OSError):
                     notes = ["clip_invalid"]
                     target = _range(segment.get("target_timerange"), "target", notes)
@@ -200,8 +252,14 @@ class DraftAdapter:
                            "reverse" if segment.get("reverse") else "forward",
                            "average_curve" if curve else "constant"), False
 
-    def _media(self, material, material_id, kind, root, warnings):
-        located = media.resolve(str(material.get("path") or ""), root)
+    def _media(self, material, material_id, kind, root, warnings, base_root=None):
+        raw = str(material.get("path") or "")
+        located = media.resolve(raw, root)
+        if (not located.get("exists") and base_root is not None
+                and Path(base_root) != Path(root)):
+            fallback = media.resolve(raw, base_root)
+            if fallback.get("exists"):
+                located = fallback
         path = str(located.get("path") or "")
         exists = bool(located.get("exists"))
         probe = {}
@@ -235,7 +293,8 @@ class DraftAdapter:
                         _rate(probe.get("frame_rate") or material.get("fps") or material.get("frame_rate")),
                         bool(has_audio) if has_audio is not None else None,
                         max(0, _integer(material.get("width") or probe.get("width"))),
-                        max(0, _integer(material.get("height") or probe.get("height")))), broken
+                        max(0, _integer(material.get("height") or probe.get("height"))),
+                        int(probe.get("rotation") or 0)), broken
 
     def _text(self, material, segment, canvas, warnings):
         width, height = canvas
@@ -273,7 +332,8 @@ class DraftAdapter:
                            _flatten(payload))
         return text, rect, payload["global_alpha"]
 
-    def _clip(self, content, segment, track_type, ident, root, did, canvas, depth):
+    def _clip(self, content, segment, track_type, ident, root, did, canvas, depth,
+              base_root=None):
         warnings = []
         target = _range(segment.get("target_timerange"), "target", warnings)
         found = content.material(segment.get("material_id"))
@@ -313,12 +373,25 @@ class DraftAdapter:
                 warnings.append("max_nest_depth")
                 placeholder = True
             elif isinstance(inner, dict):
-                draft_file = str(entry.get("draft_file_path") or material.get("draft_file_path") or "")
+                draft_file = str(entry.get("subdraft_entry", {}).get("draft_file_path")
+                                 or entry.get("draft_file_path")
+                                 or material.get("draft_file_path") or "")
+                # draft_file_path is itself a ##_draftpath_placeholder_<guid>_##/... reference.
+                # Path(draft_file).parent on the raw token yields a directory that does not
+                # exist, so every material inside the compound clip then resolves against a
+                # phantom root and reports media_missing -> placeholder tiles. Locate it with
+                # the same resolver media paths use before taking its parent.
+                if draft_file:
+                    located_file = media.resolve(draft_file, root)
+                    real_file = str(located_file.get("path") or "")
+                    if real_file:
+                        draft_file = real_file
                 child_root = Path(draft_file).parent if draft_file else root
                 if draft_file and not child_root.is_absolute():
                     child_root = root / child_root
                 try:
-                    nested = self._build(TimelineContent.build(inner), child_root, did, {}, ident, depth + 1)
+                    nested = self._build(TimelineContent.build(inner), child_root, did, {},
+                                         ident, depth + 1, base_root)
                 except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
                     warnings.append("nested_content_invalid")
                     placeholder = True
@@ -326,7 +399,8 @@ class DraftAdapter:
                 warnings.append("nested_content_missing")
                 placeholder = True
         elif kind in ("video", "image", "audio", "sticker"):
-            media_ref, broken = self._media(material, segment.get("material_id"), kind, root, warnings)
+            media_ref, broken = self._media(material, segment.get("material_id"), kind, root,
+                                            warnings, base_root)
             placeholder |= broken
             available = media_ref.available_range
             if kind in ("video", "audio") and available is not None and (
@@ -375,14 +449,36 @@ class DraftAdapter:
         if "volume" in audio_data:
             volume = max(0.0, _number(audio_data["volume"], volume))
         effects, animations = [], []
+        curves: dict[str, list[tuple[float, float]]] = {}
+        grade: dict[str, float] = {}
         for index, label in enumerate(resolved.get("labels") or []):
             label_bucket = label.get("bucket")
             if label_bucket in ("drafts", "speeds", "transitions", "material_animations"):
                 continue
-            effects.append(EffectSpec(f"{ident}/effect-{index}", str(label.get("kind") or label_bucket),
+            # A label's kind is chip metadata and must never be written back into `kind`: `kind` is
+            # this clip's MEDIA kind, and both audio gates decide by it -- the MLT lane in
+            # mlt_backend.py and evaluate() in model/timeline.py. Measured on the 1012-1626 fixture:
+            # every footage clip that carries a 智能调节/美颜 label came out as
+            # kind=`smart_color_adjust`/`makeup_root`, so it was refused an audio lane and the whole
+            # draft played with only the BGM track audible, even though the same clip's subdraft
+            # graph is audible on its own (peak 7181) and its media probes `audio_index=1`.
+            label_kind = str(label.get("kind") or label_bucket)
+            if label_bucket in ("effects", "video_effects") and label_kind in GRADE_KINDS:
+                # Keep the chip for the UI, but also carry the scalar so a backend can apply it.
+                grade[label_kind] = grade.get(label_kind, 0.0) + max(-1.0, min(1.0, _number(label.get("value"))))
+            effects.append(EffectSpec(f"{ident}/effect-{index}", label_kind,
                                       target, _flatten(label), False, ("effect_unsupported",)))
             warnings.append("effect_unsupported")
         for bucket_name, item in content.refs(segment):
+            if bucket_name == "color_curves" and isinstance(item, dict):
+                # JianYing stores the curve itself in the material (luma + per-channel Bezier
+                # nodes); only the *effect package* behind `path` is unavailable to us.
+                for channel, key in (("master", "luma"), ("red", "red"), ("green", "green"),
+                                     ("blue", "blue")):
+                    points = _sample_curve(item.get(key))
+                    if points:
+                        curves.setdefault(channel, []).extend(points)
+                continue
             if bucket_name == "material_animations":
                 for index, animation in enumerate(item.get("animations") or []):
                     if not isinstance(animation, dict):
@@ -407,4 +503,7 @@ class DraftAdapter:
                     tuple(effects), tuple(animations),
                     _integer(segment["render_index"]) if segment.get("render_index") is not None else None,
                     segment.get("visible") is not False and not label_only, nested,
-                    tuple(dict.fromkeys(warnings)), bool(placeholder)), resolved.get("transition")
+                    tuple(dict.fromkeys(warnings)), bool(placeholder),
+                    tuple((channel, tuple(sorted(set(points))))
+                          for channel, points in sorted(curves.items())),
+                    tuple((kind, round(value, 6)) for kind, value in sorted(grade.items()) if value)), resolved.get("transition")

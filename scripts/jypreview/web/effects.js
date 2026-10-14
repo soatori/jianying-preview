@@ -26,10 +26,38 @@ export function animationStateAt(layer, localUs) {
   return state;
 }
 
-export function applyTransform(node, css, state) {
-  if (!css || !css.transform) return;
-  let transform = css.transform;
+const SVG_NS = "http://www.w3.org/2000/svg";
+// layout.layer_geometry() emits `translate(cx-w/2, cy-h/2) rotate(d) [scale(±1,±1)]`; the
+// translate is positioning, everything after it is the layer's own rotation/flip.
+const PLACEMENT = /^translate\([^)]*\)\s*/;
+
+/** The node an animation belongs on, and whether its placement is already applied.
+ *
+ *  text.js bakes `translate(cx-w/2, cy-h/2)` into the SVG group it builds, and a nested caption's
+ *  holder div is full-canvas, so for both kinds the animation must go on the caption's own group.
+ *  Writing the layer's rect transform onto an already-placed node doubles the offset: a caption
+ *  whose box top-left is (200, 1350) painted at (400, 2679) and disappeared off a 1920-tall
+ *  canvas — 25 of the 37 captions in the fixture carry an in-animation, so most subtitles vanished. */
+export function animationTarget(entry) {
+  if (entry.kind === "text") return { node: entry.root, positioned: true };
+  if (entry.kind === "nested-text") {
+    const group = entry.root?.firstElementChild?.firstElementChild;
+    return { node: group || entry.root, positioned: true };
+  }
+  return { node: entry.root, positioned: false };
+}
+
+export function applyTransform(node, css, state, positioned = false) {
+  if (!node || !css || !css.transform) return;
+  // A placed node may only receive the layer's rotation/flip plus the animation; its translate
+  // is already in the DOM. SVG transform-origin resolves against the viewport by default, which
+  // would spin a caption around the canvas centre instead of its own glyphs.
+  let transform = positioned ? css.transform.replace(PLACEMENT, "") : css.transform;
   let opacity = css.opacity || "1";
+  if (positioned && node.namespaceURI === SVG_NS) {
+    node.style.transformBox = "fill-box";
+    node.style.transformOrigin = "center";
+  }
   if (state) {
     if (state.scale !== 1) transform += ` scale(${state.scale})`;
     if (state.translate_offset_px && (state.translate_offset_px[0] || state.translate_offset_px[1])) {
@@ -47,6 +75,11 @@ export function applyTransform(node, css, state) {
 
 export class EffectRenderer {
   render(entry, at, reset) {
+    if (!entry || !entry.root) {
+      // A layer without a mounted node has nothing to mark; the rest of the loop must not die on
+      // it, or one unmounted entry blanks the whole preview page.
+      return;
+    }
     const animation = entry.layer.animation;
     const labels = entry.layer.labels || [];
     const tiers = labels.map((label) => label.render_class).filter(Boolean);
@@ -62,7 +95,9 @@ export class EffectRenderer {
       const state = animation.render_class === "approx"
         ? animationStateAt(entry.layer, at.local) : null;
       if (state) {
-        applyTransform(entry.root, entry.layer.css || (entry.layer.rect || {}).css, state);
+        const target = animationTarget(entry);
+        applyTransform(target.node, entry.layer.css || (entry.layer.rect || {}).css, state,
+          target.positioned);
       } else {
         reset(entry);
         entry.root.dataset.effectStatus = animation.render_class === "exact"

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { MltPlaybackClient } from "../web/backend.js";
-import { EffectRenderer, animationStateAt } from "../web/effects.js";
+import { EffectRenderer, animationStateAt, animationTarget, applyTransform } from "../web/effects.js";
 import { AudioScheduler, audioSourceTimeAt } from "../web/media.js";
 import { LoadingController } from "../web/loading.js";
 
@@ -851,6 +851,27 @@ async function main() {
     new EffectRenderer().render({ layer, root: node, kind: "text" },
       { local: 50_000 }, () => {});
     assert.equal(node.dataset.renderClass, "approx");
+  }
+
+  {
+    // A caption group is already translated by text.js, so an animation may only add its own part.
+    // Re-applying the layer's rect translate doubled the offset: a box at (200, 1350) painted at
+    // (400, 2679) and vanished off a 1920-tall canvas -- 25 of the 37 fixture captions animate, so
+    // most subtitles were invisible. Media layers are placed by exactly that transform instead,
+    // and that path must not change.
+    const css = { transform: "translate(200px, 1350.58px) rotate(0deg)", opacity: "1" };
+    const layer = { css, animation: { start_us: 0, duration_us: 500_000,
+      render_class: "approx", approx: { impl: "zoom_in", from: 0.6, to: 1.4 } } };
+    const renderer = new EffectRenderer();
+    const group = { namespaceURI: "http://www.w3.org/2000/svg", dataset: {}, style: {} };
+    renderer.render({ layer, root: group, kind: "text" }, { local: 250_000 }, () => {});
+    assert.doesNotMatch(group.style.transform, /translate/, "caption must not be translated twice");
+    assert.match(group.style.transform, /scale\(/, "the animation part must still apply");
+    assert.equal(group.style.transformBox, "fill-box", "pivot on the glyphs, not the viewport");
+    const div = { namespaceURI: "http://www.w3.org/1999/xhtml", dataset: {}, style: {} };
+    renderer.render({ layer, root: div, kind: "media" }, { local: 250_000 }, () => {});
+    assert.match(div.style.transform, /^translate\(200px, 1350\.58px\)/,
+      "media layers are still placed by the layer transform");
   }
 
   {

@@ -10,7 +10,7 @@
 // decides per frame who is on screen. Cuts, subtitle changes and overlay swaps become
 // CSS toggles on nodes that already exist: no request, no reload, no black gap.
 import { textGroup } from "./text.js";
-import { EffectRenderer, applyTransform } from "./effects.js";
+import { EffectRenderer, animationTarget, applyTransform } from "./effects.js";
 import { SceneGraph } from "./scene.js";
 import { MediaScheduler } from "./media.js";
 
@@ -100,10 +100,19 @@ export class Stage {
     this.soundOn = !!on;
   }
 
+  /** A layer the native frame already contains: its picture *and* its baked pango caption.
+   *
+   *  Leaving the browser's text overlay up on top of the streamed frame paints the same subtitle
+   *  twice — once with the page's full styling, once flat inside the picture — which is what read
+   *  as "字幕效果预览异常" while the MLT backend was driving playback. */
+  hiddenInNative(entry) {
+    return entry.kind === "media" || entry.kind === "text" || entry.kind === "nested-text";
+  }
+
   setNativeMode(on) {
     this.nativeMode = !!on;
     for (const entry of this.flat) {
-      if (entry.kind === "media") {
+      if (this.hiddenInNative(entry)) {
         entry.root.style.display = this.nativeMode ? "none" : (entry.visible ? "" : "none");
         entry.root.style.visibility = this.nativeMode ? "hidden" : (entry.visible ? "visible" : "hidden");
       }
@@ -422,7 +431,7 @@ export class Stage {
     }
     if (this.nativeMode) {
       for (const entry of this.flat) {
-        if (entry.kind === "media") {
+        if (this.hiddenInNative(entry)) {
           entry.root.style.display = "none";
           entry.root.style.visibility = "hidden";
         }
@@ -437,7 +446,9 @@ export class Stage {
   }
 
   resetTransform(entry) {
-    applyTransform(entry.root, entry.layer.css || (entry.layer.rect && entry.layer.rect.css) || {}, null);
+    const target = animationTarget(entry);
+    applyTransform(target.node,
+      entry.layer.css || (entry.layer.rect && entry.layer.rect.css) || {}, null, target.positioned);
   }
 
   /** A visible video plays from its trimmed in-point; a hidden one is parked.
