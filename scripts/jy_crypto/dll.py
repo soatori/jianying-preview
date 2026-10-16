@@ -3,16 +3,16 @@
 Black-box usage only: we enumerate the export table and call what JianYing
 ships. No cipher is implemented, inferred, or reproduced here.
 
-Two call surfaces, preferred in this order:
-
-1. path API   -- static exports taking ``const char*`` and returning ``int``
-                 (``isFileEncrypted`` / ``decryptFile`` / ``encryptFile``).
-                 Simplest ABI, so least to get wrong.
-2. memory API -- member exports speaking MSVC x64 ``std::string``
-                 (``decrypt`` / ``encrypt`` / ``enable``). Fallback.
+The only verified call surface is the member ``std::string`` API
+(``decrypt`` / ``encrypt`` / ``enable`` under ``EncryptUtils@lvve``). The static
+path-level exports (``decryptFile`` / ``encryptFile`` / ``isFileEncrypted``)
+produced 0 bytes in every one of the 8 probed variants, and passing a draft path
+to an export whose parameter direction is unverified is the one way this layer
+could write into a draft, so they are not bound here at all (see
+``docs/evidence/crypto-probe-log.md`` and U-16).
 
 Every result must pass the round-trip gates in ``gate.py`` before it is
-trusted. A failed probe writes nothing.
+trusted.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import ctypes
 import glob
 import os
 import re
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,8 +124,8 @@ def discover_dll() -> Path:
         try:
             if PEExports(path).find(_FAMILY):
                 return path
-        except (NotADirectoryError, OSError, ValueError):
-            continue
+        except (OSError, ValueError, struct.error):
+            continue  # a malformed or unreadable image must not abort discovery
     raise CryptoUnavailable(
         "No videoeditor.dll exposing " + _FAMILY + " was found. "
         "Set JIANYING_VIDEOEDITOR_DLL to an exact path."
@@ -168,15 +169,11 @@ class StdString(ctypes.Structure):
 
 @dataclass
 class Symbols:
-    """Resolved export names, discovered by pattern rather than hardcoded."""
+    """Resolved memory-API export names, discovered by pattern rather than hardcoded."""
 
-    path_is_encrypted: str | None = None
-    path_decrypt: list[str] = None
-    path_encrypt: list[str] = None
     mem_decrypt: list[str] = None
     mem_encrypt: str | None = None
     mem_enable: str | None = None
-    mem_is_enable: str | None = None
 
     @classmethod
     def resolve(cls, exports: PEExports) -> "Symbols":
@@ -188,13 +185,9 @@ class Symbols:
             return exports.find(_FAMILY, *fragments)
 
         return cls(
-            path_is_encrypted=one("?isFileEncrypted@") or one("isFileEncrypted"),
-            path_decrypt=many("?decryptFile@") or many("decryptFile"),
-            path_encrypt=many("?encryptFile@") or many("encryptFile"),
             mem_decrypt=many("?decrypt@"),
             mem_encrypt=one("?encrypt@"),
             mem_enable=one("?enable@"),
-            mem_is_enable=one("?isEnable@"),
         )
 
 
@@ -240,38 +233,6 @@ class DllCrypto:
             self._fns[key] = proto(self._address(symbol))
         return self._fns[key]
 
-    # ---- path API -------------------------------------------------------
-
-    def is_file_encrypted(self, path: str | Path) -> bool:
-        sym = self.symbols.path_is_encrypted
-        if not sym:
-            raise CryptoUnavailable("isFileEncrypted export not present")
-        proto = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_char_p)
-        return bool(self._fn("is_file_encrypted", sym, proto)(str(path).encode("utf-8")))
-
-    def decrypt_file(self, src: str | Path, dst: str | Path, extra: bytes = b"") -> int:
-        """Call the static path-level decrypt. Returns the export's int status."""
-        candidates = [s for s in (self.symbols.path_decrypt or []) if "Stream" not in s and "Bytes" not in s]
-        if not candidates:
-            raise CryptoUnavailable("decryptFile export not present")
-        proto = ctypes.CFUNCTYPE(
-            ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p
-        )
-        return self._fn("decrypt_file", candidates[0], proto)(
-            str(src).encode("utf-8"), str(dst).encode("utf-8"), extra
-        )
-
-    def encrypt_file(self, src: str | Path, dst: str | Path, extra: bytes = b"") -> int:
-        candidates = self.symbols.path_encrypt or []
-        if not candidates:
-            raise CryptoUnavailable("encryptFile export not present")
-        proto = ctypes.CFUNCTYPE(
-            ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p
-        )
-        return self._fn("encrypt_file", candidates[0], proto)(
-            str(src).encode("utf-8"), str(dst).encode("utf-8"), extra
-        )
-
     # ---- memory API -----------------------------------------------------
 
     def _enable(self, on: bool) -> None:
@@ -280,69 +241,6 @@ class DllCrypto:
             return
         proto = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_bool)
         self._fn("enable", sym, proto)(None, on)
-
-    def is_enabled(self) -> bool | None:
-        sym = self.symbols.mem_is_enable
-        if not sym:
-            return None
-        proto = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p)
-        return bool(self._fn("is_enable", sym, proto)(None))
-
-    def enable(self, on: bool) -> None:
-        self._enable(on)
-
-    def probe_path_api(self, src: str | Path, out_dir: str | Path, extras: tuple[bytes, ...] = (b"", b"{}")) -> list[dict]:
-        """Bounded black-box probe of the static path-level exports.
-
-        Tries enable(True) first, then each argument order and each extra-arg
-        value, writing to a distinct output file. Reports status codes and
-        output sizes only -- never trusts a variant that did not produce JSON.
-        """
-        out_dir = Path(out_dir)
-        trials: list[dict] = []
-        for state in (False, True):
-            self._enable(state)
-            enabled = self.is_enabled()
-            if self.symbols.path_is_encrypted:
-                proto = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_char_p)
-                fn = self._fn("is_file_encrypted", self.symbols.path_is_encrypted, proto)
-                trials.append(
-                    {
-                        "probe": "isFileEncrypted",
-                        "enable": state,
-                        "is_enabled": enabled,
-                        "value": bool(fn(str(src).encode("utf-8"))),
-                    }
-                )
-            candidates = [s for s in (self.symbols.path_decrypt or []) if "Stream" not in s and "Bytes" not in s]
-            if not candidates:
-                continue
-            proto = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p)
-            fn = self._fn("decrypt_file", candidates[0], proto)
-            for extra in extras:
-                for order in ("src_dst", "dst_src"):
-                    dst = out_dir / f"variant-e{state}-x{len(extra)}-{order}.out"
-                    args = (str(src), str(dst)) if order == "src_dst" else (str(dst), str(src))
-                    status = fn(args[0].encode("utf-8"), args[1].encode("utf-8"), extra)
-                    size = dst.stat().st_size if dst.exists() else 0
-                    head = b""
-                    if size:
-                        with dst.open("rb") as handle:
-                            head = handle.read(1)
-                    trials.append(
-                        {
-                            "probe": "decryptFile",
-                            "enable": state,
-                            "is_enabled": enabled,
-                            "extra": extra.decode("utf-8", "replace"),
-                            "order": order,
-                            "status": status,
-                            "out_size": size,
-                            "looks_like_json": head == b"{",
-                            "dst": str(dst),
-                        }
-                    )
-        return trials
 
     def _mem_decrypt(self, symbol: str, data: bytes, with_flag: bool) -> bytes:
         source, keep_src = StdString.wrap(data)
@@ -412,7 +310,6 @@ def report(dll_path: str | Path | None = None) -> dict:
     symbols = Symbols.resolve(exports)
     return {
         "dll": str(path),
-        "sha256": None,
         "size": path.stat().st_size,
         "export_count": len(exports.names),
         "family_exports": exports.find(_FAMILY),

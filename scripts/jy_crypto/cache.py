@@ -15,10 +15,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMP_ROOT = REPO_ROOT / "temp"
 
-_DEFAULT_DRAFT_ROOTS = (
-    r"D:\JianyingPro\JianyingPro Drafts",
-    r"C:\Users\11\AppData\Local\JianyingPro\JianyingPro Drafts",
-)
+def _default_draft_roots() -> list[str]:
+    """Derive rather than hardcode: this machine keeps the corpus behind a junction."""
+    roots = [r"D:\JianyingPro\JianyingPro Drafts"]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(str(Path(local) / "JianyingPro" / "JianyingPro Drafts"))
+    return roots
+
+
+_DEFAULT_DRAFT_ROOTS = tuple(_default_draft_roots())
 _DEFAULT_INSTALL_ROOTS = (
     r"D:\Program Files\JianyingPro",
     r"C:\Program Files\JianyingPro",
@@ -30,9 +36,15 @@ class WriteFenceError(RuntimeError):
 
 
 def _roots(env_var: str, defaults: tuple[str, ...]) -> list[Path]:
+    """Resolved, order-preserving unique roots.
+
+    Deduplicating after ``resolve()`` is what keeps a junction or a symlinked
+    profile from presenting the same corpus as two roots and making callers
+    walk it twice.
+    """
     override = os.environ.get(env_var, "").strip()
     values = [override] if override else list(defaults)
-    return [Path(v).resolve() for v in values if v]
+    return list(dict.fromkeys(Path(v).resolve() for v in values if v))
 
 
 def draft_roots() -> list[Path]:
@@ -68,11 +80,6 @@ def assert_scratch_target(target: str | Path) -> Path:
         raise WriteFenceError(f"scratch output must live under {TEMP_ROOT}: {path}") from None
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def assert_read_only_source(source: str | Path) -> Path:
-    """Sources may be anywhere; we only ever open them for reading."""
-    return Path(source)
 
 
 def content_key(data: bytes) -> str:

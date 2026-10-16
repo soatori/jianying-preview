@@ -6,6 +6,7 @@ instead of hardcoding mangled strings that drift between JianYing versions.
 
 from __future__ import annotations
 
+import mmap
 import struct
 from pathlib import Path
 
@@ -21,15 +22,16 @@ class NotAPEFile(ValueError):
 
 
 class PEExports:
-    """Export names of a PE image, read without loading it."""
+    """Export names of a PE image, read without loading it.
+
+    Mapped rather than slurped: the shipped DLL is tens of megabytes and we only
+    ever touch the headers plus the export directory inside them.
+    """
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
-        data = self.path.read_bytes()
-        self.names = tuple(self._read_names(data))
-        self.name_to_ordinal = {
-            name: ordinal for ordinal, name in enumerate(self.names)
-        }
+        with self.path.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            self.names = tuple(self._read_names(data))
 
     def find(self, *fragments: str) -> list[str]:
         """Names containing every fragment (case-sensitive, as exported)."""
@@ -80,7 +82,9 @@ class PEExports:
         for i in range(num_names):
             (str_rva,) = struct.unpack_from("<I", data, names_at + i * 4)
             at = self._rva_to_offset(sections, str_rva)
-            end = data.index(b"\0", at)
+            end = data.find(b"\0", at)
+            if end < 0:
+                raise NotAPEFile(f"{self.path}: export name at {at:#x} is not NUL-terminated")
             out.append(data[at:end].decode("ascii", "replace"))
         return out
 

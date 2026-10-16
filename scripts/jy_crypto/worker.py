@@ -27,28 +27,11 @@ def _run_op(crypto_holder: list, op: dict) -> dict:
     kind = op["op"]
 
     if kind == "report":
-        info = report(op.get("dll"))
-        info.pop("sha256", None)
-        return {"op": kind, "ok": True, **info}
+        return {"op": kind, "ok": True, **report(op.get("dll"))}
 
     if not crypto_holder:
         crypto_holder.append(DllCrypto(op.get("dll")))
     crypto = crypto_holder[0]
-
-    if kind == "is_encrypted":
-        return {"op": kind, "ok": True, "src": op["src"], "value": crypto.is_file_encrypted(op["src"])}
-
-    if kind == "path_probe":
-        out_dir = assert_scratch_target(Path(op["out_dir"]) / ".keep").parent
-        trials = crypto.probe_path_api(op["src"], out_dir)
-        return {"op": kind, "ok": True, "src": op["src"], "trials": trials}
-
-    if kind in ("decrypt_file", "encrypt_file"):
-        dst = assert_scratch_target(op["dst"])
-        fn = crypto.decrypt_file if kind == "decrypt_file" else crypto.encrypt_file
-        status = fn(op["src"], dst, op.get("extra", "").encode("utf-8"))
-        produced = dst.stat().st_size if dst.exists() else 0
-        return {"op": kind, "ok": True, "status": status, "dst": str(dst), "dst_size": produced}
 
     if kind in ("decrypt_bytes", "encrypt_bytes"):
         dst = assert_scratch_target(op["dst"])

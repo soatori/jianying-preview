@@ -6,7 +6,8 @@ Two jobs:
    behind the measurements.
 2. extra measurement for structures the spec currently lacks: what buckets a
    segment's extra_material_refs actually points at, the shape of a keyframe
-   record, and the shape of responsive_layout (99.8% of segments carry it).
+   record, and the shape of responsive_layout (which comes in two forms - an
+   empty object and an all-default five-key object; see corpus_scan field_states).
 
 Read-only over temp/corpus-scan. Output: temp/spec-audit/ + a printed summary.
 
@@ -90,7 +91,15 @@ def measure_structures() -> dict:
         if not key or key in seen:
             continue
         seen.add(key)
-        src = pathlib.Path(entry["path"]) if entry.get("encoding") == "plain" else SCAN / "plain" / f"{key}.json"
+        # Prefer the frozen snapshot written by corpus_scan so the audit and the
+        # first/second-level tables describe the same bytes.
+        frozen = SCAN / "plain" / f"{key}.json"
+        if frozen.exists():
+            src = frozen
+        elif entry.get("encoding") == "plain":
+            src = pathlib.Path(entry["path"])
+        else:
+            continue
         if not src.exists():
             continue
         try:
