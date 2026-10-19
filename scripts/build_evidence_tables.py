@@ -76,6 +76,8 @@ def main() -> int:
     write("transitions_top60.csv", ["name", "id", "category", "count"],
           [[*entry["value"], entry["count"]] for entry in stats["transitions"]][:60])
 
+    check_flag_carriers()
+
     for name, source in COPIES.items():
         if not source.exists():
             print(f"  !! {name}: 源头不存在（{source}）——先跑对应的扫描脚本")
@@ -84,6 +86,51 @@ def main() -> int:
         rows = len(source.read_text(encoding="utf-8").splitlines()) - 1
         print(f"  {name}: {rows} rows (copied verbatim)")
     return 0
+
+
+def check_flag_carriers() -> None:
+    """Cross-tab check_flag bits against the text style carriers (F-029)."""
+    plain = SCAN / "plain"
+    if not plain.is_dir():
+        print("  !! check_flag_carriers.csv: 没有冻结明文（先跑 corpus_scan）")
+        return
+    tab: dict[tuple, int] = {}
+    for path in sorted(plain.glob("*.json")):
+        try:
+            content = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for material in (content.get("materials") or {}).get("texts", []) or []:
+            flag = material.get("check_flag") if isinstance(material, dict) else None
+            if not isinstance(flag, int):
+                continue
+            try:
+                styles = (json.loads(material.get("content") or "{}").get("styles") or [{}])
+                style = styles[0] if styles else {}
+            except Exception:
+                style = {}
+
+            def state(key: str) -> str:
+                if key not in style:
+                    return "absent"
+                value = style[key]
+                if not isinstance(value, list):
+                    return "other"
+                return "filled" if value else "empty"
+
+            strokes, shadows = state("strokes"), state("shadows")
+            has_shadow = material.get("has_shadow", "absent")
+            for bit in (1, 2, 4, 8, 16, 32, 64):
+                set_bit = bool(flag & bit)
+                for carrier, value in (("strokes", strokes), ("shadows", shadows),
+                                       ("has_shadow", has_shadow)):
+                    key = ("check_flag_bit", f"bit{bit}", f"{carrier}.{value}", set_bit)
+                    tab[key] = tab.get(key, 0) + 1
+            key = ("has_shadow_vs_carrier", str(has_shadow), f"shadows.{shadows}", "")
+            tab[key] = tab.get(key, 0) + 1
+    write("check_flag_carriers.csv", ["measure", "bit_or_key", "carrier_state", "flag_set", "count"],
+          [[*k, v] for k, v in sorted(tab.items())])
+    print(f"  check_flag_carriers.csv: {len(tab)} rows")
 
 
 if __name__ == "__main__":
