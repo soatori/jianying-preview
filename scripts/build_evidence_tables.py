@@ -13,8 +13,10 @@ Usage:
 """
 from __future__ import annotations
 
+import collections
 import csv
 import json
+from functools import cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +57,7 @@ def counter_pairs(counter: dict):
     return sorted(counter.items(), key=lambda kv: -kv[1])
 
 
+@cache
 def frozen_contents() -> list[tuple[str, dict]]:
     """The manifest's distinct contents only -- and why that filter exists.
 
@@ -105,6 +108,7 @@ def main() -> int:
 
     check_flag_carriers()
     alignment_by_version()
+    position_quantum()
 
     for name, source in COPIES.items():
         if not source.exists():
@@ -210,6 +214,59 @@ def alignment_by_version() -> None:
     for version in sorted(per, key=lambda v: (era(v), -per[v]["texts"])):
         emit(era(version), version, per[version])
     write("alignment_by_version.csv", header, rows)
+
+
+def position_quantum() -> None:
+    """Is clip position a quantised UI pixel, and per which divisor (F-032)?
+
+    For each (track type, axis, canvas size) report how many stored values land
+    exactly on an integer when multiplied by the axis' own canvas length, by the
+    other axis, or by a fixed 1920 - plus the most common recovered pixel value.
+    """
+    contents = frozen_contents()
+    if not contents:
+        print("  !! position_quantum.csv: 没有冻结明文（先跑 corpus_scan）")
+        return
+    buckets: dict[tuple, dict] = {}
+    for _key, content in contents:
+        canvas = content.get("canvas_config") or {}
+        width, height = canvas.get("width") or 0, canvas.get("height") or 0
+        if not width or not height:
+            continue
+        for track in content.get("tracks") or []:
+            ttype = str(track.get("type") or "?")
+            for segment in track.get("segments") or []:
+                clip = segment.get("clip")
+                transform = clip.get("transform") if isinstance(clip, dict) else None
+                if not isinstance(transform, dict):
+                    continue
+                for axis, own, other in (("x", float(width), float(height)), ("y", float(height), float(width))):
+                    value = transform.get(axis)
+                    if not isinstance(value, (int, float)) or value == 0:
+                        continue
+                    row = buckets.setdefault((ttype, axis, f"{int(width)}x{int(height)}"),
+                                             {"n": 0, "own": 0, "other": 0, "d1920": 0, "px": collections.Counter()})
+                    row["n"] += 1
+                    scaled = value * own
+                    if abs(scaled - round(scaled)) <= 1e-9:
+                        row["own"] += 1
+                        row["px"][int(round(scaled))] += 1
+                    if abs(value * other - round(value * other)) <= 1e-9:
+                        row["other"] += 1
+                    if abs(value * 1920.0 - round(value * 1920.0)) <= 1e-9:
+                        row["d1920"] += 1
+    rows = []
+    for (ttype, axis, canvas), row in sorted(buckets.items(), key=lambda kv: -kv[1]["n"]):
+        if row["n"] < 40:
+            continue
+        modal = row["px"].most_common(1)
+        rows.append([ttype, axis, canvas, row["n"],
+                     f"{row['own'] / row['n']:.4f}", f"{row['other'] / row['n']:.4f}",
+                     f"{row['d1920'] / row['n']:.4f}",
+                     modal[0][0] if modal else "", modal[0][1] if modal else ""])
+    write("position_quantum.csv",
+          ["track_type", "axis", "canvas", "nonzero_values", "integer_at_own_axis",
+           "integer_at_other_axis", "integer_at_1920", "modal_pixel", "modal_pixel_count"], rows)
 
 
 if __name__ == "__main__":
