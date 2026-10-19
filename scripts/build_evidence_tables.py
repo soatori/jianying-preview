@@ -109,6 +109,7 @@ def main() -> int:
     check_flag_carriers()
     alignment_by_version()
     position_quantum()
+    font_size_mirror()
 
     for name, source in COPIES.items():
         if not source.exists():
@@ -214,6 +215,38 @@ def alignment_by_version() -> None:
     for version in sorted(per, key=lambda v: (era(v), -per[v]["texts"])):
         emit(era(version), version, per[version])
     write("alignment_by_version.csv", header, rows)
+
+
+def font_size_mirror() -> None:
+    """Is texts.font_size a trustworthy mirror of styles[].size (F-034)?"""
+    contents = frozen_contents()
+    if not contents:
+        print("  !! font_size_mirror.csv: 没有冻结明文（先跑 corpus_scan）")
+        return
+    tab: collections.Counter = collections.Counter()
+    for _key, content in contents:
+        for material in (content.get("materials") or {}).get("texts", []) or []:
+            try:
+                styles = (json.loads(material.get("content") or "{}").get("styles")) or []
+            except Exception:
+                styles = []
+            sizes = [s.get("size") for s in styles if isinstance(s, dict)
+                     and isinstance(s.get("size"), (int, float))]
+            tab[("styles 段数", "多段" if len(styles) > 1 else "单段/无", "")] += 1
+            if "font_size" not in material:
+                tab[("font_size", "键缺席", "styles.size 有" if sizes else "styles.size 无")] += 1
+                continue
+            if not sizes:
+                tab[("font_size", "有键", "styles.size 无")] += 1
+                continue
+            flag = float(material["font_size"])
+            if any(abs(flag - float(size)) < 1e-6 for size in sizes):
+                which = "等于 styles[0]" if abs(flag - float(sizes[0])) < 1e-6 else "等于其它段"
+            else:
+                which = "与所有段都不等"
+            tab[("font_size", which, "")] += 1
+    write("font_size_mirror.csv", ["measure", "state", "detail", "count"],
+          [[*k, v] for k, v in sorted(tab.items())])
 
 
 def position_quantum() -> None:
