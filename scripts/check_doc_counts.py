@@ -22,7 +22,7 @@ DOCS = ROOT / "docs"
 EVIDENCE_FILES = [ROOT / "temp" / "corpus-scan" / "stats.json"]
 EVIDENCE_DIRS = [ROOT / "temp" / "corpus-scan" / "csv", ROOT / "temp" / "corpus-detail",
                 ROOT / "temp" / "spec-audit", DOCS / "evidence" / "tables"]
-PROBE_DIR = ROOT / "temp" / "check-1016"
+PROBE_DIRS = [ROOT / "temp" / "check-1016", ROOT / "temp" / "px-probe"]
 NUMBER = re.compile(r"(?<![\d.])(\d{1,3}(?:,\d{3})*|\d+)(?![\d.])")
 KEYED = re.compile(r"(count:\s*|次数?|出现|共|计|达)?\s*\d")
 CITE = re.compile(r"(count:\s*[\d,]+|\d[\d,]*\s*(?:次|条|份|个|行|对|批|种|点))")
@@ -50,7 +50,7 @@ def evidence_numbers() -> set[int]:
     for path in EVIDENCE_FILES:
         if path.exists():
             walk(json.loads(path.read_text(encoding="utf-8")))
-    for folder in EVIDENCE_DIRS + [PROBE_DIR]:
+    for folder in EVIDENCE_DIRS + PROBE_DIRS:
         if not folder.is_dir():
             continue
         for path in sorted(folder.glob("*.csv")) + sorted(folder.glob("*.txt")) + sorted(folder.glob("*.json")):
