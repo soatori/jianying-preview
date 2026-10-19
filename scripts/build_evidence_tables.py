@@ -55,6 +55,33 @@ def counter_pairs(counter: dict):
     return sorted(counter.items(), key=lambda kv: -kv[1])
 
 
+def frozen_contents() -> list[tuple[str, dict]]:
+    """The manifest's distinct contents only -- and why that filter exists.
+
+    plain/ accumulates every ad-hoc decryption ever done (11.6.0 differential
+    samples, the all-styles draft), so a raw glob over-counts stats.json's basis
+    by 28 contents / 814 text materials (F-030). Derived tables must not mix
+    constructed samples into usage frequency.
+    """
+    plain = SCAN / "plain"
+    if not plain.is_dir():
+        return []
+    manifest = json.loads((SCAN / "manifest.json").read_text(encoding="utf-8"))
+    keys = {rec["key"] for rec in manifest if rec.get("key")}
+    rows: list[tuple[str, dict]] = []
+    stray = 0
+    for path in sorted(plain.glob("*.json")):
+        if path.stem not in keys:
+            stray += 1
+            continue
+        try:
+            rows.append((path.stem, json.loads(path.read_text(encoding="utf-8"))))
+        except Exception:
+            continue
+    print(f"  冻结明文 {len(rows)} 份参与统计（已排除 {stray} 份非本快照的残留明文）")
+    return rows
+
+
 def main() -> int:
     stats = json.loads((SCAN / "stats.json").read_text(encoding="utf-8"))
 
@@ -77,6 +104,7 @@ def main() -> int:
           [[*entry["value"], entry["count"]] for entry in stats["transitions"]][:60])
 
     check_flag_carriers()
+    alignment_by_version()
 
     for name, source in COPIES.items():
         if not source.exists():
@@ -90,16 +118,12 @@ def main() -> int:
 
 def check_flag_carriers() -> None:
     """Cross-tab check_flag bits against the text style carriers (F-029)."""
-    plain = SCAN / "plain"
-    if not plain.is_dir():
+    contents = frozen_contents()
+    if not contents:
         print("  !! check_flag_carriers.csv: 没有冻结明文（先跑 corpus_scan）")
         return
     tab: dict[tuple, int] = {}
-    for path in sorted(plain.glob("*.json")):
-        try:
-            content = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+    for _key, content in contents:
         for material in (content.get("materials") or {}).get("texts", []) or []:
             flag = material.get("check_flag") if isinstance(material, dict) else None
             if not isinstance(flag, int):
@@ -131,6 +155,61 @@ def check_flag_carriers() -> None:
     write("check_flag_carriers.csv", ["measure", "bit_or_key", "carrier_state", "flag_set", "count"],
           [[*k, v] for k, v in sorted(tab.items())])
     print(f"  check_flag_carriers.csv: {len(tab)} rows")
+
+
+def alignment_by_version() -> None:
+    """texts.alignment encodings split by the saving app version (F-030/U-30)."""
+    contents = frozen_contents()
+    if not contents:
+        print("  !! alignment_by_version.csv: 没有冻结明文（先跑 corpus_scan）")
+        return
+    per: dict[str, dict[str, int]] = {}
+    for _key, content in contents:
+        texts = (content.get("materials") or {}).get("texts") or []
+        if not texts:
+            continue
+        version = str((content.get("last_modified_platform") or {}).get("app_version", "<none>"))
+        row = per.setdefault(version, {"drafts": 0, "texts": 0, "absent": 0, "other": 0,
+                                       "a0": 0, "a1": 0, "a2": 0, "a3": 0, "a4": 0})
+        row["drafts"] += 1
+        for material in texts:
+            row["texts"] += 1
+            if "alignment" not in material:
+                row["absent"] += 1
+                continue
+            bucket = {0: "a0", 1: "a1", 2: "a2", 3: "a3", 4: "a4"}.get(material["alignment"])
+            row["other" if bucket is None else bucket] += 1
+
+    def era(version: str) -> str:
+        try:
+            parts = [int(x) for x in version.split(".")[:2]]
+        except ValueError:
+            return "unknown"
+        return "<=8.0" if (parts[0], parts[1]) <= (8, 0) else ">=8.7"
+
+    totals: dict[str, dict[str, int]] = {}
+    for version, row in per.items():
+        agg = totals.setdefault(era(version), dict.fromkeys(row, 0))
+        for field, value in row.items():
+            agg[field] += value
+
+    header = ["era", "app_version", "drafts_with_texts", "texts", "absent", "alignment_0",
+              "alignment_1", "alignment_2", "alignment_3", "alignment_4", "other_value",
+              "share_of_keyed_is_1"]
+    rows = []
+
+    def emit(era_name: str, version: str, row: dict) -> None:
+        keyed = row["texts"] - row["absent"]
+        share = f"{row['a1'] / keyed:.4f}" if keyed else ""
+        rows.append([era_name, version, row["drafts"], row["texts"], row["absent"], row["a0"],
+                     row["a1"], row["a2"], row["a3"], row["a4"], row["other"], share])
+
+    for era_name in ("<=8.0", ">=8.7", "unknown"):
+        if era_name in totals:
+            emit(era_name, "(汇总)", totals[era_name])
+    for version in sorted(per, key=lambda v: (era(v), -per[v]["texts"])):
+        emit(era(version), version, per[version])
+    write("alignment_by_version.csv", header, rows)
 
 
 if __name__ == "__main__":

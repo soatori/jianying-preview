@@ -20,7 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
 EVIDENCE_FILES = [ROOT / "temp" / "corpus-scan" / "stats.json"]
-EVIDENCE_DIRS = [ROOT / "temp" / "corpus-scan" / "csv", ROOT / "temp" / "corpus-detail", ROOT / "temp" / "spec-audit"]
+EVIDENCE_DIRS = [ROOT / "temp" / "corpus-scan" / "csv", ROOT / "temp" / "corpus-detail",
+                ROOT / "temp" / "spec-audit", DOCS / "evidence" / "tables"]
 PROBE_DIR = ROOT / "temp" / "check-1016"
 NUMBER = re.compile(r"(?<![\d.])(\d{1,3}(?:,\d{3})*|\d+)(?![\d.])")
 KEYED = re.compile(r"(count:\s*|次数?|出现|共|计|达)?\s*\d")
