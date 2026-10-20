@@ -19,7 +19,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
-EVIDENCE_FILES = [ROOT / "temp" / "corpus-scan" / "stats.json"]
+EVIDENCE_FILES = [ROOT / "temp" / "corpus-scan" / "stats.json",
+                  ROOT / "temp" / "corpus-scan" / "manifest.json"]   # manifest 带目录级/文件级布局归属
 EVIDENCE_DIRS = [ROOT / "temp" / "corpus-scan" / "csv", ROOT / "temp" / "corpus-detail",
                 ROOT / "temp" / "spec-audit", DOCS / "evidence" / "tables"]
 PROBE_DIRS = [ROOT / "temp" / "check-1016", ROOT / "temp" / "px-probe"]
