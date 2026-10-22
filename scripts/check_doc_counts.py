@@ -19,11 +19,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
-EVIDENCE_FILES = [ROOT / "temp" / "corpus-scan" / "stats.json",
-                  ROOT / "temp" / "corpus-scan" / "manifest.json"]   # manifest 带目录级/文件级布局归属
-EVIDENCE_DIRS = [ROOT / "temp" / "corpus-scan" / "csv", ROOT / "temp" / "corpus-detail",
-                ROOT / "temp" / "spec-audit", DOCS / "evidence" / "tables"]
-PROBE_DIRS = [ROOT / "temp" / "check-1016", ROOT / "temp" / "px-probe"]
+# Every corpus snapshot on the machine is tie-able: the r3 baseline lives in
+# corpus-scan/, and the 2026-10-22 legs (drift control, both-roots) sit beside it.
+# A quoted number is only honest if the run it came from is still on disk.
+CORPUS_SNAPSHOTS = sorted((ROOT / "temp").glob("corpus-scan*"))
+EVIDENCE_FILES = [path for folder in CORPUS_SNAPSHOTS
+                  for path in (folder / "stats.json", folder / "manifest.json") if path.is_file()]
+EVIDENCE_DIRS = [folder / "csv" for folder in CORPUS_SNAPSHOTS if (folder / "csv").is_dir()]
+EVIDENCE_DIRS += [ROOT / "temp" / "corpus-detail",
+                  ROOT / "temp" / "spec-audit", DOCS / "evidence" / "tables"]
+PROBE_DIRS = [ROOT / "temp" / "check-1016", ROOT / "temp" / "px-probe",
+              ROOT / "temp" / "playback-test", ROOT / "temp" / "rea-native"]
 NUMBER = re.compile(r"(?<![\d.])(\d{1,3}(?:,\d{3})*|\d+)(?![\d.])")
 KEYED = re.compile(r"(count:\s*|次数?|出现|共|计|达)?\s*\d")
 CITE = re.compile(r"(count:\s*[\d,]+|\d[\d,]*\s*(?:次|条|份|个|行|对|批|种|点))")

@@ -38,12 +38,13 @@ class WriteFenceError(RuntimeError):
 def _roots(env_var: str, defaults: tuple[str, ...]) -> list[Path]:
     """Resolved, order-preserving unique roots.
 
-    Deduplicating after ``resolve()`` is what keeps a junction or a symlinked
-    profile from presenting the same corpus as two roots and making callers
-    walk it twice.
+    The override is ``os.pathsep``-separated, so one run can cover every draft
+    root the machine actually has. ``resolve()`` before deduplication is what
+    keeps a junction or a symlinked profile from presenting the same corpus as
+    two roots and making callers walk it twice.
     """
     override = os.environ.get(env_var, "").strip()
-    values = [override] if override else list(defaults)
+    values = [v.strip() for v in override.split(os.pathsep)] if override else list(defaults)
     return list(dict.fromkeys(Path(v).resolve() for v in values if v))
 
 
