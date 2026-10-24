@@ -39,6 +39,13 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from render_frame import FF, collect  # noqa: E402
+# Windows 控制台是 GBK：读数里带中文/箭头/替换符时 print 会在最后一步抛错，
+# 把已经算完的结果整个吞掉（本轮自己的统计工具就栽过一次）。只改错误处理策略，不改编码。
+try:
+    sys.stdout.reconfigure(errors="replace")     # type: ignore[attr-defined]
+    sys.stderr.reconfigure(errors="replace")     # type: ignore[attr-defined]
+except Exception:                                 # noqa: BLE001
+    pass
 
 
 def extract_oracle(export: str, fps: float, out_dir: Path, width: int) -> None:

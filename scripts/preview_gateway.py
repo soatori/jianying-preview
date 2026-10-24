@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import base64
 import json
 import os
 import socket
@@ -26,6 +27,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+# Windows 控制台是 GBK：读数里带中文/箭头/替换符时 print 会在最后一步抛错，
+# 把已经算完的结果整个吞掉（本轮自己的统计工具就栽过一次）。只改错误处理策略，不改编码。
+try:
+    sys.stdout.reconfigure(errors="replace")     # type: ignore[attr-defined]
+    sys.stderr.reconfigure(errors="replace")     # type: ignore[attr-defined]
+except Exception:                                 # noqa: BLE001
+    pass
 
 REPO = Path(__file__).resolve().parents[1]
 OUT = REPO / "temp" / "playback-test"
@@ -67,6 +75,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # noqa: A003 - BaseHTTPRequestHandler hook
         pass
+
+    def _ms(self) -> str:
+        """自请求进入 `_range_or_head` 起的毫秒数；没设过起点就返回 -1（不误报 0）。"""
+        start = getattr(self, "_t_started", None)
+        return f"{(time.monotonic() - start) * 1000.0:.2f}" if start else "-1"
 
     def _note(self, row: str) -> None:
         try:
@@ -121,9 +134,36 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         """Probe pages self-report here: chrome-devtools MCP restarts the browser between calls,
-        so only a page that writes its own results survives."""
+        so only a page that writes its own results survives.
+
+        `/shot` 例外：它回传的是浏览器自己画出来的帧（base64 PNG），落成文件而不是日志行。
+        门的 L2/L3 一直用通道 2 出图，所以**交互预览内核（产品本体）的画面从未被像素判过**；
+        这个端点是那条判据的唯一入口。上限单独放宽到 12 MB：1080x1920 的 PNG base64 会超 4 MB。
+        """
         n = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(min(n, 4_000_000)) if n else b""
+        path = urlparse(self.path).path
+        limit = 12_000_000 if path.endswith("/shot") else 4_000_000
+        raw = self.rfile.read(min(n, limit)) if n else b""
+        if path.endswith("/shot"):
+            name = "gateway-report.jsonl"
+            try:
+                obj = json.loads(raw.decode("utf-8", "replace"))
+                data = base64.b64decode(obj.pop("png", "") or "")
+                tag = str(obj.get("t", "x")).replace(".", "-")
+                # 把「实际画到的位置」随图一起留下：跨通道对数判的是同一帧，
+                # 不记这个就只能假设自己拍对了（t=1.0 那跑差 0.05 就是这么混过去的）。
+                (OUT / f"browser-shot-{tag}.json").write_text(
+                    json.dumps({k: v for k, v in obj.items() if k != "png"}, ensure_ascii=False),
+                    encoding="utf-8")
+                out = OUT / f"browser-shot-{tag}.png"
+                out.write_bytes(data)
+                self._note(f"POST /shot t={obj.get('t')} bytes={len(data)} -> {out.name}")
+            except Exception as e:  # noqa: BLE001
+                self._note(f"POST /shot failed: {e}")
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         name = "gateway-report.jsonl"
         try:
             tag = json.loads(raw.decode("utf-8", "replace")).get("tag")
@@ -164,9 +204,13 @@ class Handler(BaseHTTPRequestHandler):
         if status == 206:
             headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         reused = "yes" if self.reused else "no"
+        self._t_started = time.monotonic()   # SP-04：要判「复用到底省不省时间」，必须逐请求记耗时
+        #                                   （P-08 的单源对照说 NAS 上复用反而更慢，
+        #                                    而网关此前从不记 ms，所以真草稿负载上无法复算）
         if head_only:
             self._send(status, headers, length=length)
-            self._note(f"{status} HEAD id={mid} size={size} range={rng or '-'} reused={reused}")
+            self._note(f"{status} HEAD id={mid} size={size} range={rng or '-'} "
+                       f"reused={reused} ms={self._ms()}")
             return
         self.send_response(status)
         for k, v in headers.items():
@@ -188,7 +232,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             aborted = f" aborted={type(exc).__name__}"
         self._note(f"{status} GET id={mid} range={rng or '-'} sent={sent} wanted={length}{aborted} "
-                   f"file={os.path.basename(fpath)} reused={reused}")
+                   f"file={os.path.basename(fpath)} reused={reused} ms={self._ms()}")
 
     def handle_one_request(self):
         # One Handler instance == one TCP connection, so the request counter minus one

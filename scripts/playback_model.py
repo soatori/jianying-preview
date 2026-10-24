@@ -18,6 +18,13 @@ import os
 import re
 import sys
 from pathlib import Path
+# Windows 控制台是 GBK：读数里带中文/箭头/替换符时 print 会在最后一步抛错，
+# 把已经算完的结果整个吞掉（本轮自己的统计工具就栽过一次）。只改错误处理策略，不改编码。
+try:
+    sys.stdout.reconfigure(errors="replace")     # type: ignore[attr-defined]
+    sys.stderr.reconfigure(errors="replace")     # type: ignore[attr-defined]
+except Exception:                                 # noqa: BLE001
+    pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "jy_crypto"))
 
@@ -201,6 +208,10 @@ class Model:
             "text": None,
             "features": {},
             "extra_refs": refs,
+            # 混合模式以 effects 资源实现（F-049/U-12）：语料里没有 blend_mode/mix_mode 段键，
+            # 判别是 extra_material_refs -> materials.effects[type=="mix_mode"]，包身份是 path 尾段的 md5。
+            "mix_mode": None,
+            "animations": [],
         }
         if clip:
             tf = clip.get("transform") or {}
@@ -212,6 +223,20 @@ class Model:
                 "alpha": clip.get("alpha", 1.0),
                 "flip": clip.get("flip"),
             }
+        an = self.animations_for(refs)
+        if an:
+            out["animations"] = an
+
+        for r in refs:
+            if r["bucket"] != "effects":
+                continue
+            item = self.buckets[r["id"]][1]
+            if item.get("type") != "mix_mode":
+                continue
+            pkg = str(item.get("path") or "").replace("\\", "/").rstrip("/").split("/")[-1]
+            out["mix_mode"] = {"name": item.get("name"), "package_md5": pkg, "ref": r["id"]}
+            break
+
         if mat and mat.get("path"):
             p = resolve_path(mat["path"], self.draft_root)
             out["media"] = {
@@ -291,13 +316,55 @@ class Model:
                 return self.buckets[r["id"]][1]
         return None
 
+    def animations_for(self, refs: list[dict]) -> list[dict]:
+        """把 extra_material_refs -> materials.material_animations[] 解成渲染可用的条目。
+
+        两种形状都收（版本差异未判，所以不许按形状丢弃）：
+          A. `material_animations[] = {type:"sticker_animation", animations:[{type:"in",duration,path,...}]}`
+             —— 本测试草稿 65 段全走这条（P-29：「向上闪入」0.3 s 就是这样丢的）。
+          B. `{in/out/loop: {actions:[...]}}` —— 规格 F-012 记的形，语料里是否仍存在未在本轮复核。
+        """
+        out = []
+        for r in refs:
+            if r["bucket"] != "material_animations":
+                continue
+            item = self.buckets[r["id"]][1]
+            for a in item.get("animations") or []:
+                if not isinstance(a, dict):
+                    continue
+                path = str(a.get("path") or "")
+                out.append({
+                    "kind": a.get("type"),
+                    "name": a.get("name"),
+                    "duration_us": a.get("duration"),
+                    # `start` 是该动画在片段内的起始偏移（animations.yaml:15/:33）；
+                    # 缺席时按 kind 推：in 从段头起，out 从段尾倒推（F-078：窗口算错=动画常驻或永不生效）
+                    "start_us": a.get("start"),
+                    "resource_id": a.get("resource_id"),
+                    "category_name": a.get("category_name"),
+                    "panel": a.get("panel"),
+                    "material_type": a.get("material_type"),
+                    "path": path or None,
+                    "package_exists": bool(path) and os.path.isdir(path),
+                    "anim_material_id": item.get("id"),
+                })
+            for k in ("in", "out", "loop"):
+                block = item.get(k) or {}
+                for a in (block.get("actions") or []) if isinstance(block, dict) else []:
+                    if not isinstance(a, dict):
+                        continue
+                    out.append({"kind": k, "name": a.get("name"), "duration_us": a.get("duration"),
+                                "resource_id": a.get("resource_id"), "category_name": None,
+                                "panel": None, "material_type": None, "path": a.get("path") or None,
+                                "package_exists": bool(a.get("path")) and os.path.isdir(a["path"]),
+                                "anim_material_id": item.get("id")})
+        return out
+
     def features(self, seg: dict, mat: dict | None, refs: list[dict]) -> dict:
         present = {r["bucket"] for r in refs}
         fx = {}
         if "material_animations" in present:
-            anims = [self.buckets[r["id"]][1] for r in refs if r["bucket"] == "material_animations"]
-            kinds = sorted({k for a in anims for k in ("in", "out", "loop") if (a.get(k) or {}).get("actions")})
-            fx["animation"] = kinds
+            fx["animation"] = sorted({a["kind"] for a in self.animations_for(refs)})
         if "transitions" in present:
             names = [self.buckets[r["id"]][1].get("name") for r in refs if r["bucket"] == "transitions"]
             fx["transition"] = names
@@ -433,6 +500,10 @@ class Model:
                 "geometry_total": geo_tot,
                 "invisible_segments": geo_hidden,
                 "volume_segments": geo_vol,
+                "mix_mode_segments": sum(1 for tr in tracks_out for s in tr["segments"]
+                                         if s.get("mix_mode")),
+                "animation_segments": sum(1 for tr in tracks_out for s in tr["segments"]
+                                          if s.get("animations")),
                 "feature_counts": dict(sorted(feats.items(), key=lambda kv: -kv[1])),
             },
             "media": [{"path": p, **e} for p, e in sorted(media.items())],

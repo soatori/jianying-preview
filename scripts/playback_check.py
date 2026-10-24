@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -40,6 +41,13 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+# Windows 控制台是 GBK：读数里带中文/箭头/替换符时 print 会在最后一步抛错，
+# 把已经算完的结果整个吞掉（本轮自己的统计工具就栽过一次）。只改错误处理策略，不改编码。
+try:
+    sys.stdout.reconfigure(errors="replace")     # type: ignore[attr-defined]
+    sys.stderr.reconfigure(errors="replace")     # type: ignore[attr-defined]
+except Exception:                                 # noqa: BLE001
+    pass
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "temp" / "playback-test"
@@ -56,9 +64,9 @@ CRITERIA = {
 }
 
 
-def run(cmd: list[str], cwd: Path = ROOT) -> subprocess.CompletedProcess:
+def run(cmd: list[str], cwd: Path = ROOT, timeout: int = 0) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
-                          encoding="utf-8", errors="replace")
+                          encoding="utf-8", errors="replace", timeout=timeout or None)
 
 
 def free_port() -> int:
@@ -202,6 +210,20 @@ def main() -> int:
     ap.add_argument("--video-corr-min", type=float, default=0.6,
                     help="PASS threshold on corr@32px with the overlay masked")
     ap.add_argument("--skip-negative", action="store_true")
+    ap.add_argument("--skip-animations", action="store_true",
+                    help="skip the L8 animation layers")
+    ap.add_argument("--skip-browser-shots", action="store_true",
+                    help="skip the L10 layer where the browser returns its own frames")
+    ap.add_argument("--shot-times", default="1.0,6.633,20.23",
+                    help="逗号分隔的时刻；浏览器会在这些时刻把画出来的帧回传")
+    ap.add_argument("--shot-seconds", type=int, default=90)
+    ap.add_argument("--oracle-frames", default="temp/playback-test/oracle/dense216",
+                    help="一次解出的成片帧目录（L10 用，不重新解码）")
+    ap.add_argument("--skip-mixmode", action="store_true",
+                    help="skip the L7 mix-mode layers (they need no browser by default)")
+    ap.add_argument("--mixmode-gpu", action="store_true",
+                    help="also run the GPU three-way equivalence (starts its own browser)")
+    ap.add_argument("--mixmode-seconds", type=int, default=240)
     args = ap.parse_args()
 
     checks: list[tuple[str, str, str]] = []
@@ -386,6 +408,35 @@ def main() -> int:
             checks.append(("session memory (600 s criterion is separate)", "INFO",
                            peak or f"no rss_peak_mb line in {rss.name}"))
 
+        # ---- 10. L10: 浏览器自己画出来的帧，对通道 2 与对成片同刻 ------------------------
+        # 门的 L2/L3 一直用通道 2 出图，等于让另一条通道代答「预览看起来对不对」。
+        # 这一层把交互内核本体放到像素判据下：两条判据分开阈值（跨通道 / 对成片），
+        # 合并成一个数就会把「两条通路不一致」读成「成片本来就这样」。
+        if not args.skip_browser_shots:
+            times = args.shot_times
+            for x in [s.strip() for s in times.split(",") if s.strip()]:
+                (OUT / f"browser-shot-{x.replace('.', '-')}.png").unlink(missing_ok=True)
+            url = (f"http://127.0.0.1:{port}/playback-test/{args.player}"
+                   f"?model={Path(media_model).name}&seek=1.0&shots={times}"
+                   f"&fps=30&qmax=4&pool=4")
+            run([PY, "scripts/browser_soak.py", "--url", url,
+                 "--seconds", str(args.shot_seconds), "--report", str(report.relative_to(ROOT)),
+                 "--tag", "shot", "--timeout", str(args.shot_seconds + 25)])
+            sh = run([PY, "scripts/browser_shot_check.py", "--timestamps", times,
+                      "--model", args.model, "--frames-dir", args.oracle_frames,
+                      "--report", str((OUT / "browser-shots.json").relative_to(ROOT))])
+            js = OUT / "browser-shots.json"
+            n = problems = 0
+            if js.is_file():
+                rep = json.loads(js.read_text(encoding="utf-8"))
+                n = len([r for r in rep.get("rows", []) if "browser_vs_channel2" in r])
+                problems = len(rep.get("problems", []))
+            verdict("L10 browser pixels (vs channel 2 and vs export, same frame)",
+                    sh.returncode == 0 and n >= 3 and problems == 0,
+                    f"{n} timestamps compared, {problems} problems"
+                    + (" | " + "; ".join((sh.stdout or "").strip().splitlines()[-4:])
+                       if sh.returncode else ""))
+
         if not args.skip_negative and Path(args.negative_model).is_file():
             n = battery(Path(args.negative_model).name, "check-neg")
             verdict("L6 guard has teeth", bool(n.get("black_streaks")),
@@ -399,9 +450,119 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             gw.kill()
 
+    # ---- 9. L9: 跨通道曲线一致性 —— 浏览器自报的动画值 == 通道 2 算出的值 ------------------
+    # 为什么不等像素先判：`ANIM_STATS.last` 带的是浏览器那一侧真正算出来的 alpha/scale/dy 与
+    # 相对段起点的时刻，通道 2 用同一个模型重算同一时刻即可对数。像素级的通道一致另说
+    # （浏览器还有解码与字体度量差异），这里判的是「两条通道吃的是不是同一条曲线」。
+    # 口径：alpha/scale 严格比（与纹理高无关）；dy 只报差不判——JS 用节点高、Python 用墨迹高，
+    # 两者的定义本来就不同（P-16 的 PIL 升部陷阱同类），拿它当判据会假报警。
+    if not args.skip_animations:
+        try:
+            import render_frame as _rf
+            seg_by_id = {s["id"]: s for tr in m["tracks"] for s in tr["segments"]}
+            for tr in m["tracks"]:
+                for s in tr["segments"]:
+                    seg_by_id[s["id"]] = s
+            recs: dict[str, dict] = {}
+            for d in (runs or []):
+                for r_ in ((d.get("anim") or {}).get("last") or []):
+                    recs[r_["id"]] = r_
+            anim_loaded = any((d.get("anim") or {}).get("loaded") for d in (runs or []))
+            bad = []
+            for sid, r_ in recs.items():
+                s = seg_by_id.get(sid)
+                if not s:
+                    bad.append(f"{sid[:8]}: 段不在模型里")
+                    continue
+                pos_us = s["target"]["start_us"] + int(r_["t_us"])
+                v = _rf.anim_value(s, pos_us, int(m["canvas"]["height"]), None)
+                if abs(v["alpha"] - r_["alpha"]) > 0.02 or abs(v["scale_x"] - r_["s"]) > 0.02:
+                    bad.append(f"{s.get('text',{}).get('text','')[:8] or sid[:8]}: "
+                               f"浏览器 a/s={r_['alpha']}/{r_['s']} vs 通道2 "
+                               f"{v['alpha']:.3f}/{v['scale_x']:.3f}")
+            verdict("L9 cross-channel curve parity (browser == channel 2)",
+                    anim_loaded and bool(recs) and not bad,
+                    f"curves loaded={anim_loaded}, browser 报了 {len(recs)} 段, "
+                    f"不一致 {len(bad)}" + (": " + "; ".join(bad[:3]) if bad else ""))
+        except Exception as e:  # noqa: BLE001
+            verdict("L9 cross-channel curve parity (browser == channel 2)", False, f"crashed: {e}")
+
+    # ---- 7. L7: 混合模式（同源切片 GLSL + 构造样本接线）----------------------------------
+    # 本草稿 0 个 mix_mode 引用 ⇒ L1~L6 永远不会经过这条路径；「写了」不等于「生效」，
+    # 也不等于「下次改坏了还有人记得跑」。数学侧的 GPU 三方对照默认不跑（要起浏览器，
+    # 且它测的是常量而非常规回归），要跑用 --mixmode-gpu，判据读表不读 stdout。
+    if not args.skip_mixmode:
+        ex = run([PY, "scripts/mixmode_shaders.py"])
+        last = (ex.stdout.strip().splitlines() or ["no output"])[-1]
+        verdict("L7 mixmode shipped GLSL", ex.returncode == 0, last[:150])
+        wr = run([PY, "scripts/mixmode_wiring_check.py", "--model", args.model])
+        tail = [ln for ln in wr.stdout.splitlines() if "wiring checks" in ln]
+        verdict("L7 mixmode wiring (constructed fixture)", wr.returncode == 0,
+                (tail[-1] if tail else (wr.stdout or wr.stderr)[-150:]))
+        if args.mixmode_gpu:
+            eq = run([PY, "scripts/mixmode_equivalence.py"], timeout=args.mixmode_seconds)
+            tp = ROOT / "docs" / "evidence" / "tables" / "mixmode_equivalence.csv"
+            bad: list[str] = []
+            n_rows = 0
+            if tp.exists():
+                import csv as _csv
+                with tp.open(encoding="utf-8-sig") as fh:
+                    for row in _csv.DictReader(fh):
+                        n_rows += 1
+                        ship = int(row["shipped_vs_vendor_max_abs_255"])
+                        npx = int(row["numpy_vs_vendor_max_abs_255"])
+                        over = int(row["numpy_cells_over_tolerance"])
+                        if ship > 1 or npx > 1 or over > 0:
+                            bad.append(f"{row['name_id']} ship={ship} numpy={npx} over={over}")
+            verdict("L7 mixmode GPU three-way (vendor GLSL = oracle)",
+                    eq.returncode == 0 and n_rows == 10 and not bad,
+                    f"{n_rows} modes read from the table, {len(bad)} out of tolerance"
+                    + (": " + "; ".join(bad[:3]) if bad else ""))
+
+    # ---- 8. L8: 入场动画的载体与接线（曲线值来自包内 lua，不手抄）--------------------------
+    # 动画只在段头 0.1 s 有可见差，1 s 网格的 L2/L3 碰不到（P-30 就地更正的口径），
+    # 所以要单独一层；判据含「动画期外必须逐字节相同」，用来抓「曲线常驻」这类错。
+    if not args.skip_animations:
+        # 曲线表是浏览器腿的依赖，手工导出就会悄悄过期（与 P-33 记的「代理模型缺字段」同一类：
+        # 依赖不重建，浏览器静默按旧形状跑而门全绿）。所以每次门都重导一次并断言计数。
+        rc = run([PY, "scripts/animation_curve.py", "--dump-table", args.model,
+                  "--out", "temp/playback-test/animation-curves.json"])
+        # 断言只看**计数**，不看中文：子进程 stdout 在 GBK 控制台上是被替换过的，
+        # 拿中文子串匹配会把一次成功的重导判成失败（本层第一版就这么假红过一次）。
+        # 两个计数各核各的，别混：`N presets` 对表里的预设条数，`覆盖 X/Y 段` 的 Y
+        # 必须等于模型的 stats.animation_segments（口径：带**真条目**的段数，不是引用段数）。
+        allout = "\n".join((rc.stdout or "").splitlines())
+        mp = re.search(r"(\d+)\s*presets", allout)
+        mc = re.search(r"(\d+)/(\d+)", allout)
+        table = OUT / "animation-curves.json"
+        try:
+            tab = json.loads(table.read_text(encoding="utf-8")) if table.is_file() else {}
+        except (OSError, ValueError):
+            tab = {}
+        n_pre = len(tab.get("presets") or {})
+        seg_all = (m.get("stats") or {}).get("animation_segments")
+        ok = (rc.returncode == 0 and mp and mc and n_pre == int(mp.group(1))
+              and tab.get("segments_covered") == int(mc.group(1))
+              and seg_all is not None and int(mc.group(2)) == seg_all)
+        verdict("L8 curves table rebuilt from the model", ok,
+                f"表内预设 {n_pre}（导出的说 {mp.group(1) if mp else '?'}），"
+                f"覆盖 {mc.group(0) if mc else '?'} 段（模型 animation_segments={seg_all}）"
+                + ("" if ok else f" | stdout={allout[-160:]!r}"))
+        aw = run([PY, "scripts/animation_wiring_check.py", "--model", args.model])
+        tail = [ln for ln in aw.stdout.splitlines() if "animation wiring checks" in ln]
+        verdict("L8 animation wiring (real draft, covered presets)", aw.returncode == 0,
+                (tail[-1] if tail else (aw.stdout or aw.stderr)[-160:]))
+
     width = max(len(name) for name, _, _ in checks) + 2
+    # 控制台编码是 GBK：detail 里带中文（脚本 stdout 尾巴、预设名）时 print() 会在**最后一步**
+    # 抛 UnicodeEncodeError，把已经跑完的 17 层结果全部吞掉。改成按字节写并替换不可编码字符。
+    def emit(s: str) -> None:
+        try:
+            print(s)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write((s + "\n").encode("utf-8", "replace"))
     for name, state, detail in checks:
-        print(f"{state:<5} {name:<{width}} {detail}")
+        emit(f"{state:<5} {name:<{width}} {detail}")
     failed = [c for c in checks if c[1] == "FAIL"]
     print(f"\n{len(checks) - len(failed)} of {len(checks)} checks passed"
           + (f", {len(failed)} FAILED" if failed else ""))
