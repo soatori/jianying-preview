@@ -19,7 +19,7 @@ import pathlib
 import re
 import sys
 
-SKILL = pathlib.Path(r"C:\Users\11\.agents\skills\jianying-editor-skill")
+SKILL = pathlib.Path.home() / ".agents/skills/jianying-editor-skill"
 CATALOG_DIR = SKILL / "scripts" / "vendor" / "pyJianYingDraft" / "metadata"
 SCAN = pathlib.Path(__file__).resolve().parents[1] / "temp" / "corpus-scan"
 TEXT_EXT = {".md", ".py", ".json", ".txt", ".yaml", ".yml", ".toml", ".html", ".js", ".cfg", ".ini"}

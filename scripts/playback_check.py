@@ -18,11 +18,11 @@ own user-data-dir) and the gateway it starts is stopped again on the way out.
 
 Usage:
   python scripts/playback_check.py \
-      --plain "temp/playback-test/plain/李金昌 10月15日 (4)__draft_content.json.dec.json" \
-      --draft-root "D:\\JianyingPro\\JianyingPro Drafts\\李金昌 10月15日 (4)" \
+      --plain "temp/playback-test/plain/<草稿名>__draft_content.json.dec.json" \
+      --draft-root "<草稿根>/<草稿名>" \
       --timeline 017E2FEC-11D0-47d6-87C1-9709D2A2F18D \
       --model temp/playback-test/model-proxy-a.json \
-      --oracle-mp4 "E:\\输出\\销售\\1015-1701\\1015-1701.mp4" \
+      --oracle-mp4 "<你的成片 mp4>" \
       --pixel-t 1.0 --pixel-colour 255,255,255
   # --pixel-colour must name a layer that is actually live at --pixel-t: the default gold
   # caption only exists in the cover state, and against the export it reads "layer missing".

@@ -31,7 +31,7 @@ except Exception:                                      # noqa: BLE001
     pass
 
 ROOT = Path(__file__).resolve().parents[1]
-DEF_PKG = (Path("C:/Users/11/AppData/Local/JianyingPro/User Data/Cache/effect")
+DEF_PKG = (Path.home() / "AppData/Local/JianyingPro/User Data/Cache/effect"
            / "7273389803532456504/ecaffca7c7e1d7744fa296a29f65b366"
            / "AmazingFeature/lua/SeekModeScript.lua")
 

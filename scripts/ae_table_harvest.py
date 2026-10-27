@@ -26,7 +26,7 @@ try:
 except Exception:                                 # noqa: BLE001
     pass
 
-ROOT = Path("C:/Users/11/AppData/Local/JianyingPro/User Data/Cache/effect")
+ROOT = Path.home() / "AppData/Local/JianyingPro/User Data/Cache/effect"
 
 
 def join_draft(model_path: Path) -> dict:

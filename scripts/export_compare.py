@@ -19,7 +19,7 @@ structure (where bright and dark regions sit) is what has to.
 
 Usage:
   python scripts/export_compare.py --model temp/playback-test/model-check.json \
-      --export "E:/输出/销售/1015-1701/1015-1701.mp4" --from 0 --to 36 --step 1 \
+      --export "<你的成片 mp4>" --from 0 --to 36 --step 1 \
       --work-dir temp/playback-test/l3
   # reuse the extracted oracle (skips ffmpeg):
   ... --frames-dir temp/playback-test/l3/oracle

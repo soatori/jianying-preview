@@ -4,7 +4,7 @@
 而那些数是用 analyser 在 JS 循环里**轮询**取的——循环一冻几百毫秒，缺席的正是这些采样。
 用户说"音频听起来很奇怪"时，自报通道是**被怀疑对象的一部分**，不能当证人口述。
 这里读的是浏览器录下来的连续波形（player.html 的 `startCapture` → 网关 `/wave`），
-对照物是同一条时间线的原生成片音轨（`E:\输出\销售\1015-1701\1015-1701.mp4`）。
+对照物是同一条时间线的原生成片音轨（`JY_ORACLE_MP4` 指向的成片）。
 
 只报数不判绿：这些判据还没有负样本 fixture（同一台机器上把某段真做成静音再验仪器必须变红），
 按规约「先造反例再接判据」，先出读数。
@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import subprocess
 import sys
@@ -31,7 +32,7 @@ except Exception:                                 # noqa: BLE001
     pass
 
 OUT = Path(__file__).resolve().parents[1] / "temp" / "playback-test"
-MP4 = r"E:\输出\销售\1015-1701\1015-1701.mp4"
+MP4 = os.environ.get("JY_ORACLE_MP4", "")     # 成片 oracle：本机路径，不写死在源码里
 
 
 def read_wav(p: Path) -> tuple[np.ndarray, int]:

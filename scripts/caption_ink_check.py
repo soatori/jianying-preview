@@ -20,13 +20,14 @@ L10 首轮把跨通道崩口按**固定分带网格**定位，我说「字幕带
 用法:
     python scripts/caption_ink_check.py [--timestamps 1.0,7.0] [--width 540] \
         [--model temp/playback-test/model-proxy.json] \
-        [--export-mp4 "E:\\输出\\销售\\1015-1701\\1015-1701.mp4"] \
+        [--export-mp4 "<你的成片 mp4，或设 JY_ORACLE_MP4>"] \
         [--report temp/playback-test/caption-ink.json]
 前置：先跑一次带 `&shots=` 的页面（对应时刻要有 browser-shot-*.png）。
 """
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import subprocess
 import sys
@@ -144,7 +145,7 @@ def main() -> int:
     ap.add_argument("--dir", default="temp/playback-test")
     ap.add_argument("--model", default="temp/playback-test/model-proxy.json",
                     help="通道 2 用哪份模型：默认代理，与浏览器播的同一批媒体")
-    ap.add_argument("--export-mp4", default=r"E:\输出\销售\1015-1701\1015-1701.mp4")
+    ap.add_argument("--export-mp4", default=os.environ.get("JY_ORACLE_MP4", ""))
     ap.add_argument("--timestamps", default="1.0")
     ap.add_argument("--width", type=int, default=540)
     ap.add_argument("--fps", type=float, default=30.0)

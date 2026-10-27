@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import math
 import sys
@@ -38,8 +39,8 @@ try:
 except Exception:                                # noqa: BLE001
     pass
 
-MP4 = r"E:\输出\销售\1015-1701\1015-1701.mp4"
-PKG = (Path("C:/Users/11/AppData/Local/JianyingPro/User Data/Cache/effect")
+MP4 = os.environ.get("JY_ORACLE_MP4", "")     # 成片 oracle：本机路径，不写死在源码里
+PKG = (Path.home() / "AppData/Local/JianyingPro/User Data/Cache/effect"
        / "7273389803532456504/ecaffca7c7e1d7744fa296a29f65b366"
        / "AmazingFeature/lua/SeekModeScript.lua")
 EXPO = "ADBE_Exposure2_0003_0_1"

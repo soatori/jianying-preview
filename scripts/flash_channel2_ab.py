@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 from pathlib import Path
@@ -29,7 +30,7 @@ try:
 except Exception:                                 # noqa: BLE001
     pass
 
-MP4 = r"E:\输出\销售\1015-1701\1015-1701.mp4"
+MP4 = os.environ.get("JY_ORACLE_MP4", "")     # 成片 oracle：本机路径，不写死在源码里
 
 
 def obs(img: Image.Image, size=(270, 480)):
