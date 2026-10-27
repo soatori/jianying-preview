@@ -112,6 +112,58 @@ def _simple_arith(expr: str, names: dict[str, float]) -> float | None:
     return None
 
 
+def load_typewriter(pkg_path: str | pathlib.Path) -> dict | None:
+    """读「打字光标」那两张**写死在 lua 里**的节奏表（F-087）。
+
+    它不是 `fromTo`，也不是随机数：`refreshrandomTime` 取
+    `random_tween_time` / `random_tween_time1` 之一，按 `(i-1) % len` 循环铺到每个字上再归一化。
+    表是常量 ⇒ **可以逐帧精确复现**，这点决定了这块欠口值不值得做。
+    """
+    p = pathlib.Path(pkg_path)
+    d = p if p.is_dir() else p.parent
+    if not d.is_dir():
+        return None
+    tables: dict[str, list[float]] = {}
+    for f in sorted(d.glob("*.lua")):
+        text = f.read_text(encoding="utf-8", errors="replace")
+        for name, body in re.findall(r"\b(random_tween_time1?)\s*=\s*\{([^}]*)\}", text):
+            vals = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", body)]
+            if vals:
+                tables[name] = vals
+    if "random_tween_time" not in tables:
+        return None
+    return tables
+
+
+def typewriter_prefix(tw: dict, t_in_seg: float, dur_s: float, n_chars: int) -> int:
+    """这条时刻**可见的前缀字数**。
+
+    口径（全部来自包内 lua 原文）：
+      选表  `duration/oriCount >= 0.15` ⇒ `random_tween_time1`，否则 `random_tween_time`；
+      铺表  第 i 个字取 `table[(i-1) % len]`，整条按 Σ=1 归一化；
+      可见  `checkDirty` 把每个字的 alpha 设成 `getCharPt(i, 1.2*time/duration)`，
+            而 `getCharPt` 返回 `tt > 0.9 and 1.0 or 0.0`，`tt` 是该字自己槽位内的进度
+            ⇒ 第 i 字可见 ⇔ `1.2·t/dur >= Σ_{j<i} w_j + 0.9·w_i`。
+      该式对 i **单调**，所以可见集合恰好是一个前缀 ⇒ 两通道都能用「只画前 k 个字」实现，
+      不需要逐字 alpha、也不需要跑包内 GLSL（`getcuralpha`/`onUpdate` 在包里都是**空函数**，
+      `curalpha` 是**光标 sprite** 的透明度，不是文字的）。
+    """
+    if n_chars <= 0 or dur_s <= 0:
+        return 0
+    table = tw["random_tween_time1"] if dur_s / n_chars >= 0.15 else tw["random_tween_time"]
+    w = [table[i % len(table)] for i in range(n_chars)]
+    total = sum(w)
+    tau = 1.2 * t_in_seg / dur_s
+    acc, k = 0.0, 0
+    for wi in w:
+        if tau >= acc + 0.9 * wi / total:
+            k += 1
+            acc += wi / total
+        else:
+            break
+    return k
+
+
 def load_curve(pkg_path: str | pathlib.Path, lua_names: tuple[str, ...] = ()) -> list[dict]:
     """读包内 lua，取出 `fromTo` 声明。找不到返回 []（= 该预设未实现，不是返回恒等曲线）。"""
     p = pathlib.Path(pkg_path)

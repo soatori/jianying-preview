@@ -142,8 +142,21 @@ class Handler(BaseHTTPRequestHandler):
         """
         n = int(self.headers.get("Content-Length") or 0)
         path = urlparse(self.path).path
-        limit = 12_000_000 if path.endswith("/shot") else 4_000_000
+        limit = 12_000_000 if path.endswith(("/shot", "/wave")) else 4_000_000
         raw = self.rfile.read(min(n, limit)) if n else b""
+        if path.endswith("/wave"):
+            # 浏览器把**真正送出去的那一路**混音录成 WAV 发回来（player.html 的 startCapture）。
+            # 判静音段/削顶/跳变要的是连续波形：现有 peak_fs/rms_windows 是 analyser 在 JS 循环里
+            # 轮询出来的，循环一冻几百 ms 缺席的正是这些采样——自报数字会被它想测的故障本身破坏。
+            nm = (self.path.split("name=")[-1] or "")[:80]
+            nm = "".join(c for c in nm if c.isalnum() or c in "._-").lstrip(".") or "preview-capture"
+            out = OUT / f"preview-audio-{nm[:60]}.wav"
+            out.write_bytes(raw)
+            self._note(f"POST /wave bytes={len(raw)} -> {out.name}")
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path.endswith("/shot"):
             name = "gateway-report.jsonl"
             try:

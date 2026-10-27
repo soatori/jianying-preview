@@ -26,6 +26,7 @@ import argparse
 import glob
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -80,6 +81,8 @@ def main() -> int:
     ap.add_argument("--min-cross", type=float, default=0.95)
     ap.add_argument("--min-export", type=float, default=0.90)
     ap.add_argument("--report", default="temp/playback-test/browser-shots.json")
+    ap.add_argument("--max-age-min", type=float, default=180.0,
+                    help="截图超过这么多分钟就跳过（过期截图不会报错，只会给出假的负相关）")
     args = ap.parse_args()
 
     d = Path(args.dir)
@@ -89,6 +92,7 @@ def main() -> int:
         return 2
     frames = sorted(Path(args.frames_dir).glob("*.png"))
     model = json.loads(Path(args.model).read_text(encoding="utf-8-sig"))
+    cw, ch = int(model["canvas"]["width"]), int(model["canvas"]["height"])
     want = {x.strip() for x in args.timestamps.split(",") if x.strip()}
 
     rows, bad = [], []
@@ -107,6 +111,27 @@ def main() -> int:
             continue
         ours = d / f"c2-{tag}.png"
         channel2_png(model, t, ours)
+        # 两条截图卫生判据，都是 t=12 那次「跨通道 −0.370」教出来的（重截后同一时刻 0.980）：
+        # (1) **过期**：判据端无法从图本身看出它是哪一版页面产的，过期截图不会报错，
+        #     只会给出一个看起来很严重的负相关 ⇒ 超过 --max-age-min 就跳过并报。
+        # (2) **几何**：`extract.pixels(stage)` 取的是 stage 的**内容包围盒**，不是画幅，
+        #     所以 540 宽的截图通常是 540×953 而非 540×960（差 0.7%，随时刻变化）。
+        #     这条只**报**不判——真出现大偏差（>2%）才是信箱或别的东西。
+        sw, sh = Image.open(png).size
+        want_h = int(round(sw * ch / cw))
+        age_min = (time.time() - png.stat().st_mtime) / 60.0
+        if age_min > args.max_age_min:
+            bad.append(f"t={t} 截图已过期 {age_min:.0f} 分钟（>{args.max_age_min:.0f}）——"
+                       f"它可能是另一版页面产的，先重跑 &shots= 再判")
+            rows.append({"t": t, "skipped": f"shot age {age_min:.0f} min"})
+            print(f"  t={t:7.3f}  SKIP 截图过期 {age_min:.0f} 分钟")
+            continue
+        if abs(sh - want_h) > 0.02 * want_h:
+            bad.append(f"t={t} 截图 {sw}x{sh} 与画幅比例差 {abs(sh-want_h)/want_h:.1%}"
+                       f"（>2%）——信箱或别的内容，不是 0.7% 的内容包围盒效应")
+            rows.append({"t": t, "skipped": f"shot geometry {sw}x{sh} vs {sw}x{want_h}"})
+            print(f"  t={t:7.3f}  SKIP 截图几何 {sw}x{sh}（画幅应为 {sw}x{want_h}）")
+            continue
         meta = png.with_suffix(".json")
         paint_us = json.loads(meta.read_text(encoding="utf-8")).get("t_paint_us") if meta.is_file() else None
         dt_paint = round(abs((paint_us or 0) / 1e6 - t), 4) if paint_us is not None else None

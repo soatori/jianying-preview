@@ -38,6 +38,14 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+# Windows 控制台是 GBK：这台机器上已有 4 个工具在**算完之后**的 print 上崩掉、把读数吞了。
+# 只改错误处理策略（替换不可编码字符），不改编码。
+try:
+    sys.stdout.reconfigure(errors="replace")     # type: ignore[attr-defined]
+    sys.stderr.reconfigure(errors="replace")     # type: ignore[attr-defined]
+except Exception:                                 # noqa: BLE001
+    pass
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,17 +73,30 @@ def wait_port(port: int, timeout: float = 25.0) -> bool:
     return False
 
 
-def luma_box(path: Path | str, box: int = 256) -> float | None:
+def luma_box(path: Path | str, frac: float = 0.237) -> float | None:
+    """中心区均值 luma，**框按图像自身尺寸取比例**，不取固定像素。
+
+    原来写死 `box=256` 像素：256/1080 = 24% 但 256/540 = 47%，于是浏览器腿（页面回传 540 宽）
+    与 ffmpeg 腿（原生 1080 宽）**量的根本不是同一块画面**——上一轮那个"浏览器 +21 码值"
+    就是这么来的（真值是 +1.1~+1.8 的均匀偏移）。按比例取框之后，三腿的相对区域一致。
+    """
     try:
         im = Image.open(path).convert("RGB")
     except OSError:
         return None
     w, h = im.size
-    b = min(box, w, h)
-    x0, y0 = (w - b) // 2, (h - b) // 2
-    a = np.asarray(im.crop((x0, y0, x0 + b, y0 + b)), dtype=np.float32)
+    bw, bh = max(1, round(w * frac)), max(1, round(h * frac))
+    x0, y0 = (w - bw) // 2, (h - bh) // 2
+    a = np.asarray(im.crop((x0, y0, x0 + bw, y0 + bh)), dtype=np.float32)
     v = a @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
     return round(float(v.mean()), 2)
+
+
+def shot_size(path: Path) -> list[int] | None:
+    if not path.is_file():
+        return None
+    w, h = Image.open(path).size
+    return [w, h]
 
 
 def build_solo_model(src: Path, t: float, track_index: int, dest: Path) -> dict | None:
@@ -148,12 +169,19 @@ def main() -> int:
 
     # 浏览器：起网关 + 页面，用现成的 &shots= 回传（solo 模型下画面就是这条素材）
     port = args.port or free_port()
+    # **过期截图防护**：页面写的名字是它自己格式化的（t=12.0 → `browser-shot-12.png`，
+    # 不是 `browser-shot-12-0.png`），所以按字符串拼出来的那个 unlink **删不掉真正会被读的文件**——
+    # 上一轮门留下的旧截图就会被当成本次 solo 结果读进来。改成「记下开始时刻 + 事后只认
+    # mtime 晚于它、且解析出的时刻对得上的那张」，宁可报 None 也不读来历不明的图。
+    t_start = time.time()
     shot = OUT / f"browser-shot-{str(args.t).replace('.', '-')}.png"
     shot.unlink(missing_ok=True)
     gw = subprocess.Popen([sys.executable, "scripts/preview_gateway.py", "--port", str(port),
                            "--serve-dir", "temp", "--model", str(solo_path)],
                           cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     browser = None
+    shot_used: Path | None = None
+    sizes: dict = {}
     try:
         if not wait_port(port):
             print("网关没起来", file=sys.stderr)
@@ -166,7 +194,18 @@ def main() -> int:
                         "--tag", "shotprobe", "--timeout", str(args.seconds + 30)],
                        cwd=str(ROOT), capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
-        browser = luma_box(shot) if shot.is_file() else None
+        fresh = []
+        for p in sorted(OUT.glob("browser-shot-*.png")):
+            try:
+                pt = float(p.stem.replace("browser-shot-", "").replace("-", "."))
+            except ValueError:
+                continue
+            if abs(pt - args.t) < 1e-3 and p.stat().st_mtime >= t_start:
+                fresh.append(p)
+        shot_used = fresh[-1] if fresh else None
+        browser = luma_box(shot_used) if shot_used else None
+        sizes = {"ffmpeg": shot_size(OUT / "colour-ffmpeg.png"),
+                 "channel2": shot_size(c2), "browser": shot_size(shot_used)}
     finally:
         gw.terminate()
         try:
@@ -175,7 +214,14 @@ def main() -> int:
             gw.kill()
 
     rows = {"media": media, "t_timeline": args.t, "t_source": round(src_s, 4),
+            "box_frac": 0.237, "sizes": sizes, "shot": shot_used.name if shot_used else None,
             "ffmpeg_luma": ff, "channel2_luma": luma_box(c2), "browser_luma": browser}
+    # 三腿的相对区域只有在**宽高比一致**时才真的同一块；不一致就直接标出来（540×953 那种
+    # 内容包围盒差异会把 0.7% 的拉伸伪装成色彩差）。
+    asp = {k: round(v[0] / v[1], 4) for k, v in sizes.items() if v}
+    rows["aspect_ratios"] = asp
+    if len({round(a, 3) for a in asp.values()}) > 1:
+        rows["geometry_mismatch"] = True
     if rows["channel2_luma"] is not None and ff["center"] is not None:
         rows["d_channel2_minus_ffmpeg"] = round(rows["channel2_luma"] - ff["center"], 2)
     if browser is not None and ff["center"] is not None:

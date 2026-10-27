@@ -86,10 +86,16 @@ def main() -> int:
         for s in tr["segments"]:
             an = (s.get("animations") or [{}])[0]
             key = str(an.get("resource_id") or "")
-            if key not in curves:
+            # 「打字光标」没有 fromTo 轨道，所以它**从来进不了这张表**（上一版 32 条比较里一条都没有）。
+            # 现在把「带 tw 表」也算作可比较：判据仍然是**同一段开/关动画谁更贴近成片**，
+            # 而 `render_frame.typewriter_truncate` 已挂在 `APPLY_ANIMATIONS` 上，两臂才真的不同。
+            tw = bool(an.get("tw"))
+            if key not in curves and not tw:
                 continue
-            pre = curves[key]
+            pre = curves.get(key) or {"tracks": [], "name": an.get("name") or "?"}
             tween = max((t_["dur_s"] for t_ in pre["tracks"]), default=0.1)
+            if tw and not pre["tracks"]:
+                tween = (an.get("duration_us") or 0) / 1e6 or 0.1
             t0 = s["target"]["start_us"] / 1e6
             settled = t0 + tween * 2.0
             if settled >= t0 + s["target"]["duration_us"] / 1e6:
@@ -99,7 +105,7 @@ def main() -> int:
             cols = (np.abs(solo).max(axis=(0, 2)) > 8)
             xs = np.nonzero(cols)[0]
             if xs.size < 8:
-                rows.append({"t0": round(t0, 3), "name": pre["name"], "skipped": "该段孤立渲染几乎全黑"})
+                rows.append({"t0": round(t0, 3), "name": pre.get("name") or an.get("name") or "?", "skipped": "该段孤立渲染几乎全黑"})
                 continue
             x0, x1 = int(xs.min()), int(xs.max())
             for k in range(0, 4):
@@ -124,7 +130,7 @@ def main() -> int:
                 better += verdict == "更近"
                 worse += verdict == "更远"
                 same += verdict == "不变"
-                rows.append({"t0": round(t0, 3), "name": pre["name"], "t": round(t, 4),
+                rows.append({"t0": round(t0, 3), "name": pre.get("name") or an.get("name") or "?", "t": round(t, 4),
                              "x_range": [x0, x1], "mad_on": round(d_on, 2),
                              "mad_off": round(d_off, 2), "verdict": verdict})
                 print(f"  t={t:8.4f} {pre['name']:<10} x[{x0},{x1}]  "

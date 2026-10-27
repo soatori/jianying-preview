@@ -49,6 +49,24 @@ FF = r"D:\Program Files\JianyingPro\11.6.0.14552\ffmpeg.exe"
 K_EM = 0.00574          # F-035/F-036 band 0.00574-0.00578; em_px = size * canvas_width * k
 ROOT = Path(__file__).resolve().parents[1]
 
+# 草稿记的是**绝对路径**的字体，缓存被清掉就不存在了（本例 42 条字幕样式全指向
+# Cache/effect/7080096967543493150/...，该目录已没了）。原来这里落到
+# `ImageFont.load_default()`：约 10 px 的点阵字，中文全是豆腐块——字号差 4 倍，
+# 而 L2 的质心判据只看位置，于是整条时间线的字幕被量成「位置对」而没人看见它小。
+# 回退必须仍是**能画中文的真字体、且用请求的 px**，并且要**计数报出去**。
+# 顺序是**量出来的**，不是审美选择（`caption_ink_check --sweep-fallbacks`，t=1.0 字幕带对成片）：
+#   雅黑粗体 墨 3961 / corr 0.777 / MAD 20.5   ← 成片 3476，浏览器 3544
+#   黑体      墨 1962 / corr 0.765 / MAD 20.3
+#   雅黑常规  墨 2295 / corr 0.715 / MAD 22.6
+#   Noto VF   墨  721 / corr 0.605 / MAD 27.0
+# 缺的那款是 HelloFont_ID_JianSong_95（95 = 重宋），所以默认先落到**重**字面；
+# 常规体把笔画量差到 1/5，判据端就会把「字幕没画出来」读成「字幕位置没问题」。
+FALLBACK_FONTS = [r"C:\Windows\Fonts\msyhbd.ttc",           # 雅黑粗体：标定后最贴近成片
+                  r"C:\Windows\Fonts\simhei.ttf",           # 黑体
+                  r"C:\Windows\Fonts\msyh.ttc",
+                  r"C:\Windows\Fonts\NotoSansSC-VF.ttf"]
+FONT_FALLBACKS: dict = {}     # 请求路径 -> 实际用的回退（None = 连回退都没有）
+
 _MIX_MANIFEST: dict | None = None
 _MPATH = ROOT / "temp" / "playback-test" / "mixmode" / "manifest.json"
 if _MPATH.exists():
@@ -213,9 +231,48 @@ def place(layer: Image.Image, canvas_size, clip, material_kind: str = "video") -
     return int(cx - scaled.width / 2), int(cy - scaled.height / 2), scaled
 
 
+_TW_CACHE: dict = {}
+
+
+def typewriter_truncate(seg, txt: str, pos_us: int) -> str:
+    """「打字光标」= 只画可见前缀（F-087）。
+
+    包内 lua 的 `checkDirty` 把每个字的 alpha 设成 `getCharPt(i, 1.2·t/dur)`，而后者是
+    `tt > 0.9 ? 1 : 0` —— 对字序**单调**，所以可见集合永远是一个前缀，画前 k 个字与逐字
+    设 alpha 等价，且不需要跑包内 GLSL（`onUpdate`/`getcuralpha` 在包里都是空函数，
+    `curalpha` 是光标 sprite 的透明度，不是文字的）。节奏表是**写死的常量**，不是随机数。
+    """
+    for a in seg.get("animations") or []:
+        if a.get("name") != "打字光标":
+            continue
+        if not APPLY_ANIMATIONS:
+            # 「开/关动画」的对照判据（animation_region_check）要求这条路径也受同一个开关管，
+            # 否则两臂画的完全一样，读数会变成假的「无差别」。
+            return txt
+        path = a.get("path") or ""
+        if not path:
+            return txt
+        if path not in _TW_CACHE:
+            import animation_curve as ac
+            _TW_CACHE[path] = ac.load_typewriter(path)
+        tw = _TW_CACHE[path]
+        if not tw:
+            return txt
+        import animation_curve as ac
+        tg = seg.get("target") or {}
+        # 时间轴是**动画自己的** 0.2 s，不是片段时长（本时间线 14 段全是 0.20 s，片段却 0.47–0.93 s）。
+        # 用片段时长会把揭示拉慢 2–5 倍 ⇒ `animation_region_check` 里成片已满、我们还在画前两个字，
+        # 那 35 条「更远」就是这个轴错，不是仪器坏（F-087 的初判已就地更正）。
+        dur_s = (a.get("duration_us") or 0) / 1e6 or (tg.get("duration_us", 0) / 1e6)
+        t_in = (pos_us - tg.get("start_us", 0) - (a.get("start_us") or 0)) / 1e6
+        k = ac.typewriter_prefix(tw, max(0.0, t_in), dur_s, len(txt))
+        return txt[:k]
+    return txt
+
+
 def draw_text(canvas: Image.Image, seg, fonts_dir_cache, pos_us: int = 0) -> None:
     t = seg.get("text") or {}
-    txt = (t.get("text") or "").replace("\n", " ")
+    txt = typewriter_truncate(seg, (t.get("text") or "").replace("\n", " "), pos_us)
     styles = t.get("styles") or [{}]
     cw, ch = canvas.size
     # segments[].clip is the geometry channel (P-13): normalised offsets where ±1 is half the
@@ -308,6 +365,18 @@ def load_font(path, px, _cache=None):
         except OSError:
             f = None
     if f is None:
+        # 缺字体≠没有字幕：换一条仍能画中文的真字体，**用同一个 px**，并把这次回退记下来。
+        chosen = None
+        for fb in FALLBACK_FONTS:
+            try:
+                if Path(fb).is_file():
+                    f = ImageFont.truetype(fb, px)
+                    chosen = fb
+                    break
+            except OSError:
+                continue
+        FONT_FALLBACKS.setdefault(path or "-", chosen)
+    if f is None:
         f = ImageFont.load_default()
     _font_cache[key] = f
     return f
@@ -323,15 +392,144 @@ def active_segment(track, pos_us):
     return None
 
 
+# ---------------------------------------------------------------- 入场动画的曝光项
+# 包内 `SeekModeScript.lua` 带明文 `ae_attribute` 关键帧表（F-095），其中
+# `ADBE_Exposure*` 是**全画面**的乘性曝光。走哪一支由**成片判**（F-096）：
+# 线性光（`use_linear_light=0`，与 `Exposure.material` 默认一致）残差 rms 19.1 码值，
+# gamma 空间直乘（`exposure_script` 的 `no_use_linear_light=true` 会写 1.0）rms 100.6 ⇒ 取前者。
+# 时间映射**夹紧、不循环**：`mod` 写法在窗口外 mse=2040 vs 夹紧 0.3（F-096）。
+AE_FLASH = {"off": False, "blur": True}
+AE_LOG: list = []
+_AE_CACHE: dict = {}
+# 结构项的律是**对成片拟合出来的经验式**（F-096）：`gradV/基线 = 1/(1 + K·V)`，
+# K=0.0552 由垂直强度 V 拟合（rms 0.0404），用水平强度拟合只有 rms 0.0917 ⇒ 各向异性。
+# `GaussianBlur.frag` **仍未读**，所以这里不猜 `u_Strength` 的量纲：改成**在我们自己这一帧上**
+# 试一组半径、量同一口径（270×480 灰度垂直梯度，与 K 的拟合口径一致）的梯度，
+# 取第一个达到目标比值的半径。内容自适应、无需存表。
+AE_BLUR_K = 0.0552
+AE_VBLUR_ATTR = "ADBE_Gaussian_Blur_2_0001_2_3"
+AE_BLUR_RADII = (0, 1, 2, 3, 4, 6, 8, 11, 14, 18, 24)
+# 峰值帧 V=300 要 17× 梯度抑制，单趟半径 24 到不了；重复同一半径即 sigma 合成。
+AE_BLUR_MAX_PASSES = 8
+
+
+def _grad_v_small(img: Image.Image) -> float:
+    a = np.asarray(img.convert("L").resize((270, 480)), dtype=np.float64)
+    return float(np.mean(np.abs(np.diff(a, axis=0))))
+
+
+def apply_vertical_blur(canvas: Image.Image, strength: float) -> float:
+    """把整画布的垂直梯度压到 `1/(1+K·V)` 预测的比例；返回实际达到的比值。
+
+    阶梯是单调的，所以取**第一档达到目标**的半径（就地停手，宁可略欠不可过糊）；
+    整条阶梯都够不到目标时——峰值帧 V=300 要 17× 抑制，单趟上限只有 ~3.5×——
+    重复叠加最强一档（即 sigma 合成）直到达到或触顶。
+    早退式"够不到就一档不动"是原缺陷：恰恰在最该糊的帧上不糊（201..203 实测比值 1.000）。
+    """
+    base = _grad_v_small(canvas)
+    if base <= 0:
+        return 1.0
+    want = base / (1.0 + AE_BLUR_K * strength)
+    top = ImageFilter.GaussianBlur(radius=(0, AE_BLUR_RADII[-1]))
+    chosen, got = canvas, base
+    for r in AE_BLUR_RADII:
+        if r == 0:
+            continue
+        cand = canvas.filter(ImageFilter.GaussianBlur(radius=(0, r)))
+        g = _grad_v_small(cand)
+        if g <= want:
+            chosen, got = cand, g
+            break
+    passes = 1
+    while got > want and passes < AE_BLUR_MAX_PASSES:
+        cand = chosen.filter(top)
+        g = _grad_v_small(cand)
+        if g >= got:
+            break
+        chosen, got, passes = cand, g, passes + 1
+    canvas.paste(chosen)
+    return got / base
+
+
+def _ae_track(seg: dict, pos_us: int, attr: str | None, tag: str) -> float:
+    """从段的 `in` 动画所指的包里取某条 AE 轨道在此刻的值（夹紧、不循环）。"""
+    if AE_FLASH["off"]:
+        return 0.0
+    for a in seg.get("animations") or []:
+        if a.get("kind") != "in" or not a.get("path"):
+            continue
+        lua = Path(a["path"]) / "AmazingFeature" / "lua" / "SeekModeScript.lua"
+        if not lua.exists():
+            continue
+        pkg = _ae_pkg(str(lua))
+        if pkg[0] == "ERR":
+            AE_LOG.append(("degraded", str(seg.get("id")), pkg[1]))
+            continue
+        aek, tools, cons, expo = pkg
+        key = expo if attr is None else attr
+        if key not in tools.attrs:
+            return 0.0
+        dur = (a.get("duration_us") or 0) / 1e6
+        if dur <= 0:
+            continue
+        t = (pos_us - seg["target"]["start_us"]) / 1e6
+        cf = aek.frame_of_clamped(t, dur, cons, tools.all_frame)
+        v = tools.get_val(key, max(0.0, min(cf, tools.all_frame)) / tools.all_frame)
+        val = float(v[0] if isinstance(v, list) else v)
+        AE_LOG.append((tag, str(seg.get("id")), round(t, 4), round(val, 4)))
+        return val
+    return 0.0
+
+
+def _ae_pkg(lua_path: str):
+    """解析并 memoize 一个包的 AE 表。解不出就返回 ("ERR", 原因) —— 降级要数得出来。"""
+    if lua_path in _AE_CACHE:
+        return _AE_CACHE[lua_path]
+    val = None
+    try:
+        import ae_keyframe as aek
+        src = Path(lua_path).read_text(encoding="utf-8", errors="replace")
+        attrs = aek.parse_ae_attribute(src)
+        expo = next((k for k in attrs if k.startswith("ADBE_Exposure")), None)
+        if not expo:
+            val = ("ERR", "no-exposure-attr")
+        else:
+            val = (aek, aek.AETools(attrs), aek.extract_constants(src), expo)
+    except Exception as e:                         # noqa: BLE001
+        val = ("ERR", f"{type(e).__name__}: {e}")
+    _AE_CACHE[lua_path] = val
+    return val
+
+
+def ae_exposure_at(seg: dict, pos_us: int) -> float:
+    """该段入场动画在此时刻的曝光 E（0 表示不适用/已结束）。只认带表的 `in` 动画。"""
+    return _ae_track(seg, pos_us, None, "applied")
+
+
+def ae_vblur_at(seg: dict, pos_us: int) -> float:
+    """同一段入场动画的**垂直**模糊强度 `u_Strength`（包里的轨道名是固定的）。"""
+    return _ae_track(seg, pos_us, AE_VBLUR_ATTR, "vblur")
+
+
+def apply_exposure(canvas: Image.Image, e: float) -> None:
+    """逐字照 `Exposure.frag`：pow 2.2 → ×2^E → +u_Offset(0) → pow(1/gsc=1) → pow 0.454545454545。"""
+    a = np.asarray(canvas).astype(np.float64)
+    rgb = np.power(np.clip(a[..., :3] / 255.0, 0.0, 1.0), 2.2) * (2.0 ** e)
+    a[..., :3] = np.clip(np.power(rgb, 0.454545454545) * 255.0, 0.0, 255.0)
+    canvas.paste(Image.fromarray(a.astype(np.uint8), "RGBA"))
+
+
 def collect(canvas, model, pos_us, fonts_dir_cache, depth=0):
     """Paint every track at pos_us onto canvas, composites recursed (P-02)."""
     layers = []
+    actives = []
     for ti, track in enumerate(model["tracks"]):
         if track["type"] == "audio":
             continue
         seg = active_segment(track, pos_us)
         if not seg:
             continue
+        actives.append(seg)
         z = ti * 100000 + (seg.get("render_index") or 0)
         if track["type"] == "text":
             layers.append(("text", z, seg, None))
@@ -390,6 +588,18 @@ def collect(canvas, model, pos_us, fonts_dir_cache, depth=0):
                                          else 1.0))
             else:
                 canvas.alpha_composite(img, (x, y))
+    if depth == 0 and actives:
+        e = 0.0
+        v = 0.0
+        for seg in actives:
+            e = max(e, ae_exposure_at(seg, pos_us))
+            if AE_FLASH["blur"]:
+                v = max(v, ae_vblur_at(seg, pos_us))
+        if v > 0:                       # 包内顺序：模糊在前、曝光是最后一趟
+            ratio = apply_vertical_blur(canvas, v)
+            AE_LOG.append(("grad_ratio", round(v, 2), None, round(ratio, 4)))
+        if e > 1e-4:
+            apply_exposure(canvas, e)
 
 
 def main() -> int:
@@ -422,6 +632,10 @@ def main() -> int:
     if MIX_DEGRADED:
         print(f"mix_mode degraded (composited normally, NOT guessed): {len(MIX_DEGRADED)} "
               f"segments; e.g. {MIX_DEGRADED[:3]}", file=sys.stderr)
+    if FONT_FALLBACKS:
+        # 报出来而不是悄悄画：这条时间线的字幕全用回退字体画，像素判据要按这个口径读（F-084）。
+        print(f"font fallback used for {len(FONT_FALLBACKS)} requested face(s): "
+              f"{sorted(set(map(str, FONT_FALLBACKS.values())))}", file=sys.stderr)
     return 0
 
 

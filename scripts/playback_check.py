@@ -61,6 +61,10 @@ CRITERIA = {
     "seek_median_ms_max": 150.0,
     "first_frame_ms_max": 300.0,
     "session_peak_mb_max": 2048.0,
+    # 帧预算按 30 fps 的一帧（33.3 ms）定 p95，按四个帧周期定 max：这是"看不出顿"的口径，
+    # 不是照着某一轮读数反推的阈值。
+    "frame_cost_p95_ms_max": 33.4,
+    "frame_cost_max_ms_max": 150.0,
 }
 
 
@@ -105,8 +109,8 @@ def layer_metrics(render: Path, cover: Path, colour: tuple[int, int, int],
         h, w = m.shape
         n = len(xs)
         if n < 50:
-            return {"n": int(n)}
-        return {"n": int(n),
+            return {"n": int(n), "frac": 0.0}
+        return {"n": int(n), "frac": round(n / (h * w), 6),
                 "cx": round(float(xs.mean()) / w, 3), "cy": round(float(ys.mean()) / h, 3),
                 "x0": round(float(np.percentile(xs, 1)) / w, 3),
                 "x1": round(float(np.percentile(xs, 99)) / w, 3),
@@ -118,7 +122,13 @@ def layer_metrics(render: Path, cover: Path, colour: tuple[int, int, int],
     if "cx" not in r or "cx" not in c:
         return {**shared, "ok": False, "why": "layer missing on one side"}
     d = {k: round(abs(r[k] - c[k]), 3) for k in ("cx", "cy", "x0", "x1", "y0", "y1")}
+    # 试过把「墨量比」也做成判据，**它是空的**：F-084 的豆腐块负样本给 ink_ratio 0.865，
+    # 稳稳落在任何合理带宽里——整帧白墨 mask 被素材的亮区主导，字幕只占其中百分之几。
+    # 真正有牙的还是下面这条 bbox 判据：豆腐块时 y1 从 0.732 掉到 0.540（Δ0.192 ≫ 0.02），
+    # 因为字幕是画面里**最低**的白东西，1–99 百分位盒的下边就是它定的。
+    # 墨量只在**字幕带内**才有意义，那条判据在 `scripts/caption_ink_check.py`（带由模型几何定）。
     return {**shared, "delta": d, "max_delta": max(d.values()),
+            "ink_ratio": round(r["frac"] / c["frac"], 3) if c["frac"] else float("inf"),
             "ok": max(d.values()) <= 0.02, "render": r, "cover": c}
 
 
@@ -224,6 +234,12 @@ def main() -> int:
     ap.add_argument("--mixmode-gpu", action="store_true",
                     help="also run the GPU three-way equivalence (starts its own browser)")
     ap.add_argument("--mixmode-seconds", type=int, default=240)
+    ap.add_argument("--skip-flash", action="store_true",
+                    help="skip the L11 向上闪入 in/out A/B layer")
+    ap.add_argument("--skip-jank", action="store_true",
+                    help="skip the whole-timeline frame-budget layer (~1 extra pass)")
+    ap.add_argument("--flash-seconds", type=int, default=1500,
+                    help="L11 budget: it renders 16 frames x 3 arms offline")
     args = ap.parse_args()
 
     checks: list[tuple[str, str, str]] = []
@@ -247,6 +263,25 @@ def main() -> int:
             f"clip on {s['geometry_segments']}/{s['geometry_total']} segments, "
             f"{s['segment_count']} segments, {s['media_count']} media "
             f"(missing {s['media_missing']}, unreadable {s['media_unreadable']})")
+    # 轨类型覆盖（U-98）：不判 PASS/FAIL —— 草稿里有 mixed/sticker 轨不是错误，
+    # 但"没被任何一条腿路由的段数"必须出现在门面上，否则它又变成一个没人读的数。
+    checks.append(("L1 track coverage", "INFO",
+                   f"按类型段数 {s.get('track_type_segments')}, "
+                   f"未路由段数 {s.get('unrouted_track_segments')} "
+                   f"(画面只走 video/text，声音只走 audio/video)"))
+
+    # ---- 1b. L1 carrier hygiene: the media model is a *snapshot* ---------------------------
+    # `fonts[].exists` was computed when the carrier was built. JianYing can evict its effect-font
+    # cache at any time (it did, mid-session, F-084), and then the browser goes and fetches a face
+    # that is no longer on disk: the page reports "A network error occurred" and L6 goes red for an
+    # environmental reason that looks exactly like a player regression. Say what it is instead.
+    mm = json.loads(Path(media_model).read_text(encoding="utf-8-sig"))
+    stale = [f.get("path", "-") for f in (mm.get("fonts") or [])
+             if f.get("exists") and not Path(f.get("path", "")).is_file()]
+    verdict("L1 carrier freshness", not stale,
+            f"{len(mm.get('fonts') or [])} face(s) listed in {Path(media_model).name}, "
+            f"stale exists=true on {len(stale)}"
+            + (f" - rebuild the carrier before reading L6; e.g. {stale[0][-40:]}" if stale else ""))
 
     # ---- 2. L2: render a frame and compare one layer against the native oracle ------------
     # The export is the oracle now that we have one: `draft_cover.jpg` is an independently
@@ -278,8 +313,9 @@ def main() -> int:
             got = layer_metrics(png, oracle, rgb)
             verdict("L2 pixel layer", got.get("ok", False),
                     f"{png.name} vs {oracle.name}: max box/centroid delta "
-                    f"{got.get('max_delta', 'n/a')} (<=0.02) over {got.get('n_render', 0)} px "
-                    f"[{got.get('why', '')}]")
+                    f"{got.get('max_delta', 'n/a')} (<=0.02) over {got.get('n_render', 0)} px; "
+                    f"ink ratio {got.get('ink_ratio', 'n/a')} (observed only, NOT judged — "
+                    f"void on the F-084 fixture) [{got.get('why', '')}]")
     else:
         checks.append(("L2 pixel layer", "SKIP", "no --oracle-mp4 / --cover given"))
 
@@ -336,10 +372,13 @@ def main() -> int:
             verdict("gateway", False, f"port {port} never accepted connections")
             return 2
 
-        def battery(url_model: str, tag: str) -> dict:
+        def battery(url_model: str, tag: str, playms: int | None = None,
+                    seeks: int | None = None) -> dict:
             before = len(report.read_text(encoding="utf-8").splitlines()) if report.exists() else 0
             url = (f"http://127.0.0.1:{port}/playback-test/{args.player}"
-                   f"?autostart=1&model={url_model}&playms={args.battery_ms}&seeks={args.seeks}"
+                   f"?autostart=1&model={url_model}"
+                   f"&playms={playms if playms is not None else args.battery_ms}"
+                   f"&seeks={seeks if seeks is not None else args.seeks}"
                    f"&fps=30&qmax=4&pool=4&loop=1")
             run([PY, "scripts/browser_soak.py", "--url", url, "--seconds", "90",
                  "--report", str(report.relative_to(ROOT)), "--tag", tag])
@@ -385,10 +424,97 @@ def main() -> int:
                     f"{over}/{len(first)} runs over the line")
             verdict("L4 Range streaming", (med(reqs) or 0) > 0,
                     f"median {med(reqs)} ranged requests per {args.battery_ms} ms window")
+
+            # ---- 4b. L4 帧预算：整条时间轴跑一遍，判尾部而不是均值 ----------------------------
+            jd: dict = {}
+            ld: dict = {}   # --skip-jank 时这两个不进 L6 的分母，但名字必须存在（L6 要引用）
+            # 用户报"一顿一顿"而门全绿，有两条理由：①`composited_fps` 是帧数÷墙钟的**均值**，
+            # 一帧 1.2 s 的停顿摊进均值只剩 0.03 fps；②电池只跑 10 s 还带 seek，实测最坏那十帧
+            # 落在 5.7~16.4 s，从没被覆盖过。这层自己走完整条时间轴，判 p95/max，并把
+            # "重复上一帧"的次数与新帧速率一起报出来——否则"不卡"可能只是"冻住了"。
+            if not args.skip_jank:
+                dur_ms = int(round(m["duration_us"] / 1000)) + 700
+                jd = battery(Path(media_model).name, "jank", playms=dur_ms, seeks=0)
+                pl = jd.get("play") or {}
+                fc = pl.get("frame_cost_ms") or {}
+                p95, mx, n = fc.get("p95"), fc.get("max"), fc.get("n") or 0
+                ok = (n > 0 and isinstance(p95, (int, float)) and isinstance(mx, (int, float))
+                      and p95 <= CRITERIA["frame_cost_p95_ms_max"]
+                      and mx <= CRITERIA["frame_cost_max_ms_max"])
+                w = pl.get("warm") or {}
+                verdict("L4 frame budget (whole timeline, tail not mean)", ok,
+                        f"n={n} p50={fc.get('p50')} p90={fc.get('p90')} p95={p95} max={mx} ms"
+                        f"（p95<={CRITERIA['frame_cost_p95_ms_max']} / "
+                        f"max<={CRITERIA['frame_cost_max_ms_max']}）；"
+                        f">33ms {fc.get('over_33ms')} >100ms {fc.get('over_100ms')}；"
+                        f"重复上一帧 {pl.get('pump', {}).get('stale_holds')} 次，"
+                        f"新帧 {pl.get('fresh_track_frames_per_second')}/s"
+                        # 预热这条腿的分母：max 过线也可能因为它根本没跑（页侧默认开，一旦被改坏
+                        # 就退化成"别处巧合让 max 达标"）。used≠started 就是有白热的解码器。
+                        f"；预热泵 {w.get('used')}/{w.get('started')} 被到点取用"
+                        f"（开={w.get('on')} 白热={w.get('wasted')} 废={w.get('dropped')}）"
+                        + ("" if ok else f" | worst={fc.get('worst', [])[:3]} fps={pl.get('composited_fps')}"))
+            # ---- 4c. L4 直播节奏（tick 那条真实通路，用 drive=timer 敲同一个函数体）--------------
+            # 其余各腿都跑在 battery() 自己按墙钟补帧的循环上；本机 headless、Qoder 内置浏览器、
+            # 我自己起的带头 Chrome 三处都实测 **rAF 0 帧**，真实 rAF 自动测不到。
+            # 但 tick() 本来就是 rAF 不等返回的 fire-and-forget ⇒ 用同帧率的定时器去敲它，
+            # `await paint()` 挡住下一拍的效应一样，于是"用户看到的那条路"终于有自动读数。
+            # 读数口径写死是 timer 驱动，不许冒充真实 rAF（写进报告字段 driver）。
+            if not args.skip_jank:
+                live_ms = int(round(m["duration_us"] / 1000)) + 3000
+                # 网关按 tag 分文件写（report-<tag>.jsonl）。这个坑本轮踩过三次：
+                # 不显式带 &tag= 而依赖页面默认值，就会去读一个永远不增长的 `report-playback.jsonl`，
+                # 症状是"页面什么都没回答"。所以 URL 里写死 tag，读的也就是那个文件。
+                lrep = OUT / "report-livepacing.jsonl"
+                before = len(lrep.read_text(encoding="utf-8").splitlines()) if lrep.exists() else 0
+                run([PY, "scripts/browser_soak.py", "--url",
+                     f"http://127.0.0.1:{port}/playback-test/{args.player}"
+                     f"?liveplay={live_ms}&model={Path(media_model).name}"
+                     f"&drive=timer&fps=30&tag=livepacing",
+                     "--seconds", str(int(live_ms / 1000) + 25),
+                     "--report", str(lrep.relative_to(ROOT)), "--tag", "livepacing"])
+                lines = lrep.read_text(encoding="utf-8").splitlines() if lrep.exists() else []
+                ld = json.loads(lines[-1]) if len(lines) > before else {}
+                lv = ld.get("live") or {}
+                # 音画残差：音频时钟走过的秒数与播放头走过的秒数之差。
+                # 必须**截到播放头还在走的那段**——时间轴走完 pos 就钉在 DUR，
+                # 而 ctx 继续跑到 liveplay 窗口结束，不截就会看到 +4.9 s 的假失步（本轮就差点报出去）。
+                dur = m["duration_us"] / 1e6
+                ctk = [x for x in (lv.get("clock_track") or []) if len(x) > 2 and x[2] is not None]
+                playing_pts = [x for x in ctk if x[1] < dur - 0.05]
+                avres: list[float] = []
+                if len(playing_pts) > 5:
+                    p0, c0 = playing_pts[0][1], playing_pts[0][2]
+                    avres = [(x[2] - c0) / 1000.0 - (x[1] - p0) for x in playing_pts]
+                av_max = max((abs(v) for v in avres), default=None)
+                nfr, p95, mx = lv.get("frames"), lv.get("gap_p95_ms"), lv.get("gap_max_ms")
+                okl = (isinstance(nfr, int) and nfr > 200
+                       and isinstance(p95, (int, float)) and p95 <= 50.0
+                       and isinstance(mx, (int, float)) and mx <= 150.0
+                       and avres and av_max is not None and av_max <= 0.05)
+                verdict("L4 live pacing + A/V residual (drive=timer, not real rAF)", okl,
+                        f"n={nfr} 帧 gap p50={lv.get('gap_p50_ms')} p95={p95} max={mx} ms"
+                        f"（p95<=50 / max<=150）；音画残差 max={None if av_max is None else round(1000*av_max)} ms"
+                        f"（<=50，截到播放头走完为止）；paint p95={lv.get('paint_p95_ms')} "
+                        f"driver={lv.get('driver')} avclk={lv.get('avclk')} 错误={len(ld.get('tick_errors') or [])}")
+
+            # L6 的分母原本只有 10 s 电池那几条跑，于是**整条时间轴那跑里的黑屏从来没被 judge 过**。
+            # P-85 就是这么一条：flag=2 叠层 `C7817`（窗口 10.733–12.467 s）在整条跑里连续 ≥5 帧没出图，
+            # 同跑 L6 仍报 0/1。判"有没有静默黑屏"却不看用户实际会走完整条的那一遍，等于只在一小段
+            # 采样里有牙齿。现在把整条跑（jank）与直播节奏跑（livepacing）一起纳入，并按路径标注，
+            # 免得两个分母混成一个数。
+            extra_runs = [("整条时间轴", jd), ("直播节奏", ld)]
             bad = [d for d in runs if d.get("black_streaks") or d.get("errors")]
-            verdict("L6 no silent black frame", not bad,
-                    f"{len(bad)}/{len(runs)} runs with black_streaks or errors"
-                    + (f"; e.g. {bad[0].get('black_streaks')} {bad[0].get('errors')[:1]}" if bad else ""))
+            bad_x = [(name, d) for name, d in extra_runs
+                     if isinstance(d, dict) and (d.get("black_streaks") or d.get("errors"))]
+            verdict("L6 no silent black frame", not bad and not bad_x,
+                    f"{len(bad)}/{len(runs)} 电池跑 + {len(bad_x)}/{len(extra_runs)} 整条/直播跑"
+                    f" 有 black_streaks 或 errors"
+                    + (f"; e.g. {bad[0].get('black_streaks')} {bad[0].get('errors')[:1]}" if bad else "")
+                    + "".join(f" | {n}: {d.get('black_streaks')} {(d.get('errors') or [''])[0][:70]}"
+                              f" (max帧时 {(d.get('play') or {}).get('frame_cost_ms', {}).get('max')} ms"
+                              f", 不成像素材 {(d.get('no_video_media') or {}).get('frames_skipped')} 帧)"
+                              for n, d in bad_x))
             aud = [aud_of(d) for d in runs]
             nerr = sum(1 for a in aud if a.get("audio_errors"))
             rates = sorted({r for d in runs for r in (play(d).get("audio_rates_seen") or [])})
@@ -422,8 +548,11 @@ def main() -> int:
             run([PY, "scripts/browser_soak.py", "--url", url,
                  "--seconds", str(args.shot_seconds), "--report", str(report.relative_to(ROOT)),
                  "--tag", "shot", "--timeout", str(args.shot_seconds + 25)])
+            # 通道 2 这一腿必须和浏览器**播同一批媒体**。浏览器播的是代理（`--media-model`），
+            # 而这里一直传的是 `--model`（原片）——F-083 第③条量过这个混淆本身就有 0.04
+            # （0.910 vs 0.948），拿它当「两条通道不一致」会把管线差异算到渲染账上。
             sh = run([PY, "scripts/browser_shot_check.py", "--timestamps", times,
-                      "--model", args.model, "--frames-dir", args.oracle_frames,
+                      "--model", media_model, "--frames-dir", args.oracle_frames,
                       "--report", str((OUT / "browser-shots.json").relative_to(ROOT))])
             js = OUT / "browser-shots.json"
             n = problems = 0
@@ -499,6 +628,15 @@ def main() -> int:
         tail = [ln for ln in wr.stdout.splitlines() if "wiring checks" in ln]
         verdict("L7 mixmode wiring (constructed fixture)", wr.returncode == 0,
                 (tail[-1] if tail else (wr.stdout or wr.stderr)[-150:]))
+        # 浏览器那条腿单独一层：本草稿 0 个 mix_mode 段，L1~L10 在真实模型上永远不会
+        # 走到浏览器混合路径；这层拿注入件跑真浏览器，判"载体取到切片、滤镜建出来、
+        # 挂在活节点上"，并且带**反 fixture**（未知包 md5 必须降级且不挂任何节点）。
+        bw = run([PY, "scripts/mixmode_browser_check.py",
+                  "--carrier", args.media_model or args.model], timeout=300)
+        btail = [ln for ln in bw.stdout.splitlines() if "MIXMODE_BROWSER_WIRING" in ln]
+        verdict("L7 mixmode browser wiring (fixture + negative fixture)",
+                bw.returncode == 0 and any("MIXMODE_BROWSER_WIRING ok" in ln for ln in btail),
+                (btail[-1][:150] if btail else (bw.stdout or bw.stderr)[-150:]))
         if args.mixmode_gpu:
             eq = run([PY, "scripts/mixmode_equivalence.py"], timeout=args.mixmode_seconds)
             tp = ROOT / "docs" / "evidence" / "tables" / "mixmode_equivalence.csv"
@@ -552,6 +690,53 @@ def main() -> int:
         tail = [ln for ln in aw.stdout.splitlines() if "animation wiring checks" in ln]
         verdict("L8 animation wiring (real draft, covered presets)", aw.returncode == 0,
                 (tail[-1] if tail else (aw.stdout or aw.stderr)[-160:]))
+        # 打字光标是**新落地的渲染路径**，而整帧类判据对「字幕是整句出现还是逐字露出」不敏感
+        # （F-072/F-080 同族）⇒ 表从载体里丢了、或 truncate 提前 return，都不会让任何一层变红。
+        # 规约「本草稿会触发的新渲染路径必须有自己的门层」，这条就是补上的那层。
+        tw = run([PY, "scripts/typewriter_wiring_check.py", "--model", args.model, "--segments", "2"])
+        twl = [ln for ln in tw.stdout.splitlines() if "TYPEWRITER_WIRING" in ln]
+        verdict("L8 typewriter wiring (prefix law live on channel 2 + carrier)", tw.returncode == 0,
+                (twl[-1].strip() if twl else (tw.stdout or tw.stderr)[-160:]))
+
+    # ---- 11. L11: 「向上闪入」曝光+垂直模糊的同刻开/关 A/B（对成片同帧号）--------------------
+    # 这条族是 L10 在 t=6.633 判红的成因（F-095/F-096），而整帧相关对「只有一层在动」不敏感
+    # （F-072/F-080）⇒ 两项各自都要能证明"生效了"。判据形态：窗内每帧 MAD 不变坏、窗外逐字节
+    # 相同、阴性对照（预切点）不动、降级 0 且分母报出来。窗内必须**同时**见到曝光项和模糊项，
+    # 否则表里那条 ADBE_Gaussian_Blur_2_0001_2_3 丢了也不会变红（空判据）。
+    if not args.skip_flash:
+        if args.oracle_mp4:
+            rep = OUT / "flash-ab-gate.json"
+            fr = run([PY, "scripts/flash_channel2_ab.py", "--model", media_model,
+                      "--mp4", args.oracle_mp4, "--lead", str(args.oracle_lead),
+                      "--fps", str(args.oracle_fps), "--report", str(rep)],
+                     timeout=args.flash_seconds)
+            try:
+                rows = json.loads(rep.read_text(encoding="utf-8")) if rep.is_file() else []
+            except (OSError, ValueError):
+                rows = []
+            live_of = lambda r: (r["exposure_E"] or 0) > 1e-4 or (r["vblur_V"] or 0) > 1e-4
+            live = [r for r in rows if live_of(r)]
+            idle = [r for r in rows if not live_of(r)]
+            expo_live = [r for r in live if (r["exposure_E"] or 0) > 1e-4]
+            blur_live = [r for r in live if (r["vblur_V"] or 0) > 1e-4]
+            # 两项各自单变量：曝光看 off→expo，模糊看 expo→both。只看 off→both 会漏掉
+            # 「曝光赚的被模糊亏回去」（206 帧那版过糊就是这么躲过去的）。
+            worse = [r["frame"] for r in live if r["mad_expo"] > r["mad_off"] + 0.05]
+            blur_worse = [r["frame"] for r in blur_live if r["mad_both"] > r["mad_expo"] + 0.05]
+            flat = [r["frame"] for r in live if abs(r["mad_both"] - r["mad_off"]) <= 0.05]
+            moved = [r["frame"] for r in idle if abs(r["mad_both"] - r["mad_off"]) > 1e-9]
+            degrades = [x for r in rows for x in (r.get("log") or []) if x[0] == "degraded"]
+            ok = (fr.returncode == 0 and rows and expo_live and blur_live
+                  and not worse and not blur_worse and not moved and not degrades)
+            verdict("L11 flash in/out A/B (channel 2 vs export, same frame index)", ok,
+                    f"{len(rows)} 帧：窗内 {len(live)}（曝光 {len(expo_live)} / 模糊 {len(blur_live)}）、"
+                    f"窗外 {len(idle)}；曝光变坏 {len(worse)} 模糊变坏 {len(blur_worse)} "
+                    f"合计持平 {len(flat)}，窗外位移 {len(moved)}，降级 {len(degrades)}/{len(rows)}"
+                    + (f" worse={worse[:4]} blur_worse={blur_worse[:4]}"
+                       if (worse or blur_worse) else "")
+                    + ("" if ok else f" | rc={fr.returncode} err={(fr.stderr or '')[-120:]}"))
+        else:
+            checks.append(("L11 flash in/out A/B", "SKIP", "no --oracle-mp4 given"))
 
     width = max(len(name) for name, _, _ in checks) + 2
     # 控制台编码是 GBK：detail 里带中文（脚本 stdout 尾巴、预设名）时 print() 会在**最后一步**

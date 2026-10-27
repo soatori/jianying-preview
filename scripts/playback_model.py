@@ -195,6 +195,10 @@ class Model:
             "source": {"start_us": s_start, "duration_us": s_dur},
             "speed": speed,
             "render_index": seg.get("render_index"),
+            # 轨道级叠序键。语料里 1412/2218 份草稿带它（`render_index_track_mode_on` 为 true 的 1576 份），
+            # 以前 L1 根本不复制 ⇒ 下面的叠序哨兵会恒等通过（我第一次的负样本测试就是这么暴露的）。
+            # 值按剪映的写法**继承轨上第一个非空值**：它挂在段上，但语义是轨级的。
+            "track_render_index": seg.get("track_render_index"),
             # Segment-level level control. `materials.audios[].volume` is null on all 37 clips of
             # this draft, so reading only the material's volume silently drops the real attenuation:
             # 4 of 104 segments write a non-default one here, three of them the music bed at
@@ -257,6 +261,23 @@ class Model:
                 "loudness": self.ref_of(refs, "loudnesses"),
                 "fade": self.ref_of(refs, "audio_fades"),
             }
+        # 视频段也引用 loudnesses / audio_fades：剪映对**烘焙进组合缓存**的那条音轨做响度归一
+        # （实测一条 `enable:true, target_loudness:-12.0, avg_loudness:-9.26`，且它的
+        # time_range.duration=6.6 s 正等于主轨第一段的长度 ⇒ 归一对象就是组合音频）。
+        # 原来只在 audios 桶建 `audio`，视频段的归一信息整个不落模型，于是口播的替换音源
+        # 按满增益进混音：peak_fs 1.30→2.05、满刻度窗 33→458（P-88）。
+        if bucket == "videos" and mat:
+            loud = self.ref_of(refs, "loudnesses")
+            fade = self.ref_of(refs, "audio_fades")
+            if loud or fade:
+                out["audio"] = {
+                    "volume": mat.get("volume"),
+                    "duration_us": mat.get("duration"),
+                    "channel_layout": mat.get("channel_layout"),
+                    "type": mat.get("type"),
+                    "loudness": loud,
+                    "fade": fade,
+                }
         if bucket == "texts" and mat:
             content = load_json_string(mat.get("content") or "")
             styles = (content or {}).get("styles") or []
@@ -316,6 +337,23 @@ class Model:
                 return self.buckets[r["id"]][1]
         return None
 
+    def _tw_tables(self, path: str, name: str | None):
+        """把「打字光标」那两张**写死的**节奏表塞进模型条目（F-087）。
+
+        浏览器读不了包内 lua（网关只按 id 发媒体/字体），而这条律的表是常量不是随机数，
+        所以随模型带 28 个浮点是让两通道共用**同一条律**的最小代价——比在页面里另抄一份强。
+        """
+        if name != "打字光标" or not path:
+            return None
+        cache = self.__dict__.setdefault("_tw_cache", {})
+        if path not in cache:
+            try:
+                import animation_curve as ac
+                cache[path] = ac.load_typewriter(path)
+            except Exception:                               # noqa: BLE001
+                cache[path] = None
+        return cache[path]
+
     def animations_for(self, refs: list[dict]) -> list[dict]:
         """把 extra_material_refs -> materials.material_animations[] 解成渲染可用的条目。
 
@@ -346,6 +384,7 @@ class Model:
                     "material_type": a.get("material_type"),
                     "path": path or None,
                     "package_exists": bool(path) and os.path.isdir(path),
+                    "tw": self._tw_tables(path, a.get("name")),
                     "anim_material_id": item.get("id"),
                 })
             for k in ("in", "out", "loop"):
@@ -479,7 +518,39 @@ class Model:
                         vol += v2
             return hit, tot, hidden, vol
 
+        # 叠序归属（U-15）的**发现器**，不是新律：语料 2218 份草稿里 `render_index_track_mode_on`
+        # 为 true 的有 1576 份、带 `track_render_index` 的 1412 份，但"按 tri 排"与"按轨道列表位置排"
+        # 在两律之间**从未在任何瞬间产生过不同次序**（temp/playback-test/u15_corpus_scan.py：可判对象 0 例，
+        # 唯一一例次序不一致也只是两条轨并列同一个值，不是反转）⇒ 不凭推断改渲染次序，只留哨兵：
+        # 真出现反转的草稿必须拿成片重判，而不是让渲染器按一个未证的律走。
+        def _first_tri(tr):
+            for sg in tr["segments"]:
+                if sg.get("track_render_index") is not None:
+                    return sg["track_render_index"]
+            return None
+
+        _keys = [(_first_tri(tr) if _first_tri(tr) is not None else -1, i)
+                 for i, tr in enumerate(tracks_out)]
+        if [i for _, i in sorted(_keys, key=lambda p: p[0])] != list(range(len(tracks_out))):
+            self.warnings.append(
+                "track_render_index order != track list order "
+                f"(mode_on={draft.get('render_index_track_mode_on')}) ⇒ 叠序两律在此草稿上会分叉，"
+                "U-15 需按成片重判，别照现行律出图")
+
         geo_hit, geo_tot, geo_hidden, geo_vol = count_geometry(tracks_out)
+        # 轨类型的**覆盖分母**（U-98）：画面腿只走 video/text，声音腿只走 audio/video，
+        # 于是 mixed / sticker / effect / adjust / filter 这几类轨被静默丢掉——语料尺度上
+        # mixed 有 930 条轨 / 355 份草稿（其中材料桶是 videos 1723 + texts 848，是真内容），
+        # sticker 280 条。不报错的丢失最难发现，所以先把"没被任何腿路由的段数"变成数。
+        _rendered = ("video", "text", "audio")
+        type_segs: dict = {}
+        unrouted = 0
+        for tr in tracks_out:
+            ty = tr.get("type") or "?"
+            n = len(tr.get("segments") or [])
+            type_segs[ty] = type_segs.get(ty, 0) + n
+            if ty not in _rendered:
+                unrouted += n
         return {
             "timeline_id": draft.get("id"),
             "duration_us": declared,
@@ -500,6 +571,8 @@ class Model:
                 "geometry_total": geo_tot,
                 "invisible_segments": geo_hidden,
                 "volume_segments": geo_vol,
+                "track_type_segments": type_segs,
+                "unrouted_track_segments": unrouted,
                 "mix_mode_segments": sum(1 for tr in tracks_out for s in tr["segments"]
                                          if s.get("mix_mode")),
                 "animation_segments": sum(1 for tr in tracks_out for s in tr["segments"]

@@ -60,6 +60,28 @@ def wait_port(port: int, timeout: float = 25.0) -> bool:
     return False
 
 
+def drift_from(txt: str) -> dict | None:
+    """末 60 s 中位 − 首 60 s 中位。soak 自带的 `growth_mb_over_window` 不能用：
+    它是「末值 − 首值」，而首值永远是 Chrome 还没起 renderer 时的 5 MB ⇒ 每条臂都"增长 ~1000 MB"。"""
+    ps = re.search(r"per_second:(.+)", txt)
+    if not ps:
+        return None
+    by_sec: dict[int, int] = {}
+    for s, v in re.findall(r"(\d+)s=(\d+)MB", ps.group(1)):
+        by_sec[int(s)] = int(v)                      # 采样器一秒可能取两次，后者覆盖
+    secs = sorted(by_sec)
+    if len(secs) < 120:
+        return None
+    head = [by_sec[s] for s in secs if s < 60]
+    tail = [by_sec[s] for s in secs if s >= secs[-1] - 59]
+    vals = [by_sec[s] for s in secs]
+    return {"n": len(vals), "span_s": secs[-1],
+            "first60_median": statistics.median(head),
+            "last60_median": statistics.median(tail),
+            "drift_mb": statistics.median(tail) - statistics.median(head),
+            "p95_mb": statistics.quantiles(vals, n=20)[18]}
+
+
 def run_arm(name: str, model: str, port: int, seconds: int, playms: int, tag: str) -> dict:
     extra = ""
     if "?" in model:
@@ -78,14 +100,28 @@ def run_arm(name: str, model: str, port: int, seconds: int, playms: int, tag: st
         return {"arm": name, "model": model, "error": f"{rss.name} 没写出来（soak 退出码 {rr.returncode}）",
                 "stderr_tail": (rr.stderr or "")[-300:]}
     txt = rss.read_text(encoding="utf-8", errors="replace")
-    # browser_soak 的逐秒行形如 `  12.4 1180 14 gpu-process=...,renderer=...`
-    numbers = [int(m) for m in re.findall(r"^\s*[\d.]+\s+(\d+)\s+\d+", txt, re.M)]
+    # browser_soak 现在只往这个文件里写**汇总行**（`wall_s=… samples=…` + rss_* + by_role），
+    # 不再写逐秒序列 ⇒ 老的逐秒正则永远匹配不到东西，于是 `samples=0` 而 median 悄悄回退到
+    # 汇总值——**读数看起来正常，其实没人检查过这轮跑了多久**。改成直接读汇总字段并**核对时长**：
+    # 上一版就是这样把一次 38 s 的跑当成 600 s 报出来的（`--playms` 小于 `--seconds` 时，
+    # 页面放完一遍就结束，soak 跟着结束，而 `--seconds` 只是上限不是下限）。
+    got = {}
+    for k in ("wall_s", "samples"):
+        m = re.search(rf"{k}=(\d+(?:\.\d+)?)", txt)
+        if m:
+            got[k] = float(m.group(1))
     summary = {}
     for k in ("rss_first_mb", "rss_mean_mb", "rss_peak_mb", "rss_last_mb", "rss_median_mb"):
         m = re.search(rf"{k}=(\d+)", txt)
         if m:
             summary[k] = int(m.group(1))
     over = re.search(r"seconds_over_2048=(\S+)", txt)
+    wall = got.get("wall_s", 0.0)
+    short = wall < 0.8 * seconds
+    # 漂移才是 600 s 这一档真正要量的东西。soak 自带的 `growth_mb_over_window` **不能用**：
+    # 它是「末值 − 首值」，而首值永远是 Chrome 还没起 renderer 时的 5 MB，于是每条臂都"增长 ~1000 MB"。
+    # 这里改成**末 60 s 中位 − 首 60 s 中位**（都取稳定窗口），并一并报 p95。
+    drift = drift_from(txt)
     # 只看 by_role 那一行：整份文件里 `rss_peak_mb=1540` 也会被 ROLE_RE 误抓成角色 "s"
     roles = {}
     for line in txt.splitlines():
@@ -93,10 +129,9 @@ def run_arm(name: str, model: str, port: int, seconds: int, playms: int, tag: st
             continue
         for r, mb in ROLE_RE.findall(line):
             roles[r] = max(roles.get(r, 0), int(mb))
-    return {"arm": name, "model": model, "samples": len(numbers),
-            "median_from_samples": round(statistics.median(numbers), 1) if numbers else None,
-            "p95_from_samples": round(statistics.quantiles(numbers, n=20)[18], 1) if len(numbers) > 20 else None,
-            "max_from_samples": max(numbers) if numbers else None,
+    return {"arm": name, "model": model, "samples": int(got.get("samples", 0)),
+            "wall_s": wall, "short": short, "drift": drift,
+            "median_from_samples": None, "p95_from_samples": None, "max_from_samples": None,
             "summary": summary, "seconds_over": over.group(1) if over else None,
             "roles_peak_seen": roles}
 
@@ -135,20 +170,32 @@ def main() -> int:
             gw.kill()
 
     print("-" * 70)
+    bad = []
     for r in out:
         if r.get("error"):
             print(f"  {r['arm']:<14} ERROR {r['error']}")
+            bad.append(r["arm"])
             continue
         s = r["summary"]
-        print(f"  {r['arm']:<14} 样本={r['samples']:>4} "
-              f"median={r['median_from_samples'] or s.get('rss_median_mb')} "
-              f"p95={r['p95_from_samples']} max={r['max_from_samples'] or s.get('rss_peak_mb')} "
-              f"越线={r['seconds_over']} 角色峰值={r['roles_peak_seen']}")
+        flag = "  <-- 时长不足，这条臂作废" if r.get("short") else ""
+        dr = r.get("drift") or {}
+        print(f"  {r['arm']:<14} 样本={r['samples']:>4} 实跑={r.get('wall_s', 0):.0f}s"
+              f"/{args.seconds}s median={s.get('rss_median_mb')} mean={s.get('rss_mean_mb')} "
+              f"peak={s.get('rss_peak_mb')} last={s.get('rss_last_mb')} "
+              f"漂移={dr.get('drift_mb', '?')}MB(首60s {dr.get('first60_median','?')}→末60s "
+              f"{dr.get('last60_median','?')}) p95={dr.get('p95_mb','?')} "
+              f"越线={r['seconds_over']} 角色峰值={r['roles_peak_seen']}{flag}")
+        if r.get("short"):
+            bad.append(r["arm"])
+    if bad:
+        # 上一版就是这里没喊：`--playms` 比 `--seconds` 小时页面放完一遍就收工，
+        # 38 s 的数据被当成 600 s 报出来，median/peak 全都像真的。
+        print(f"  ! 无效臂：{bad} —— 需要 --playms >= --seconds*1000（或让页面真循环）")
     Path(args.report).write_text(json.dumps({"seconds": args.seconds, "playms": args.playms,
                                              "arms": out}, ensure_ascii=False, indent=1),
                                  encoding="utf-8")
     print(f"report -> {args.report}")
-    return 0
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
