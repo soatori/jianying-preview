@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import socket
 import subprocess
@@ -248,6 +249,23 @@ def main() -> int:
 
     def verdict(name: str, ok: bool, detail: str) -> None:
         checks.append((name, "PASS" if ok else "FAIL", detail))
+
+    # ---- 0. L0: the player under test must be the tracked one -------------------------------
+    # The runtime copy sits in temp/ because that is where the gateway's static root and the
+    # `/playback-test/...` URLs point (it pulls pixi/mediabunny from /px-probe/node_modules too).
+    # If that copy drifts from `player/player.html`, every browser layer below judges code that is
+    # not in the repo -- so materialise it and assert the write landed byte-identical.
+    src = ROOT / "player" / "player.html"
+    dst = OUT / Path(args.player).name
+    if not src.is_file():
+        verdict("L0 tracked player present", False, f"{src} missing")
+    else:
+        blob = src.read_bytes()
+        tmp = dst.with_suffix(dst.suffix + ".sync.tmp")
+        tmp.write_bytes(blob)
+        os.replace(tmp, dst)
+        verdict("L0 tracked player in place", dst.read_bytes() == blob,
+                f"player/player.html -> {dst.relative_to(ROOT)} ({len(blob)} B), 与在册副本逐字节相同")
 
     # ---- 1. L1: build the model and read its own assertions -------------------------------
     r = run([PY, "scripts/playback_model.py", args.plain, "--draft-root", args.draft_root,
