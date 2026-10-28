@@ -20,7 +20,7 @@ Usage:
   python scripts/playback_check.py \
       --plain "temp/playback-test/plain/<草稿名>__draft_content.json.dec.json" \
       --draft-root "<草稿根>/<草稿名>" \
-      --timeline 017E2FEC-11D0-47d6-87C1-9709D2A2F18D \
+      --timeline "<时间线 uuid>" \
       --model temp/playback-test/model-proxy-a.json \
       --oracle-mp4 "<你的成片 mp4>" \
       --pixel-t 1.0 --pixel-colour 255,255,255

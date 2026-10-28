@@ -587,7 +587,7 @@ const CHILD_AUDIO = Q.get('childaudio') !== '0';
 const CHILD_NORM = Q.get('childnorm') !== '0';
 // 视频段自带音轨默认**仍与影像共用一条 Input**（`&vidaudiopriv=1` 才另开私有流）。
 // 我按"两个读者拉同一条流会饿死解码"的假设做过配对实验：priv0 三跑空窗 1 次 vs priv1 三跑 2 次，
-// 且 max 帧时 97/93/91 → 128/170/142 更差，空窗位置在两臂完全相同（658C39C6@11.11、89614BA4@25.74）
+// 且 max 帧时 97/93/91 → 128/170/142 更差，空窗位置在两臂完全相同（同两段、同一时刻）
 // ⇒ 假设被否证，这不是流争用而是**位置相关的解码吞吐**（见 P-92）。留着开关只是否证的化石。
 const VIDEO_AUDIO_PRIV = Q.get('vidaudiopriv') === '1';
 async function scheduleAudio(posSec) {

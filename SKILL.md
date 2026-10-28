@@ -56,7 +56,7 @@ python scripts/playback_check.py --plain "<plain.json>" --draft-root "<草稿根
 | 变量 | 用途 |
 |---|---|
 | `JY_ORACLE_MP4` | 原生导出成片路径（L3 像素判据与若干 A/B 的对照物）。未设时相关脚本走"文件不存在"分支并报错，不会静默用空路径比对 |
-| `LOCALAPPDATA` | 剪映机器资产（效果包、字体）根；`C:\Users\<你>\AppData\Local\JianyingPro\User Data\...` |
+| `LOCALAPPDATA` | 剪映机器资产（效果包、字体）根，即 `%LOCALAPPDATA%\JianyingPro\User Data\...`（脚本用 `Path.home()`，不写死用户名） |
 
 ## 门能判什么（编号即层名）
 
