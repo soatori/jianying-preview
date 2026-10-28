@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -25,10 +26,25 @@ def _default_draft_roots() -> list[str]:
 
 
 _DEFAULT_DRAFT_ROOTS = tuple(_default_draft_roots())
-_DEFAULT_INSTALL_ROOTS = (
-    r"D:\Program Files\JianyingPro",
-    r"C:\Program Files\JianyingPro",
-)
+
+
+def _default_install_roots() -> list[str]:
+    """静态两根永远在册，检测到的根再并进来。
+
+    栅栏不能因为检测失败而变窄：``jy_paths`` 不可用时这里照样给出 D/C 两根。
+    """
+    roots = [r"D:\Program Files\JianyingPro", r"C:\Program Files\JianyingPro"]
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import jy_paths
+
+        roots.extend(str(p) for p in jy_paths.guard_roots())
+    except Exception:                                 # noqa: BLE001
+        pass
+    return roots
+
+
+_DEFAULT_INSTALL_ROOTS = tuple(_default_install_roots())
 
 
 class WriteFenceError(RuntimeError):

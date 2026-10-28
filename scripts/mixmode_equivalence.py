@@ -40,6 +40,7 @@ except Exception:                                 # noqa: BLE001
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "temp" / "playback-test"
 PY = sys.executable
+import jy_paths                                      # noqa: E402
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -70,14 +71,16 @@ def wait_port(port: int, timeout: float = 25.0) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--install", default=r"D:/Program Files/JianyingPro/11.6.0.14552")
+    ap.add_argument("--install", default=None,
+                    help="剪映安装目录（版本目录）；缺省由 scripts/jy_paths.py 自动检测")
     ap.add_argument("--model", default=str(OUT / "model-check.json"))
     ap.add_argument("--seconds", type=int, default=120)
     ap.add_argument("--tolerance", type=int, default=1, help="8-bit units treated as equal")
     args = ap.parse_args()
+    install = args.install or str(jy_paths.install_dir())
 
     # 1. 抽取 frag 原文到网关可服务的目录（sha256 与安装目录逐字节一致，见 manifest.json）
-    ex = run([PY, "scripts/mixmode_extract.py", "--install", args.install,
+    ex = run([PY, "scripts/mixmode_extract.py", "--install", install,
               "--out-dir", str(OUT / "mixmode")])
     if ex.returncode:
         print(ex.stdout, ex.stderr)

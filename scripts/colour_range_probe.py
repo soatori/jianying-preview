@@ -50,8 +50,10 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "temp" / "playback-test"
-FF = r"D:\Program Files\JianyingPro\11.6.0.14552\ffmpeg.exe"
 sys.path.insert(0, str(ROOT / "scripts"))
+import jy_paths                                      # noqa: E402
+
+FF = str(jy_paths.ffmpeg())
 
 
 def free_port() -> int:

@@ -1,3 +1,5 @@
 /temp/
 /docs/
 __pycache__/
+/config.local.json
+/config.local.json.tmp

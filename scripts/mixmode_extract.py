@@ -10,7 +10,7 @@
 inputWidth/inputHeight/_alpha/baseTex/_MainTex），所以走哪条 alpha 分支由引擎决定，不由包决定。
 
 用法：
-    python scripts/mixmode_extract.py [--install "D:/Program Files/JianyingPro/11.6.0.14552"]
+    python scripts/mixmode_extract.py [--install "<剪映安装目录>"]   # 缺省自动检测
                                       [--out-dir temp/mixmode]
 输出：temp/mixmode/frags/<nameId>.frag + temp/mixmode/manifest.json
       docs/evidence/tables/mixmode_frag_manifest.csv
@@ -33,6 +33,8 @@ except Exception:                                 # noqa: BLE001
     pass
 
 ROOT = Path(__file__).resolve().parent.parent
+import jy_paths                                      # noqa: E402
+
 FUNC_RE = re.compile(r"^\s*(?:float|vec4)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
 UNIFORM_RE = re.compile(r"^\s*uniform\s+\w+\s+(\w+)\s*;", re.M)
 VARYING_RE = re.compile(r"^\s*varying\s+\w+\s+(\w+)\s*;", re.M)
@@ -47,12 +49,13 @@ def find_frag(pkg: Path) -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--install", default=r"D:/Program Files/JianyingPro/11.6.0.14552")
+    ap.add_argument("--install", default=None,
+                    help="剪映安装目录（版本目录）；缺省由 scripts/jy_paths.py 自动检测")
     ap.add_argument("--out-dir", default=str(ROOT / "temp" / "mixmode"))
     ap.add_argument("--table", default=str(ROOT / "docs" / "evidence" / "tables" / "mixmode_frag_manifest.csv"))
     args = ap.parse_args()
 
-    install = Path(args.install)
+    install = Path(args.install) if args.install else jy_paths.install_dir()
     mixdir = install / "Resources" / "MixMode"
     index = json.loads((mixdir / "MixMode.json").read_text(encoding="utf-8-sig"))
     out = Path(args.out_dir)

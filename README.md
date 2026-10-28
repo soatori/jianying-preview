@@ -19,5 +19,7 @@
 ## 说明
 
 - 本工具集对草稿**只读**，不会修改任何剪映项目文件。
-- 剪映安装路径：`D:\Program Files\JianyingPro`
+- 剪映安装路径不写死：`python scripts/jy_paths.py` 自动检测（默认查 C:/D: 的 `Program Files`、
+  `Program Files (x86)` 与 user 的 `%LOCALAPPDATA%\JianyingPro\Apps`），结果记在 `config.local.json`
+  （已 gitignore）。装在不同盘时设 `JY_INSTALL_DIR` 指向版本目录。
 - 想参与或跟进，先读 `docs/spec/00-overview.md`。

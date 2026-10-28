@@ -45,7 +45,10 @@ try:
 except Exception:                                 # noqa: BLE001
     pass
 
-FF = r"D:\Program Files\JianyingPro\11.6.0.14552\ffmpeg.exe"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import jy_paths                                      # noqa: E402
+
+FF = str(jy_paths.ffmpeg())
 K_EM = 0.00574          # F-035/F-036 band 0.00574-0.00578; em_px = size * canvas_width * k
 ROOT = Path(__file__).resolve().parents[1]
 

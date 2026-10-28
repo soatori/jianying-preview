@@ -22,6 +22,7 @@ import glob
 import os
 import re
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +54,13 @@ def _install_roots() -> list[Path]:
             roots.append(Path(value) / "JianyingPro")
     for drive in ("C:", "D:", "E:"):
         roots.append(Path(drive + os.sep) / "Program Files" / "JianyingPro")
+    try:  # 与 scripts/jy_paths.py 共用同一份候选根，两边不会各扫各的
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import jy_paths
+
+        roots.extend(jy_paths.candidate_roots())
+    except Exception:                                 # noqa: BLE001
+        pass
     return roots
 
 
