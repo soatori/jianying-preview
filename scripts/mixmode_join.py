@@ -7,7 +7,7 @@ blend function from docs/evidence/tables/mixmode_glsl.csv.
 
 Writes docs/evidence/tables/{mixmode_packages,mixmode_draft_paths}.csv.
 
-Usage: python scripts/mixmode_join.py [--install "D:/Program Files/JianyingPro/11.6.0.14552"]
+Usage: python scripts/mixmode_join.py [--install "<剪映安装目录>"]   # 缺省自动检测
 """
 import argparse
 import collections
@@ -17,6 +17,8 @@ import json
 import os
 import re
 from pathlib import Path
+
+import jy_paths
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / 'temp' / 'corpus-scan' / 'manifest.json'
@@ -35,10 +37,12 @@ def load_glsl():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--install', default=r'D:/Program Files/JianyingPro/11.6.0.14552')
+    ap.add_argument('--install', default=None,
+                    help='剪映安装目录（版本目录）；缺省由 scripts/jy_paths.py 自动检测')
     args = ap.parse_args()
 
-    index_path = Path(args.install) / 'Resources' / 'MixMode' / 'MixMode.json'
+    install = Path(args.install) if args.install else jy_paths.install_dir()
+    index_path = install / 'Resources' / 'MixMode' / 'MixMode.json'
     index = json.loads(index_path.read_text(encoding='utf-8-sig'))['resourceList']
     by_rid = {str(e['resourceId']): e for e in index}
     by_eid = {str(e['effectId']): e for e in index}

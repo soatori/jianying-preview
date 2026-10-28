@@ -53,7 +53,10 @@ except Exception:                                 # noqa: BLE001
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "temp" / "playback-test"
 PY = sys.executable
-FFMPEG = r"D:\Program Files\JianyingPro\11.6.0.14552\ffmpeg.exe"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import jy_paths                                      # noqa: E402
+
+FFMPEG = str(jy_paths.ffmpeg())
 
 # The six base criteria, as thresholds. Values come from docs/spec (render-base decision) and the
 # readings in docs/evidence/playback-log.md; a criterion with no agreed basis is reported INFO.

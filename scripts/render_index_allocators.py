@@ -23,8 +23,10 @@ import os
 import re
 from pathlib import Path
 
+import jy_paths
+
 ROOT = Path(__file__).resolve().parent.parent
-APP_JS = Path('D:/Program Files/JianyingPro/11.6.0.14552/Resources/canvas_agent/app/static/js')
+APP_JS = jy_paths.app_js_dir()
 MANIFEST = ROOT / 'temp' / 'corpus-scan' / 'manifest.json'
 PLAIN = ROOT / 'temp' / 'corpus-scan' / 'plain'
 OUT = ROOT / 'docs' / 'evidence' / 'tables'

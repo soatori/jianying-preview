@@ -45,7 +45,9 @@ try:
 except Exception:                                 # noqa: BLE001
     pass
 
-FFMPEG = r"D:\Program Files\JianyingPro\11.6.0.14552\ffmpeg.exe"
+import jy_paths                                      # noqa: E402
+
+FFMPEG = str(jy_paths.ffmpeg())
 LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 

@@ -18,6 +18,7 @@ description: 只读预览与校验剪映(JianYingPro)草稿：解析/解密 draf
 | 件 | 位置 | 职责 |
 |---|---|---|
 | L1 模型 | `scripts/playback_model.py` | 解密/解析草稿 → `model.json`（段、几何、字体、动画引用、音量、断言） |
+| 安装定位 | `scripts/jy_paths.py` | 自动检测剪映安装（`ffmpeg.exe` / `videoeditor.dll` / `canvas_agent` 的 js 目录都从这里取），结果记在 `config.local.json`；不再往脚本里写死盘符 |
 | 网关 | `scripts/preview_gateway.py` | 只绑 127.0.0.1、GET/HEAD、Range + keep-alive；媒体与字体按不透明 id 供；`/report` `/shot` `/wave` 回收入口 |
 | 浏览器通道 | `player/player.html` | Pixi 8 合成 + mediabunny 解码 + WebAudio 混音；运行副本在 `temp/playback-test/player.html`（门会逐字节校验） |
 | 离线通道 | `scripts/render_frame.py` | PIL/ffmpeg 同律渲染，用于像素级对照与成片比对 |
@@ -29,7 +30,8 @@ description: 只读预览与校验剪映(JianYingPro)草稿：解析/解密 draf
 ## 最小可用流程
 
 ```bash
-# 0) 解密草稿（只读；plain 产物进 temp/）
+# 0) 安装位置自检（只读，结果记在 config.local.json），再解密草稿（plain 产物进 temp/）
+python scripts/jy_paths.py
 python scripts/media_probe.py "<draft_content.json>"          # 结构清点（GOP/moov/elst）
 python scripts/playback_model.py "<plain.json>" --draft-root "<草稿根>" \
        --timeline <uuid> --out temp/playback-test/model.json
@@ -57,6 +59,8 @@ python scripts/playback_check.py --plain "<plain.json>" --draft-root "<草稿根
 |---|---|
 | `JY_ORACLE_MP4` | 原生导出成片路径（L3 像素判据与若干 A/B 的对照物）。未设时相关脚本走"文件不存在"分支并报错，不会静默用空路径比对 |
 | `LOCALAPPDATA` | 剪映机器资产（效果包、字体）根，即 `%LOCALAPPDATA%\JianyingPro\User Data\...`（脚本用 `Path.home()`，不写死用户名） |
+| `JY_INSTALL_DIR` | 钉死剪映安装版本目录（如 `D:\Program Files\JianyingPro\11.6.0.14552`）。不设时由 `scripts/jy_paths.py` 查 C:/D: 的 `Program Files`、`Program Files (x86)` 与 user 的 `%LOCALAPPDATA%\JianyingPro\Apps`，取「完整安装」（有 `Resources/` 且带 `ffmpeg.exe`/`videoeditor.dll`）里版本号最大的那个，并写回 `config.local.json` |
+| `config.local.json` | 本机安装记录（skill 根目录，已 gitignore）。记录里的目录还在就沿用，不再走盘；被升级/删除后自动重扫。`python scripts/jy_paths.py --rescan` 强制重扫 |
 
 ## 门能判什么（编号即层名）
 
