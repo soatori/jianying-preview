@@ -1,0 +1,1999 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>剪映草稿只读预览（播放测试）</title>
+<style>
+  html,body{margin:0;background:#111;color:#ddd;font:12px/1.4 monospace}
+  #stage{position:relative;width:min(100vw,calc(100vh*0.5625));margin:0 auto}
+  #stage canvas{width:100%;display:block}
+  #hud{padding:6px 10px;display:flex;gap:14px;flex-wrap:wrap}
+  #log{padding:6px 10px;white-space:pre-wrap;max-height:22vh;overflow:auto}
+  #bar{height:22px;background:#222;position:relative;cursor:pointer}
+  #play{position:absolute;height:100%;width:2px;background:#4f8cff;left:0}
+  .seg{position:absolute;height:4px;background:#5a5;opacity:.7}
+</style>
+<div id="hud">
+  <span id="pos">pos -</span><span id="fps">fps -</span><span id="stat">req 0 / bytes 0</span>
+  <span id="heap">heap -</span><span id="mode">mode idle</span>
+  <span>space 播放/暂停 · ←/→ ±1s · 点轨道条 seek</span>
+</div>
+<div id="stage"></div>
+<div id="bar"></div>
+<div id="log"></div>
+<script type="module">
+// Route A player skeleton on one real draft: model.json (scripts/playback_model.py) ->
+// mediabunny CustomSource closed-range fetch -> WebCodecs VideoDecoder -> Pixi compositing.
+// Geometry law from F-035: offset px = (x*W/2, -y*H/2), origin at canvas centre, y up.
+// Font law from F-035/F-036: em_px = size * canvasWidth * 0.00574 (band 0.00574-0.00578).
+// Draw order is NOT calibrated (U-15): larger render_index = on top is the working assumption.
+import { Application, Sprite, Texture, Text, Container, BlendModeFilter, ColorMatrixFilter, BlurFilter }
+  from '/px-probe/node_modules/pixi.js/dist/pixi.min.mjs';
+import { Input, CustomSource, VideoSampleSink, AudioBufferSink, ALL_FORMATS }
+  from '/px-probe/node_modules/mediabunny/dist/bundles/mediabunny.mjs';
+
+const Q = new URLSearchParams(location.search);
+const now = () => performance.now();
+const LOG = document.getElementById('log');
+const out = (s) => { LOG.textContent += s + '\n'; LOG.scrollTop = 1e9; console.log(s); };
+const stat = { requests: 0, bytes: 0 };
+const K_EM = 0.00574;
+
+const MODEL_URL = '/playback-test/' + (Q.get('model') || 'model.json');
+const model = await (await fetch(MODEL_URL)).json();
+const mediaList = await (await fetch('/media')).json();
+const idOf = new Map(mediaList.map((m) => [m.path, m.id]));
+const fontFamilies = new Map();   // declared before the first call: it is a const
+await loadFonts();
+const W = model.canvas.width, H = model.canvas.height;
+const DUR = model.duration_us / 1e6;
+// 未路由的轨类型必须先**说出来**（U-98）：画面腿只画 video/text、声音腿只走 audio/video，
+// 于是 mixed / sticker / effect / adjust / filter 整轨消失却不报错——与 P-12/P-68 同族：
+// 一条不报错的腿可以整条是死的，所以每条新通路都要自带分母。语料尺度：mixed 930 轨
+// （段的材料桶是 videos 1723 + texts 848 = 真内容）、sticker 280 轨。
+const UNCOVERED_TRACKS = {};
+for (const t of model.tracks) {
+  if (['video', 'text', 'audio'].includes(t.type)) continue;
+  UNCOVERED_TRACKS[t.type] = (UNCOVERED_TRACKS[t.type] || 0) + (t.segments || []).length;
+}
+if (Object.keys(UNCOVERED_TRACKS).length) {
+  out(`  · 未路由的轨类型：${Object.entries(UNCOVERED_TRACKS).map(([k, n]) => `${k} ${n}段`).join('，')}`
+    + '（画面与声音两条腿都不走，不是解析失败 ⇒ 见 U-98）');
+}
+const videoTracks = model.tracks.filter((t) => t.type === 'video' && t.segments.length);
+const textTracks = model.tracks.filter((t) => t.type === 'text' && t.segments.length);
+
+const app = new Application();
+await app.init({ width: W, height: H, background: '#000', antialias: false });
+document.getElementById('stage').appendChild(app.canvas);
+const world = new Container();
+world.sortableChildren = true;
+app.stage.addChild(world);
+const sprites = new Map();
+const texts = new Map();
+const comps = new Map();
+const liveThisFrame = new Set();
+const visibleThisFrame = new Set();
+const badge = new Text({ text: '', style: { fontFamily: 'monospace', fontSize: 26, fill: '#ffcf5a', lineHeight: 34 } });
+badge.x = 24; badge.y = 24; badge.visible = false; badge.zIndex = 1e9;
+app.stage.addChild(badge);   // 挂在 stage 上而不是 world 上：入场动画的全画布后处理不该糊到 HUD
+
+// ---- 「向上闪入」的 AE 律进浏览器（计划步骤②）------------------------------------------
+// 表由 `scripts/ae_table_export.py` 用**通道 2 同一个解析器**（ae_keyframe）按 1/30 s 步长导出，
+// 浏览器只查表插值：不再解析第二遍 lua、也不手抄数字（同族规矩：F-079 切片不誊写、P-33 曲线表）。
+// 曝光这一腿可以直接证成"就是 γ 空间乘一个增益"：`pow(v,2.2)·2^E` 再 `pow(1/2.2)` 与 `v·2^(E/2.2)`
+// 在 0..255 全部 256 个输入上 maxΔ=0.000000 码值（本轮 numpy 核过），
+// 所以用内建 ColorMatrixFilter 的对角阵即可——**不自建 sampler，避开 F-093 那条"自定义名不绑定"**。
+const AE = { loaded: false, n: 0, missing: [], applied: 0, lastE: 0, lastV: 0, eSum: 0, vSum: 0, blurPx: 0 };
+let AE_TABLE = {};
+try {
+  const j = await (await fetch('/playback-test/ae-curves.json')).json();
+  AE_TABLE = (j && j.curves) || {};
+  AE.loaded = !!j; AE.n = Object.keys(AE_TABLE).length; AE.step_us = j.step_us;
+} catch (e) { AE.loaded = false; }
+// V→垂直模糊半径（px）的比例。**标定出来的，不是猜的**（2026-10-26）：
+// 浏览器五臂实测 ratio(px)=1/(1+0.1273·px)（aok=0.05 ⇒ px=6.65 ⇒ 比值 0.541），
+// 要与通道 2 同刻**实际达到**的 gradV 对齐：浏览器只曝光时 gradV=7.128、通道 2 只曝光时 7.109
+// （两通道基线差 0.3%，说明画面本身同源），通道 2 曝+糊后=1.407 ⇒ 需要比值 0.197
+// ⇒ px=31.9 ÷ V(=133.2 @t=6.633) ⇒ k=0.2398。
+// 注意这是对**通道 2 已达到的**比值定的：通道 2 自己的阶梯上限在 V=300 时只能压到 0.20
+// （理论目标 0.057，成片绝对梯度 1.19 vs 我们 1.41），所以这条是"两通道一致"，不是"更像成片"。
+const AO_SIGMA_PER_V = +(Q.get('aok') || 0.2398);
+const AO_ON = Q.get('ao') !== '0';
+const expoFilter = new ColorMatrixFilter();
+const aoBlur = new BlurFilter({ strength: 0, quality: 4 });
+const setExpoGain = (g) => { expoFilter.matrix = [g, 0, 0, 0, 0, 0, g, 0, 0, 0, 0, 0, g, 0, 0, 0, 0, 0, 1, 0]; };
+setExpoGain(1);
+
+function aeAt(seg, posUs) {
+  for (const a of seg.animations || []) {
+    if (a.kind !== 'in' || !a.path) continue;
+    const key = String(a.path).replace(/\\/g, '/');
+    const c = AE_TABLE[key];
+    if (!c) { const nm = key.split('/').slice(-2).join('/'); if (!AE.missing.includes(nm)) AE.missing.push(nm); continue; }
+    const t = posUs - seg.target.start_us;
+    if (t < 0 || t > c.duration_us) continue;
+    const i = Math.max(0, Math.min(c.exposure.length - 1, Math.round(t / c.step_us)));
+    return { e: c.exposure[i], v: c.vblur[i] };
+  }
+  return null;
+}
+
+function flashApply(posUs) {
+  if (!AO_ON) { world.filters = null; return; }
+  let e = 0, v = 0;
+  for (const tr of model.tracks) {
+    if (tr.type === 'audio') continue;
+    for (const seg of tr.segments || []) {
+      const t0 = seg.target.start_us, t1 = t0 + seg.target.duration_us;
+      if (t0 > posUs || posUs >= t1) continue;
+      const a = aeAt(seg, posUs);
+      if (a) { if (a.e > e) e = a.e; if (a.v > v) v = a.v; }
+    }
+  }
+  const gain = Math.pow(2.0, e / 2.2);
+  const px = v * AO_SIGMA_PER_V;
+  setExpoGain(gain);
+  aoBlur.blurX = 0; aoBlur.blurY = px;
+  world.filters = (e > 1e-4 || v > 1e-4) ? (v > 1e-4 ? [aoBlur, expoFilter] : [expoFilter]) : null;
+  if (e > 1e-4 || v > 1e-4) {
+    AE.applied++; AE.eSum += e; AE.vSum += v;
+    AE.lastE = +e.toFixed(4); AE.lastV = +v.toFixed(2); AE.blurPx = +px.toFixed(2);
+  }
+}
+
+function makeSource(url) {
+  let size = 0;
+  return new CustomSource({
+    getSize: async () => {
+      if (size) return size;
+      const r = await fetch(url, { method: 'HEAD' });
+      size = +r.headers.get('Content-Length');
+      if (!size) throw new Error(`HEAD gave no length for ${url}`);
+      return size;
+    },
+    read: async (start, end) => {
+      stat.requests++;
+      const r = await fetch(url, { headers: { Range: `bytes=${start}-${end - 1}` } });
+      if (!r.ok && r.status !== 206) throw new Error(`range fetch ${r.status} ${url}`);
+      const b = new Uint8Array(await r.arrayBuffer());
+      stat.bytes += b.length;
+      return b;
+    },
+    maxCacheSize: 32 * 2 ** 20,
+  });
+}
+
+// One demuxed stream per media file, LRU-capped so the 2 GB session ceiling is a design
+// constraint rather than an accident (F-038 measured 956 MB with none of this).
+// Live decoders, not bytes, dominate RSS: each Input keeps a VideoSampleSink with its own
+// WebCodecs queue of 1080x1920 frames, so a 12-entry pool cost ~3 GB of peaks
+// (median 1394 MB, peak 4216 MB, 131 of 614 s over the 2 GB threshold). The pool is now sized
+// to what can be on screen at once, and eviction disposes the stream.
+const pool = { max: +(Q.get('pool') || 4), map: new Map() };
+// 页面起点的单调时钟：驱逐账本原本记 `now() - winStart`，而测量那条路把 winStart 归零，
+// 于是每一条 evict 都写成 at=0——"驱逐发生在我失败之前多久"这个最关键的问题答不了。
+const T0_PAGE = now();
+const poolStats = { evictions: 0, dispose_skipped_live: 0, revalidated: 0, evict_log: [],
+  opens: 0, open_ms_max: 0, open_log: [] };
+// A killed pump keeps iterating until its async generator notices, so "is this stream still
+// in use" cannot be answered by looking at the pump maps - the entry is deleted first.
+// Reference counting is what actually prevents eviction from disposing a live stream.
+const hold = (st) => { st.refs = (st.refs || 0) + 1; };
+const release = (st) => { st.refs = Math.max(0, (st.refs || 1) - 1); };
+// 计数**挂在句柄对象上**，不再按媒体 id 记。P-74 的读数是证据：失败那跑
+// `pooled=false refs=0 disposed=evicted pump=live` 且 `skipped_live=0` ——
+// id 口径下，同一 id 的旧句柄被 dispose 后新句柄会**继承旧计数**（老代码的 `|| 1` 兜底
+// 正是这个意思），所以"谁还在读"看不见，我补的两条时间窗守卫都被这层错配绕过。
+const liveRefEntries = () => [...pool.map.values()].filter((v) => (v.refs || 0) > 0).length;
+// 每个池条目一个递增序号：`handle=STALE` 只能回答"我手里的对象还是不是池里那个"，
+// 而池里已经没有这个 id 时（pooled=false）它答不了"哪一次驱逐把我这个对象干掉的"。
+// 有了 born，驱逐账本和我手里的句柄可以直接对号，不必再靠 id 猜（P-79 的读数就卡在这）。
+let poolSeq = 0;
+async function streamFor(path, want = 'video', own = false) {
+  const id = idOf.get(path);
+  if (!id) throw new Error(`media ${path} not served`);
+  if (pool.map.has(id)) {
+    const e = pool.map.get(id);
+    e.last = now();
+    if (own) hold(e);
+    return e;
+  }
+  const o0 = now();   // 只量"开一个新流"的代价（池命中在上面已经 return 了）
+  const input = new Input({ source: makeSource(`/media/${id}`), formats: ALL_FORMATS });
+  // One Input (one Range stream, one pool slot) carries BOTH tracks of a file. The camera clips
+  // are video + pcm/aac in one container and the mixer now reads their sound too, so a pool keyed
+  // by id that only built the requested sink would hand the audio caller a video sink.
+  const vtrack = await input.getPrimaryVideoTrack();
+  const atrack = await input.getPrimaryAudioTrack();
+  if (!vtrack && !atrack) throw new Error(`no track in ${path}`);
+  const entry = {
+    id, input, track: vtrack || atrack, last: now(), path, born: ++poolSeq,
+    sink: vtrack ? new VideoSampleSink(vtrack) : null,
+    abSink: atrack ? new AudioBufferSink(atrack) : null,
+  };
+  if (want === 'audio' && !entry.abSink) throw new Error(`no audio track in ${path}`);
+  if (want === 'video' && !entry.sink) throw new Error(`no video track in ${path}`);
+  pool.map.set(id, entry);
+  // Ownership is taken in the same synchronous step as the insertion. scheduleAudio can be
+  // in flight several times at once, and a caller that only held the reference after its await
+  // let a concurrent call evict and dispose the entry it had just created.
+  if (own) hold(entry);
+  if (pool.map.size > pool.max) {
+    // Disposing a stream whose pump is still iterating kills that pump mid-flight
+    // ("Input has been disposed", seen once per battery run at pool=4), so the LRU may
+    // only evict idle entries. If everything is busy the pool temporarily exceeds its cap.
+    for (const [k, v] of [...pool.map].sort((a, b) => a[1].last - b[1].last)) {
+      if ((v.refs || 0) > 0) continue;
+      // A live audio job owns its stream for the whole length of the segment, which can outlast
+      // the frame pump that first touched the file (three short mp3s hit this as
+      // "Input has been disposed" once video segments started sharing the pool). The job list is
+      // the authority here; the refcount alone was not enough.
+      // 三条守卫现在都比**句柄对象身份**，不再比 id：P-74 的失败读数是
+      // `pooled=false refs=0 disposed=evicted pump=live` 且 `skipped_live=0` ——
+      // id 相同但对象已经是新的，按 id 的守卫就成了空守卫。
+      if ([...audioJobs.values()].some((j) => j.st === v)) continue;
+      // 刚退役的作业：生成器可能还在读它（见 stopAudioJob 那条注释），这段时间里不能 dispose。
+      if (v.retiredUntil && v.retiredUntil > now()) continue;
+      if ([...pumps.values()].some((p) => p.st === v)) { poolStats.dispose_skipped_live++; break; }
+      pool.map.delete(k);
+      // 驱逐账本：把**动手那一刻**看到的守卫状态留下来。上一轮的教训是读数时刻错——
+      // catch 在 `finally { release(st) }` 之后才跑，refs 早已归零，"当时有没有人持用"答不了。
+      // 有了这本账，再出 `Input has been disposed` 就能直接对上：是不是有一条守卫在 refs>0
+      // 或有泵/有作业时仍然动了手。
+      poolStats.evict_log.push({ id: String(k).slice(-8), born: v.born, refs: v.refs || 0,
+        pump: [...pumps.values()].some((p) => p.st === v) ? 1 : 0,
+        job: [...audioJobs.values()].some((j) => j.st === v) ? 1 : 0,
+        grace: v.retiredUntil ? Math.max(0, Math.round(v.retiredUntil - now())) : 0,
+        size: pool.map.size + 1, at: Math.round(now() - T0_PAGE) });
+      if (poolStats.evict_log.length > 12) poolStats.evict_log.shift();
+      v.disposed = true; v.input.dispose(); poolStats.evictions++; break;
+    }
+  }
+  // 开流代价单独记：三跑复现的最坏帧都落在 t≈13.60（一个新视频文件 C7727 起步），
+  // 而同步 getSample 兜底三跑都是 0 次 ⇒ 大帧只能是这里。
+  const oc = Math.round(now() - o0);
+  poolStats.opens++; poolStats.open_ms_max = Math.max(poolStats.open_ms_max, oc);
+  poolStats.open_log.push({ p: String(path).split('/').pop(), ms: oc });
+  if (poolStats.open_log.length > 400) poolStats.open_log.shift();
+  return entry;
+}
+
+// ---- multi-track mixer (SP-10) -----------------------------------------------------------
+// AudioContext is the clock authority; each active audio segment gets a pump that pulls
+// AudioBuffers ahead of the playhead and batches ~0.5 s of them into one BufferSource, so a
+// 3-track mix costs a few nodes per second instead of one per tick per track (WebAV's flaw).
+let actx = null, master = null, analyser = null;
+const audioJobs = new Map();
+const silentPaths = new Set();
+// 每个媒体文件的"音频已排到音频时钟何处"游标（见 scheduleAudio 里 ctxAt 的单调钳制）。
+const fileAudioEnd = new Map();
+// 视频腿的对应物：素材里根本没有视频轨（mp3 放上了视频轨 / 组合子时间线里的 BGM）。
+// 认一次就记住，别逐帧再去开流——原来每次都开，一次电池报出 12 条错误。
+const noVideoPaths = new Set();
+const audioRates = new Set();   // every rate that reached the mixer this run   // video files the demuxer says carry no audio track
+let audioGen = 0;
+const audioStats = { chunks: 0, nodes: 0, peak_rms: 0, peak_fs: 0, clipped_windows: 0, sample_rate: 0, audio_errors: 0, loudness_applied: 0, fades_applied: 0, rms_windows: [], clamps: 0, clamp_ms_total: 0, clamp_ms_max: 0, exp_s: 0, sched_s: 0, lost_s: 0, short_jobs: 0, interrupted_jobs: 0, jobs_started: 0, dropped_samples: 0, flushes: 0, flushes_quiet: 0, flush_rms_sum: 0, per_seg: [] };
+
+function ensureAudio() {
+  if (!actx) {
+    actx = new AudioContext({ latencyHint: 'interactive' });
+    master = actx.createGain();
+    // Summing 37 clips at unity clipped in the digital domain (measured peak_rms 1.577 /
+    // 1.179), so the chain gets a compressor as a safety net under the per-clip gains.
+    const comp = actx.createDynamicsCompressor();
+    comp.threshold.value = -6;
+    comp.knee.value = 6;
+    comp.ratio.value = 4;
+    comp.attack.value = 0.005;
+    comp.release.value = 0.12;
+    analyser = actx.createAnalyser();
+    analyser.fftSize = 2048;
+    // 交付账已证：117.7 s 排进图里、0 段被打断，可录音仍 62% 静音 ⇒ 损失在 src.start() 之后。
+    // 首要嫌疑人是这条限幅支路：草稿侧 37 段求和后离线合成峰已达 1.69，而 comp 是
+    // threshold −6 dB / ratio 4 / attack 5 ms —— 对瞬态能压出十几二十 dB 的 reduction，
+    // 表现就是"又轻又一会儿有一会儿没"（泵动）。&comp=0 把它整条旁路，单变量判是不是它。
+    if (Q.get('comp') === '0') {
+      master.connect(analyser);
+    } else {
+      master.connect(comp);
+      comp.connect(analyser);
+    }
+    analyser.connect(actx.destination);
+  }
+  if (actx.state === 'suspended') actx.resume();
+  startCapture();
+  return actx;
+}
+
+// ---- 录下**真正送出去的那一路**（旁路 tap，输出一律留空）------------------------------
+// 为什么要另起一路：现有 peak_fs / rms_windows 是 analyser 在 JS 循环里**轮询**出来的，
+// 循环一冻 883 ms，缺席的正是这些采样——自报数字会被"它想测的那个故障"本身破坏（同族教训：
+// 视频侧 composited_fps 是均值，1.2 s 的停顿摊进均值只剩 0.03 fps）。ScriptProcessor 由音频
+// 线程连续喂，录 post-compressor 的混音，能判出静音段、削顶、跳变(click) 与对成片的电平差。
+// 边界要说清：这条证明的是"混音器产出了什么"，不是"声卡播出了什么"（驱动层问题看不见）。
+const CAP = { on: Q.get('tap') !== '0', chunks: [], rate: 0, node: null, caps: 0 };
+
+function startCapture() {
+  if (!CAP.on || CAP.node || !analyser) return;
+  CAP.rate = actx.sampleRate;
+  // 录音第 0 个样本对应哪一刻：墙钟与音频时钟都记下来。
+  // 这样录音里的"声音起点"能换算回墙钟，再与时钟轨上"画面走到那段内容的墙钟"直接相减。
+  CAP.t0Wall = now(); CAP.t0Ctx = actx.currentTime;
+  CAP.node = actx.createScriptProcessor(4096, 2, 2);
+  CAP.node.onaudioprocess = (e) => {
+    CAP.chunks.push(Float32Array.from(e.inputBuffer.getChannelData(0)));
+    CAP.caps++;
+    const s = CAP.chunks.reduce((a, c) => a + c.length, 0) / CAP.rate;
+    if (s > 75) { CAP.node.onaudioprocess = null; }   // 上限保护：不无限堆内存
+  };
+  analyser.connect(CAP.node);
+  CAP.node.connect(actx.destination);   // 支路输出留空=静音，屏上听感与改前一致
+}
+
+function captureWav() {
+  const tot = CAP.chunks.reduce((a, c) => a + c.length, 0);
+  const pcm = new Int16Array(tot);
+  let o = 0;
+  for (const c of CAP.chunks)
+    for (let i = 0; i < c.length; i++)
+      pcm[o++] = Math.max(-32768, Math.min(32767, Math.round(c[i] * 32767)));
+  const hdr = new ArrayBuffer(44), dv = new DataView(hdr);
+  const wstr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  wstr(0, 'RIFF'); dv.setUint32(4, 36 + pcm.byteLength, true); wstr(8, 'WAVE');
+  wstr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, CAP.rate, true); dv.setUint32(28, CAP.rate * 2, true); dv.setUint16(32, 2, true);
+  dv.setUint16(34, 16, true); wstr(36, 'data'); dv.setUint32(40, pcm.byteLength, true);
+  return { blob: new Blob([hdr, pcm], { type: 'audio/wav' }), seconds: tot / CAP.rate, blocks: CAP.caps };
+}
+
+async function postCapture(name) {
+  if (!CAP.chunks.length) return null;
+  const c = captureWav();
+  await fetch('/wave?name=' + encodeURIComponent(name), { method: 'POST', body: c.blob });
+  return { seconds: +c.seconds.toFixed(2), blocks: c.blocks, bytes: c.blob.size, name,
+    // 录音原点的两把时钟：样本 i 的墙钟 ≈ t0Wall + i/rate*1000（音频线程按 ctx 连续喂）。
+    t0_wall_ms: Math.round(CAP.t0Wall || 0), t0_ctx_ms: Math.round((CAP.t0Ctx || 0) * 1000) };
+}
+
+function measureAudio() {
+  if (!analyser) return 0;
+  const buf = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(buf);
+  let sum = 0, pk = 0;
+  for (let i = 0; i < buf.length; i++) {
+    sum += buf[i] * buf[i];
+    const a = buf[i] < 0 ? -buf[i] : buf[i];
+    if (a > pk) pk = a;
+  }
+  const rms = Math.sqrt(sum / buf.length);
+  audioStats.peak_rms = Math.max(audioStats.peak_rms, rms);
+  // RMS cannot answer "did the mix clip": 0.55 average still allows samples at full scale.
+  // peak_fs is the true sample peak over the windows we happened to look at (one fftSize window
+  // per tick), so it can under-report a transient that lands between windows - it is a floor,
+  // not a proof.
+  audioStats.peak_fs = Math.max(audioStats.peak_fs, +pk.toFixed(4));
+  if (pk >= 0.999) audioStats.clipped_windows++;
+  // The scalars above cannot answer "does our mix have the app's shape" - a flat normalised bed
+  // and a squashed-loud one share a peak. Keep every window so the envelope can be compared
+  // against the export's own distribution (F-076/F-077).
+  if (audioStats.rms_windows.length < 2000) audioStats.rms_windows.push(+rms.toFixed(4));
+  return rms;
+}
+
+// 作业从 audioJobs 消失的那一刻，它的 async 生成器**还没注意到 j.stop**——streamFor 上方那条注释
+// 说的就是这件事（被杀的泵会继续迭代到生成器察觉为止）。这段窗口里 LRU 一旦 dispose，就是门上那条
+// `! Input has been disposed.`。所以给刚退役的**句柄**一条宽限期，在它自己收尾之前不许被 dispose。
+// 宽限期记在对象上（`v.retiredUntil`），不再用 id→时刻 的表：id 相同的新句柄不该继承旧句柄的宽限期。
+// 池因此可以临时超上限——这条代码本来就已经接受（见 streamFor 里那句注释）。
+const RETIRE_GRACE_MS = 4000;
+const retireStream = (st) => { if (st) st.retiredUntil = now() + RETIRE_GRACE_MS; };
+
+function stopAudioJob(id) {
+  const j = audioJobs.get(id);
+  if (!j) return;
+  j.stop = true;
+  for (const n of j.nodes) { try { n.stop(); } catch (e) { /* already ended */ } }
+  retireStream(j.st);
+  audioJobs.delete(id);
+}
+
+function stopAudio() {
+  audioGen++;
+  // 暂停/seek 之后所有排期作废，单调游标必须一起清掉，否则下一次开播会被推到很远的将来。
+  fileAudioEnd.clear();
+  for (const j of audioJobs.values()) {
+    j.stop = true;
+    for (const n of j.nodes) { try { n.stop(); } catch (e) { /* already ended */ } }
+    retireStream(j.st);
+  }
+  audioJobs.clear();
+}
+
+async function pumpAudio(seg, st, ctxAt, mediaStart, mediaEnd, speed) {
+  const j = { stop: false, nodes: [], stId: st.id, st, seg, sched: 0, rms_sum: 0, rms_n: 0 };
+  audioJobs.set(seg.id, j);
+  // 批次长度是这条缺陷的量纲。原先固定 0.5 s：`flush()` 每批在实际到达时才排期
+  // （`at = Math.max(when, actx.currentTime)`），所以**第一段 0.5 s 之后每一批都可能撞成静音**——
+  // 实测正是这个形状：≤0.5 s 的片段（一次 flush 就完）连续，>0.5 s 的片段只播到 29%/33%/35%。
+  // 批长取 2 s 后，下一批有 2 s 的墙钟窗口可到货（AUDIO_LEAD=0.6 s 之外再 cushion），
+  // 短于 2 s 的片段直接一次排完——这条草稿 37 段音频里绝大多数都在此列。
+  const SLOT = Math.max(2048, Math.ceil((st.track.sampleRate || 48000) * AUDIO_SLOT_S));
+  let ch = null, filled = 0, rate = 0, when = ctxAt;
+  // Level: segments[].volume is the real control and materials.audios[].volume is null on all
+  // 37 clips of this draft, so reading only the material's dropped it - the music bed asks for
+  // 0.3981 = -8 dB and we were playing it at full scale (F-076). loudnesses[] then rides on top:
+  // gain = target_loudness - avg_loudness in LU, plus the fades.
+  const aud = seg.audio || {};
+  const loud = aud.loudness;
+  const vol = seg.volume ?? aud.volume ?? 1;
+  const base = vol * (loud && loud.enable
+    ? Math.pow(10, ((loud.target_loudness ?? 0) - (loud.loudness_param?.avg_loudness ?? 0)) / 20)
+    : 1);
+  const fi = (aud.fade?.fade_in_duration ?? 0) / 1e6;
+  const fo = (aud.fade?.fade_out_duration ?? 0) / 1e6;
+  const segDur = (seg.target.duration_us / 1e6) / speed;
+  if (loud && loud.enable) audioStats.loudness_applied++;
+  if (fi > 0 || fo > 0) audioStats.fades_applied++;
+  let localT = (mediaStart - seg.source.start_us / 1e6) / speed;
+  const gainAt = (t) => {
+    let v = base;
+    if (fi > 0 && t < fi) v *= Math.max(0, t / fi);
+    if (fo > 0 && t > segDur - fo) v *= Math.max(0, (segDur - t) / fo);
+    return v;
+  };
+  const flush = () => {
+    if (!filled || !ch) return;
+    const out = actx.createBuffer(ch.length, filled, rate);
+    for (let c = 0; c < ch.length; c++) out.copyToChannel(ch[c].subarray(0, filled), c);
+    // 交付账说 117.7 s 都排进图了，录音却只有 1/3 有声，而限幅支路旁路掉也一样
+    // ⇒ 直接量"排进去的那一批本身有多响"。如果成批是接近 0，那就是**填充路径写进了零**
+    //   （`ch` 在声道数变化时重新分配，但 `filled` 没归零——留下的就是零前缀）。
+    const t0c = out.getChannelData(0);
+    let ss = 0;
+    for (let i = 0; i < t0c.length; i++) ss += t0c[i] * t0c[i];
+    const frms = Math.sqrt(ss / Math.max(1, t0c.length));
+    audioStats.flushes++;
+    audioStats.flush_rms_sum += frms;
+    if (frms < 1e-4) audioStats.flushes_quiet++;
+    // 按段记一条（时长加权），用来和 Python 离线合成的同一段配成对，看 Δ 是常数还是分档：
+    // 常数 ⇒ 图里有一层没算过的全局因子；分档 ⇒ gainAt()/localT 的淡入淡出起点错。
+    j.rms_sum += frms * (filled / rate); j.rms_n += filled / rate;
+    const src = actx.createBufferSource();
+    src.buffer = out;
+    src.playbackRate.value = speed;
+    const g = actx.createGain();
+    const d = out.duration / speed;
+    const at = Math.max(when, actx.currentTime);
+    // 排期被推到现在 = 屏上从 when 到 at 这段已经是数字静音。这个计数器就是碎流的直接成因量，
+    // 不用再从录音反推：clamps=被夹的次数，clamp_ms_max=单次夹掉多少毫秒。
+    if (at > when + 0.005) {
+      audioStats.clamps++;
+      const ms = (at - when) * 1000;
+      audioStats.clamp_ms_total += ms;
+      audioStats.clamp_ms_max = Math.max(audioStats.clamp_ms_max, ms);
+    }
+    g.gain.setValueAtTime(gainAt(localT), at);
+    g.gain.linearRampToValueAtTime(gainAt(localT + d), at + d);
+    src.connect(g);
+    g.connect(master);
+    src.start(at);
+    localT += d;
+    when = at + d;
+    j.sched += filled;      // 秒数账：真正排出去的样本数（flush 前 filled 就是这一批的长度）
+    j.nodes.push(src);
+    audioStats.nodes++;
+    filled = 0;
+  };
+  // The caller holds the reference before invoking us and this function's finally releases it.
+  try {
+    for await (const b of st.abSink.buffers(mediaStart, mediaEnd)) {
+      if (j.stop) break;
+      const buf = b.buffer;
+      if (!ch || ch.length !== buf.numberOfChannels) {
+        ch = Array.from({ length: buf.numberOfChannels }, () => new Float32Array(SLOT));
+      }
+      rate = buf.sampleRate;
+      audioStats.sample_rate = rate;   // last writer only - see audioRates
+      audioRates.add(rate);
+      if (filled + buf.length > SLOT) flush();
+      const take = Math.min(buf.length, SLOT - filled);
+      for (let c = 0; c < buf.numberOfChannels; c++) {
+        if (COPY_FIX) {
+          // `copyFromChannel(dest, ch, start)` 的第三个参数在 mediabunny 里是**源**的偏移，
+          // 不是目的地的偏移。证据：同一段里逐批 RMS 单调掉 0.0322→0.0301→0.0132，
+          // 正是每批多跳过 `filled` 个样本、读到数组末尾补零的形状 ⇒ 缓冲大部分是零
+          // ⇒ 与同段参考比 Δ 中位 −20 dB、录音"一会儿有一会儿没"。
+          const tmp = new Float32Array(take);
+          buf.copyFromChannel(tmp, c, 0);
+          ch[c].subarray(filled, filled + take).set(tmp);
+        } else {
+          buf.copyFromChannel(ch[c], c, filled);
+        }
+      }
+      if (buf.length > take) audioStats.dropped_samples += buf.length - take;  // 装不下的尾巴会被丢，要数出来
+      filled += take;
+      audioStats.chunks++;
+    }
+    flush();
+  } catch (e) {
+    out(`  ! audio ${seg.id.slice(0, 8)}: ${String(e && e.message || e).slice(0, 90)}`);
+    audioStats.audio_errors++;  // was pcm_seen: it only ever counted failures
+  } finally {
+    // 秒数账：这一段"本该有多少秒音频"vs"实际排出去多少秒"。23 s 静音如果来自被打断的泵，
+    // 这里就会直接对上；对不上就说明缺的不是尾巴，而是别的东西（候选见 docs P-69）。
+    const expS = Math.max(0, mediaEnd - mediaStart);
+    const gotS = (j.sched || 0) / (rate || 48000);
+    audioStats.jobs_started++;
+    audioStats.exp_s += expS;
+    audioStats.sched_s += gotS;
+    if (j.stop) audioStats.interrupted_jobs++;
+    if (gotS < expS - 0.02) { audioStats.short_jobs++; audioStats.lost_s += expS - gotS; }
+    if (audioStats.per_seg.length < 300) {
+      audioStats.per_seg.push({ id: String(seg.id).slice(0, 24), base: +base.toFixed(4),
+        exp_s: +expS.toFixed(2), sched_s: +gotS.toFixed(2),
+        // 判「重音」需要的两样东西：这段排的是**哪个文件**，以及它在**音频时钟**上占的时间窗。
+        // 没有 file 就看不见"同一段录音由两条不同链路各放一遍"（作业表按 id 去重，拦不住它）；
+        // 没有 ctx 窗就分不清"同时在放"与"回绕后依次重播"（后者不是缺陷）。
+        file: String(st.path || seg.media?.path || '').split('/').pop(),
+        ctx0: +ctxAt.toFixed(2), ctx1: +when.toFixed(2),
+        rms: +(j.rms_sum / Math.max(1e-6, j.rms_n)).toFixed(5),
+        fi: +fi.toFixed(3), fo: +fo.toFixed(3), media_start: +(mediaStart).toFixed(3),
+        t0: +(seg.target.start_us / 1e6).toFixed(3), rate: rate });
+    }
+    // 私有流（组合子段音频）用完就 dispose；池内句柄才走引用计数。
+    // 单调游标推进到"这个文件已经排到音频时钟何处"，下一刀就从这里之后排（见 ctxAt 处注释）。
+    fileAudioEnd.set(st.path || seg.media?.path || '', Math.max(fileAudioEnd.get(st.path) || 0, when));
+    if (st.priv) dropPrivateStream(st); else release(st);
+  }
+}
+
+// 组合子时间线的音频走**私有流**，不进池。理由是一条实测出来的教训（P-88）：
+// 同一个拍摄文件被子时间线切成 4 段、各自源位置不同（15.17 / 17.67 / 20.53 s…），
+// 若这些音频作业共用池里**同一个 `AudioBufferSink`/同一条解封装流**，每个作业都会去
+// re-seek 同一个 sink 并互相偷样本 ⇒ 实测 max 帧时 765/1696 ms、新帧速率 49→16/s，播放直接崩。
+// 顶层视频段的自带音频没这问题，是因为那里"一个文件同一时刻只有一段"。
+let privLive = 0, privMax = 0;
+async function privateAudioStream(path) {
+  const id = idOf.get(path);
+  if (!id) throw new Error(`media ${path} not served`);
+  const input = new Input({ source: makeSource(`/media/${id}`), formats: ALL_FORMATS });
+  const atrack = await input.getPrimaryAudioTrack();
+  if (!atrack) { input.dispose(); throw new Error(`no audio track in ${path}`); }
+  const st = { id: `priv-${id}-${++poolSeq}`, priv: true, input, track: atrack,
+               abSink: new AudioBufferSink(atrack), path };
+  privLive++; privMax = Math.max(privMax, privLive);
+  // 这条腿的分母：同时在跑的私有流数（峰值）——没有它，"音频多了人声"与"音频把播放拖崩"
+  // 两种情况在报告里长得一样。
+  audioStats.priv_live = privLive; audioStats.priv_max = privMax;
+  return st;
+}
+function dropPrivateStream(st) {
+  try { st.input.dispose(); } catch (e) { /* 已经废掉就算成功 */ }
+  privLive = Math.max(0, privLive - 1);
+}
+
+// Schedule every audio segment overlapping [posSec, posSec + lead]; called from the play loop.
+const AUDIO_LEAD = 0.6;
+// 主轨的段是**加密组合缓存**（`container.readable=false`），所以按文件走永远排不出音频；
+// 而口播就在它**子时间线指向的拍摄文件**自带的音轨里（顶层 3 条音频轨的 37 个材料全是
+// `type:"sound"` 的 music mp3 = BGM，里面没有人声）。画面早就递归 `composite.tracks` 重建了，
+// 音频这条腿没走 ⇒ 用户听到的"最底下口播轨没声音"。`&childaudio=0` 留作单变量对照。
+// 组合子时间线的音频默认**开**（`&childaudio=0` 关）。
+// 上一轮因为用户听到「重音」，我把它保守地改成默认关（P-89⑤），结果用户第二次反馈
+// "音频又变回之前的样子"——他听到的是**人声没了**。撤掉那个保守处置：默认恢复开。
+// 而"重音"本身要用**文件级**证据判（见 per_seg 新增的 file 字段）：
+// 同一段录音若同时由顶层段与子段各放一遍，那是两条不同 id 的作业，作业表的 has() 拦不住它。
+const CHILD_AUDIO = Q.get('childaudio') !== '0';
+// 替换音源要不要吃父段的响度归一（`&childnorm=0` = 不吃，留给单变量对照）
+const CHILD_NORM = Q.get('childnorm') !== '0';
+// 视频段自带音轨默认**仍与影像共用一条 Input**（`&vidaudiopriv=1` 才另开私有流）。
+// 我按"两个读者拉同一条流会饿死解码"的假设做过配对实验：priv0 三跑空窗 1 次 vs priv1 三跑 2 次，
+// 且 max 帧时 97/93/91 → 128/170/142 更差，空窗位置在两臂完全相同（同两段、同一时刻）
+// ⇒ 假设被否证，这不是流争用而是**位置相关的解码吞吐**（见 P-92）。留着开关只是否证的化石。
+const VIDEO_AUDIO_PRIV = Q.get('vidaudiopriv') === '1';
+async function scheduleAudio(posSec) {
+  ensureAudio();
+  const one = async (trackType, seg, usePriv) => {
+    const t0 = seg.target.start_us / 1e6, t1 = t0 + seg.target.duration_us / 1e6;
+    if (t1 < posSec || t0 > posSec + AUDIO_LEAD || audioJobs.has(seg.id)) return;
+    if (!seg.media?.path || !seg.media.exists || !seg.media.container?.readable) return;
+    if (trackType === 'video' && silentPaths.has(seg.media.path)) return;
+    const speed = seg.speed || 1;
+    const s0 = seg.source.start_us / 1e6;
+    const from = s0 + Math.max(0, posSec - t0) * speed;
+    const to = s0 + (t1 - t0) * speed;
+    // 同一文件必须**单调**排期：`ctxAt` 是按帧（33 ms 粒度）算出来的，于是相邻两刀的同一盘录音
+    // 会出现后一段起点比前一段终点早约一帧 ⇒ 约 33 ms 的同一内容被放两遍（P-90：19 处，
+    // 用户听到的「重音」就是这个，而不是跨链路重复——`per_seg.file` 查过，顶层与子段没有共用文件）。
+    const ctxAt = Math.max(actx.currentTime + Math.max(0, t0 - posSec),
+                           fileAudioEnd.get(seg.media.path) || 0);
+    // 占位必须在**任何 await 之前**：scheduleAudio 每帧被调但不串行，两次调用的
+    // `audioJobs.has()` 都可能先通过、再各自 `await streamFor(...)`，于是同一段音频被排进图两次
+    // —— 用户听到的「重音」就是这个（实测 peak_fs 2.0+、满刻度窗 641、一次电池 74 个作业对
+    // 40 来段，全是它的账）。同族缺陷见池持用那次（P-74：持用要和插入处在同一个同步步）。
+    audioJobs.set(seg.id, { pending: true, seg, nodes: [], st: null, stId: null,
+                            sched: 0, rms_sum: 0, rms_n: 0 });
+    let st;
+    // 视频段的自带音轨另开一条流。同一条 `Input` 被视频泵（往前放）与音频作业（往后拽）
+    // 按不同字节位置并发读时，Range 流会在两个位置之间来回跳，实测饿死影像解码：
+    // 3/3 跑各出现一次"段内 391-777 ms 连续 5 帧没出图、泵活着但 q0"，且 4/4 次
+    // 空窗时刻同文件都有音频作业在播（`temp/playback-test/black_attrib.py`）。
+    const priv = usePriv || (trackType === 'video' && VIDEO_AUDIO_PRIV);
+    try { st = priv ? await privateAudioStream(seg.media.path)
+                    : await streamFor(seg.media.path, 'audio', true); }
+    catch (e) {
+      // The demuxer, not the draft, is the authority on whether a video file has sound: this
+      // draft's video materials carry no has_audio field at all, and a silent clip is noise
+      // rather than a fault - remember the path and move on.
+      if (trackType === 'video' && /no audio track/.test(String((e && e.message) || e))) {
+        silentPaths.add(seg.media.path);
+      } else {
+        out(`  ! audio stream ${String(e.message || e).slice(0, 60)}`);
+      }
+      audioJobs.delete(seg.id);   // 占位要撤，否则这段整场都不会再试（撤早了又会开双份）
+      return;
+    }
+    pumpAudio(seg, st, ctxAt, from, to, speed);
+  };
+  for (const track of model.tracks) {
+    // Video segments carry their own sound and JianYing plays it unless muted, so the mixer has
+    // to walk video tracks too - a speech-led draft previewing silently is not a preview.
+    if (track.type !== 'audio' && track.type !== 'video') continue;
+    for (const seg of track.segments) {
+      await one(track.type, seg);
+      if (!CHILD_AUDIO || !seg.composite?.tracks) continue;
+      // 组合子段的时间是**子时间线本地时间**，映射到父窗口是纯平移（组合律里时间恒等）。
+      // 这里造一个把 `target` 平移到父时间、`volume` 乘上父段的合成段，于是原有排期/淡入淡出/
+      // 响度/停作业的时间判定全部原样复用。父段音量必须乘进去：本草稿有一条**引用同一个组合**
+      // (D1F33107) 的上层轨 `volume=0.001`（−60 dB，就是用户说的"被静音的轨道"），
+      // 不乘它就会把已经静音的那份人声又放出来。
+      const shift = seg.target.start_us;
+      const pv = seg.volume ?? 1;
+      if (pv <= 0.002) continue;              // 父段静音 ⇒ 子段一并跳过，这条本身就是反向对照
+      for (const ct of seg.composite.tracks) {
+        if (ct.type !== 'audio' && ct.type !== 'video') continue;
+        for (const cs of ct.segments) {
+          // 子时间线里也有 `material_type:"photo"` 指向 .png 的段（JianYing Presets/Combination/
+          // Resources/76cff6f9….png）。它的容器能被探测到"readable"，但拿去当**音频源**时
+          // mediabunny 直接报 `Input has an unsupported or unrecognizable format`（门 L6 就是这么红的）。
+          // 替换音源只该来自真有影像的拍摄段：其余类型一律跳过。
+          if (cs.media?.material_type !== 'video') continue;
+          await one(ct.type, {
+            ...cs,
+            id: `${String(cs.id).slice(0, 8)}@${String(seg.id).slice(0, 8)}`,
+            target: { start_us: cs.target.start_us + shift, duration_us: cs.target.duration_us },
+            volume: (cs.volume ?? 1) * pv,
+            // 归一继承父段：`loudnesses` 那条 -12/-9.26 描述的是**组合缓存里烘焙的音频**，
+            // 而子段拍摄文件正是它的内容来源，所以替换音源要吃同一份归一。
+            // 不给这一层时实测 peak_fs 1.30→2.05、满刻度窗 33→458（P-88）。`&childnorm=0` 复现旧行为。
+            audio: cs.audio || (CHILD_NORM ? seg.audio : undefined),
+          }, true);
+        }
+      }
+    }
+  }
+}
+
+// Forward streaming pump per active segment: sink.samples(from, to) decodes ahead into a
+// bounded VideoFrame queue, so continuous playback stops paying a fresh keyframe seek per frame.
+// A generation counter merges seeks/pauses into "kill all pumps" (opencut-classic's pattern).
+const pumps = new Map();
+let playGen = 0;
+const QMAX = +(Q.get('qmax') || 4);
+const AUDIO_SLOT_S = +(Q.get('audio_slot') || 0.5);   // 实测 2 s/4 s 更坏（占空比 35%→10%/8%），默认留在 0.5
+const COPY_FIX = Q.get('copyfix') !== '0';            // &copyfix=0 = 改前写法（把 filled 当目的偏移传），单变量对照
+// 每一腿（一个片段取一帧）的**墙钟耗时**。上一版的错在于：`waits_ms` 是把同一帧里
+// 并发多条腿的等待**加总**的，所以「wait≈cost」根本不能证明是某一条挡住了整帧。
+// 要定这 284 ms 归谁，只能逐腿各记自己那一段的墙钟时间。
+const LEG = [];
+const pumpStats = { hits: 0, misses: 0, dropped: 0, waits_ms: 0, decoded: 0, decode_ms: 0, stale_holds: 0, sync_fallbacks: 0 };
+
+// 到货节奏的账（键到段 id，泵被停掉也不丢）：空窗只说明队列空，不说明为什么空。
+// `slowest_arrivals` 是**前 16 名**，所以"不在名单里"只说明它没进最差 16，不说明这条腿活着
+// 还是死了。`&probe=<8位id,...>` 点名要无条件回送的腿（配平 A/B 的对照段就是这个用途）：
+// 有记录且 pushes>0 才算活腿，缺记录就是死腿——死腿的"停顿消失"不能当成效果。
+const PROBE_IDS = new Set((Q.get('probe') || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
+const arrivals = new Map();
+function makePump(seg, st, fromSec, toSec, gen) {
+  const p = { q: [], waiters: [], done: false, killed: false, error: null, gen, seg, st, stId: st.id,
+               lastArr: 0, maxGapMs: 0, maxGapAt: null, gaps50: 0 };
+  p.sleep = () => new Promise((res) => p.waiters.push(res));
+  p.wake = () => { p.waiters.splice(0).forEach((r) => r()); };
+  hold(st);
+  (async () => {
+    try {
+      for await (const s of st.sink.samples(fromSec, toSec)) {
+        if (!s) continue;
+        if (gen !== playGen) { s.close?.(); break; }
+        const d0 = now();
+        const vf = s.toVideoFrame();
+        const item = { ts: s.timestamp, rot: s.rotation || 0, dw: vf.displayWidth, dh: vf.displayHeight,
+                       bmp: await createImageBitmap(vf, { resizeWidth: vf.codedWidth, resizeHeight: vf.codedHeight }) };
+        vf.close();
+        s.close();
+        pumpStats.decoded++;
+        pumpStats.decode_ms += now() - d0;
+        // 到货节奏：空窗那次只证明了"队列是空的"，没证明"解码跟不上"。两者要分开，
+        // 所以每个泵记自己相邻两次 push 的最大墙钟间隔（含首帧：从泵建立算起）。
+        const tArr = now();
+        // 账要无条件记：`pushes` 从**第一次 push 就计**（此前它写在 `if (p.lastArr)` 里面，
+        // 于是"只解出一帧"的腿在名单里根本不存在，死腿和极短腿分不开）。间隔仍只在第二次起算。
+        const rec = arrivals.get(seg.id) || { id: String(seg.id).slice(0, 8),
+              file: String(seg.media && seg.media.path || '').split('/').pop(),
+              max_ms: 0, over50: 0, pushes: 0 };
+        rec.pushes++;
+        if (p.lastArr) {
+          const g = tArr - p.lastArr;
+          if (g > p.maxGapMs) { p.maxGapMs = g; p.maxGapAt = +s.timestamp.toFixed(3); }
+          if (g > 50) p.gaps50++;
+          if (g > rec.max_ms) { rec.max_ms = g; rec.at = +s.timestamp.toFixed(2); }
+          if (g > 50) rec.over50++;
+        }
+        arrivals.set(seg.id, rec);
+        p.lastArr = tArr;
+        while (p.q.length >= QMAX && !p.killed && gen === playGen) await p.sleep();
+        if (p.killed || gen !== playGen) { item.bmp.close?.(); break; }
+        p.q.push(item);
+        p.wake();
+      }
+    } catch (e) { p.error = String(e && e.message || e); }
+    finally { release(st); }
+    p.done = true;
+    p.wake();
+  })();
+  return p;
+}
+
+function stopPump(id) {
+  const p = pumps.get(id);
+  if (!p) return;
+  p.killed = true;
+  while (p.q.length) p.q.shift().bmp.close?.();
+  p.done = true;
+  p.wake();
+  pumps.delete(id);
+}
+
+function killPumps() {
+  playGen++;
+  for (const id of [...pumps.keys()]) stopPump(id);
+}
+
+// ---- warm-ahead over a video cut -----------------------------------------------------------
+// 逐腿墙钟耗时把最坏帧定到了「一个新视频文件的第一帧」：大帧里 top-2 条腿占 93% 的时间，
+// 而且这些腿的年龄都是 +0.007…+0.020 s —— 冷开流（Range + 解封装 + getPrimaryVideoTrack）和
+// 首帧关键帧解码全挤在同一帧的墙上。音频那条腿一直有 AUDIO_LEAD 的提前量，视频这条腿没有。
+// 这里补上同一个提前量：剪切点之前就把流开出来、把泵建起来，到点时第一帧直接从队列取。
+// 预解码量由 QMAX 封顶（泵跑到队列满就 park），并发量由 WARM_MAX 封顶——池上限是 2 GB 那条
+// 设计约束（见 streamFor 上方 F-038 的实测），预热不能把它绕过去。单变量对照 &warm=0。
+const VIDEO_LEAD = +(Q.get('warm_lead') || 0.3);
+const WARM_MAX = +(Q.get('warm_max') || 2);
+const WARM_ON = Q.get('warm') !== '0';
+// 第三条臂，用来把"预热带来的好处"拆成两半：`&warm_predecode=0` 只**提前开流**（HEAD+解封装+取轨），
+// 不建泵、不预解码。对照 `&warm=0`（两者都不做）与默认（都做）：
+// 若这一臂≈`warm=0` ⇒ 省下来的那 150 ms 是**首帧解码**；若≈默认 ⇒ 是**冷开流**。
+// （`&warm_max` 判不了这个：22 个切点彼此间隔 >=0.467 s，任一时刻最多只有 1 个预热泵活着，见 P-83。）
+const WARM_PREDECODE = Q.get('warm_predecode') !== '0';
+const warmInflight = new Set();
+// used/wasted 是这条腿的**通不通**证据：只报 started 会说不出"预热的帧到底被用上了没有"。
+const warmStats = { started: 0, used: 0, wasted: 0, dropped: 0, open_ms_max: 0, opened_only: 0,
+                    primed: 0, err: '' };
+const PRIME_ON = Q.get('prime') !== '0';   // &prime=0 = 改前行为（起点那一帧现开现解），单变量对照
+
+function warmAhead(posUs, prime = false) {
+  // prime=true 是给**播放起点**用的：那里没有"切点之前"可预热（P-85④：最坏帧就压在 t=1.82 这一帧），
+  // 所以改成"把当前在场的段先把泵建起来"。判据 `first_frame_ms` 与帧预算 max 吃的是同一笔账。
+  if (!WARM_ON || (prime && !PRIME_ON) || (!prime && !playing)) return null;
+  const posSec = posUs / 1e6;
+  const cands = [];
+  const primed = [];
+  for (const track of videoTracks) {
+    for (const seg of track.segments) {
+      const t0 = seg.target.start_us / 1e6;
+      const t1 = t0 + seg.target.duration_us / 1e6;
+      if (prime) { if (!(t0 <= posSec && posSec < t1)) continue; }
+      else if (t0 <= posSec || t0 - posSec > VIDEO_LEAD) continue;
+      if (pumps.has(seg.id) || warmInflight.has(seg.id)) continue;
+      if (!seg.media?.path || !seg.media.exists || seg.media.container?.readable === false) continue;
+      if (noVideoPaths.has(seg.media.path)) continue;
+      cands.push([t0, seg]);
+    }
+  }
+  cands.sort((a, b) => a[0] - b[0]);
+  // 预热受并发上限约束（池上限是 2 GB 那条约束），但 prime 那一路不需要：
+  // 它最多就是"当前在场的几段"，本来就要各自持一个泵。
+  let room = (prime ? cands.length : WARM_MAX
+              - [...pumps.values()].filter((p) => p.warm).length - warmInflight.size);
+  for (const [, seg] of cands) {
+    if (room-- <= 0) break;
+    warmInflight.add(seg.id);
+    const gen = playGen, w0 = now();
+    const s0 = seg.source.start_us / 1e6;
+    const toSec = s0 + (seg.target.duration_us * (seg.speed || 1)) / 1e6;
+    primed.push((async () => {
+      let st = null;
+      try {
+        st = await streamFor(seg.media.path, 'video', true);
+        //  await 期间播放头可能已经 seek（playGen 变了）或这一段已经有了真泵：那就把这次持用
+        // 还回去，不要塞一个过期泵进 pumps 把它当画面用。`playing` 只对预热那一路要求——
+        // prime 那一路是在播放循环**之前**调的，那时 playing 还是 false（P-85④：起点没"前面"可预热）。
+        if (gen !== playGen || pumps.has(seg.id) || (!prime && !playing)) { warmStats.dropped++; return; }
+        if (!WARM_PREDECODE) { warmStats.opened_only++; return; }   // 只开流；finally 里释放这次持用，条目留在池里
+        const p = makePump(seg, st, s0, toSec, gen);
+        p.warm = true;
+        pumps.set(seg.id, p);
+        warmStats.started++;
+        if (prime) warmStats.primed++;
+        warmStats.open_ms_max = Math.max(warmStats.open_ms_max, Math.round(now() - w0));
+      } catch (e) {
+        warmStats.dropped++;
+        warmStats.err = String(e && e.message || e).slice(0, 70);
+      } finally {
+        if (st) release(st);   // makePump 自己持了一份，这次预热的持用在这里配平
+        warmInflight.delete(seg.id);
+      }
+    })());
+  }
+  // prime 那一路要等：起点的 paint 只有拿到"泵已存在"这个事实才会走去队列，而不是自己去开流+解首帧。
+  // 并发仍然成立（各段的 streamFor 同时飞），所以墙钟是 max(开流) 而不是 sum(开流)。
+  return prime ? Promise.all(primed) : null;
+}
+
+async function takeFromPump(p, wantSec, budgetMs, holdMode = false) {
+  const t0 = now();
+  for (;;) {
+    if (p.q.length) {
+      let i = 0;
+      while (i + 1 < p.q.length && p.q[i + 1].ts <= wantSec) i++;
+      const dropped = p.q.splice(0, i);
+      dropped.forEach((x) => x.bmp.close?.());
+      pumpStats.dropped += dropped.length;
+      pumpStats.hits++;
+      pumpStats.waits_ms += now() - t0;
+      const f = p.q.shift();
+      p.wake();  // the pump parks on a full queue; without this it never resumes
+      return f;
+    }
+    if (p.done || p.error || now() - t0 > budgetMs) { pumpStats.misses++; return null; }
+    if (holdMode) {
+      // 改前的缺陷就在这一行所在的位置：预算只在"队列仍然是空的"时检查，所以一帧花 124 ms
+      // 送到时照样算命中并返回——屏上明明已经有画面，却把整条循环冻住。这里给等待本身设上限：
+      // 到点就走，让调用方重复上一帧；那一帧留在队列里，下一帧会照旧取到它（不丢内容，只丢押注）。
+      const left = Math.max(1, budgetMs - (now() - t0));
+      const woke = await Promise.race([p.sleep().then(() => true),
+                                       new Promise((r) => setTimeout(() => r(false), left))]);
+      if (!woke) return null;
+      continue;
+    }
+    await p.sleep();
+  }
+}
+
+// 卡顿的成因就在这里：原先队列空时 takeFromPump 最多押 120 ms，押不到再走
+// `sink.getSample()` 的同步随机解码——两段罚时相加就是实测那些 100~1200 ms 的帧
+// （最坏 10 帧里 9 帧的 cost≈pump 等待）。屏上已经有这一段的画面时，正确做法是
+// **让上一帧留在屏上**、这一帧只等一小会儿，而不是为了"新"把整个循环冻住。
+const HOLD_BUDGET_MS = 10;      // 已有画面时最多押这么久，押不到就重复上一帧
+const FIRST_BUDGET_MS = 120;    // 屏上还没有东西：必须拿到帧，慢也要等
+const HOLD_ON = Q.get('hold') !== '0';   // &hold=0 = 改前的行为（押 120 ms 再同步解码），单变量对照用
+
+async function frameFor(seg, st, mediaSec, playingNow, havePicture) {
+  if (!st.sink) {
+    // 池条目可以**只有音频轨**：把 mp3 放到视频轨上是剪映的常规操作，组合子时间线里也有。
+    // 原来这条路直接 `st.sink.getSample` ⇒ 一次电池 9 条
+    // `Cannot read properties of null (reading 'getSample')`，全都挤在同一个段上。
+    // 正确回答是"这一段不成像"，并且把这个事实记住，别再逐帧重开一次流——音频腿的 silentPaths 同套路。
+    if (!noVideoPaths.has(st.path)) {
+      noVideoPaths.add(st.path);
+      out(`  · 素材无视频轨，按不成像处理：${String(st.path).split('/').pop()}`);
+    }
+    stat.no_video_media = (stat.no_video_media || 0) + 1;
+    return null;
+  }
+  let p = pumps.get(seg.id);
+  if (playingNow && (!p || p.done || p.error)) {
+    const toSec = (seg.source.start_us + seg.target.duration_us * (seg.speed || 1)) / 1e6;
+    p = makePump(seg, st, mediaSec, toSec, playGen);
+    pumps.set(seg.id, p);
+  }
+  if (p && !p.done) {
+    const f = await takeFromPump(p, mediaSec, havePicture ? HOLD_BUDGET_MS : FIRST_BUDGET_MS,
+                                !!havePicture);
+    if (f) return f;
+    if (havePicture) { pumpStats.stale_holds++; return null; }   // 调用方保留屏上那一帧
+  }
+  // 走到这里就是"泵没给到货，只能现场随机解码"——这条路比取队列贵一个量级，
+  // 电池那条路里 max 143~307 ms 的大帧到底是不是它，按帧记一笔就知道（别再靠猜）。
+  pumpStats.sync_fallbacks++;
+  const s = await st.sink.getSample(mediaSec);
+  if (!s) return null;
+  const vf = s.toVideoFrame();
+  const f = { bmp: await createImageBitmap(vf, { resizeWidth: vf.codedWidth, resizeHeight: vf.codedHeight }),
+              ts: mediaSec, rot: s.rotation || 0, dw: vf.displayWidth, dh: vf.displayHeight };
+  vf.close(); s.close();
+  return f;
+}
+
+const IMAGE_CONTAINERS = new Set(["png", "jpeg", "webp", "gif", "bmp"]);
+const imageTex = new Map();
+
+async function imageTexture(path) {
+  if (imageTex.has(path)) return imageTex.get(path);
+  const id = idOf.get(path);
+  if (!id) throw new Error(`image ${path} not served`);
+  // Pixi 8 dropped the string overload of Texture.from - it threw "reading 'width'" and the
+  // whole image branch died. Same route as video: fetch by id, hand the decoded bitmap over.
+  const resp = await fetch(`/media/${id}`);
+  if (!resp.ok) throw new Error(`image ${id} -> HTTP ${resp.status}`);
+  const tex = Texture.from(await createImageBitmap(await resp.blob()));
+  imageTex.set(path, tex);
+  return tex;
+}
+
+// ---- 入场/出场动画（F-078/P-33）----
+// 曲线值不在草稿字段里，在预设包内明文 lua 的 tween 参数里；那张表由
+// `scripts/animation_curve.py --dump-table` 导出，JS 侧**不重抄数字**（重抄就是第二轮证据）。
+// 表里没有的预设（AE 导出脚本、onUpdate 显式数学）保持静态态并计入 ANIM_STATS.noCurve，
+// 不许按名字猜曲线。
+let ANIM_CURVES = null;
+const APPLY_ANIM = Q.get('anim') !== '0';   // &anim=0：字段照读、曲线表照取，但不应用（内存 A/B 用）
+// &tw=0 只关**打字光标**那条逐字前缀路径（P-51 缺口 2）：它每帧可能改 `node.text`，
+// 而改文本会让 Pixi 重排字形——这正是最可能涨内存/掉帧的那类操作，所以必须能**单独**关掉它，
+// 否则 `&anim=0` 一关就把 fromTo 和打字一起关了，A/B 测不出是谁的代价。
+const APPLY_TW = Q.get('tw') !== '0';
+const ANIM_STATS = { loaded: false, noCurve: [], frames: 0, last: [] };
+const ANIM_READY = fetch('/playback-test/animation-curves.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .then((j) => { ANIM_CURVES = (j && j.presets) || {}; ANIM_STATS.loaded = true; return ANIM_CURVES; })
+  .catch(() => { ANIM_CURVES = {}; ANIM_STATS.loaded = false; return ANIM_CURVES; });
+
+// ---- 混合模式（U-92，接入形状由 F-094 定）----
+// 数学**不在这里重写**，也不自己造滤镜：F-094 实测把包内函数原样注进 Pixi 自己的
+// `BlendModeFilter` 模板槽（`{FUNCTIONS}`/`{MAIN}`），与裸 GL 出厂件逐字节相等
+// （multiply 与 soft_light 都 maxΔ=0、289 格全过），而自定义 `Filter` 的第二个 sampler
+// 在纯 GL 路径根本不注册（F-093④）⇒ 背景交给 Pixi 绑，我只负责喂函数体。
+// 表与切片就是通道 2 读的同一批文件（mixmode/manifest.json + frags-shipped/），不另起一份，
+// 所以浏览器这条腿不存在"第二轮誊写"。解析不出来（无本地包）的段必须显式降级并计数，
+// 与 render_frame 的 MIX_DEGRADED 同口径，不许静默当正常层画。
+const MIX = { loaded: false, packages: [], filters: new Map(), pending: new Set(),
+              degraded: [], errors: [], byId: new Map(), applied: 0 };
+fetch('/playback-test/mixmode/manifest.json')
+  .then((r) => (r.ok ? r.json() : null))
+  .then(async (j) => {
+    MIX.packages = (j && j.packages) || [];
+    MIX.loaded = true;
+  })
+  .catch(() => { MIX.errors.push('manifest fetch failed'); });
+
+// functions = 切片里 `void main` 之前、去掉声明行的部分。这条变换与 F-094 的仪器同一行代码，
+// 等价性是在这份文本上测出来的，改这里就等于改了被测对象。
+const mixFunctionsOf = (text) => String(text).split('void main')[0]
+  .replace(/^\s*(precision|uniform|varying)[^\n]*\n/gm, '');
+
+async function mixFilterFor(md5) {
+  if (MIX.filters.has(md5)) return MIX.filters.get(md5);
+  if (MIX.pending.has(md5)) return null;
+  MIX.pending.add(md5);
+  const pkg = MIX.packages.find((p) => p.package_md5 === md5) || null;
+  if (!pkg) { MIX.pending.delete(md5); MIX.degraded.push(md5); return null; }
+  try {
+    const text = await (await fetch(`/playback-test/mixmode/frags-shipped/${pkg.nameId}.frag`)).text();
+    const functions = mixFunctionsOf(text);
+    const f = new BlendModeFilter({ gl: { functions,
+      main: `finalColor = ${pkg.premul_fn}(front, back);` } });
+    f.resolution = 1;
+    f.__mix = { name_id: pkg.nameId, fn: pkg.premul_fn, chars: functions.length,
+                draft_name: pkg.draft_name_zh || '' };
+    MIX.filters.set(md5, f);
+  } catch (e) {
+    MIX.errors.push(`${String(md5).slice(0, 8)}: ${String(e && e.message || e).slice(0, 90)}`);
+  }
+  MIX.pending.delete(md5);
+  return MIX.filters.get(md5) || null;
+}
+
+// 每帧在 paintTracks 的段循环里登记（含合成子时间线，因为递归走的也是这里）
+function mixRecord(seg) {
+  const mm = seg.mix_mode;
+  MIX.byId.set(seg.id, mm && mm.package_md5 ? mm.package_md5 : null);
+  if (mm && mm.package_md5 && !MIX.filters.has(mm.package_md5) && !MIX.pending.has(mm.package_md5))
+    void mixFilterFor(mm.package_md5);
+}
+
+// 挂/摘都在帧尾做一次性的幂等比对：节点池按 seg.id 复用，混合模式是段的静态属性。
+function mixApply() {
+  let n = 0;
+  for (const [id, md5] of MIX.byId) {
+    const node = sprites.get(id) || comps.get(id) || texts.get(id);
+    if (!node) continue;
+    if (!md5) { if (node.__mixMd5) { node.filters = null; node.__mixMd5 = null; } continue; }
+    const f = MIX.filters.get(md5);
+    if (!f) continue;                       // 还在取切片，下一帧再挂；不算降级
+    if (node.__mixMd5 !== md5) { node.filters = [f]; node.__mixMd5 = md5; }
+    n += 1;
+  }
+  MIX.applied = n;
+}
+
+const mixStats = () => {
+  // 分母来自模型，不来自浏览器自己的读数：否则"这个模型本来没有混合段"和
+  // "混合段一个都没挂上"都是 0，守卫就永远是绿的。合成子时间线也算进去。
+  const walk = (segs) => segs.reduce((n, s) => n + (s.mix_mode ? 1 : 0)
+    + (s.composite && s.composite.tracks
+       ? walk(s.composite.tracks.flatMap((t) => t.segments || [])) : 0), 0);
+  return { loaded: MIX.loaded, packages: MIX.packages.length,
+    expected_segs: model && model.tracks ? walk([...model.tracks].flatMap((t) => t.segments || [])) : null,
+    known: MIX.filters.size, applied_nodes: MIX.applied, pending: [...MIX.pending],
+    degraded: [...new Set(MIX.degraded)], errors: MIX.errors.slice(0, 6),
+    detail: [...MIX.filters.values()].map((f) => f.__mix) };
+};
+
+function animValue(seg, posUs, texH, outH) {
+  if (!APPLY_ANIM) return null;
+  const an = (seg.animations || [])[0];
+  if (!an || !ANIM_CURVES) return null;
+  const pre = ANIM_CURVES[String(an.resource_id || an.path || '')];
+  if (!pre) {
+    const k = an.name || String(an.resource_id || 'unknown');
+    if (!ANIM_STATS.noCurve.includes(k)) ANIM_STATS.noCurve.push(k);
+    return null;
+  }
+  const durUs = an.duration_us || 0;
+  const segDur = (seg.target && seg.target.duration_us) || 0;
+  // `start` 是片段内起始偏移；缺席时 in 从段头起、out 从段尾倒推（算错窗口=动画常驻或永不生效）
+  const startUs = (an.start_us !== null && an.start_us !== undefined)
+    ? an.start_us : (an.kind === 'out' ? Math.max(0, segDur - durUs) : 0);
+  const t = (posUs - seg.target.start_us - startUs) / 1e6;
+  const v = { alpha: 1, s: 1, dy: 0 };
+  for (const k of pre.tracks) {
+    let from = k.from;
+    if (k.from_expr) {
+      const m = String(k.from_expr).replace(/\s+/g, '').match(/^([0-9.]+)\*textureH\/screenH$/);
+      if (!m) continue;                     // 认不出的式子 => 跳过这条轨迹，不猜
+      from = parseFloat(m[1]) * (texH || 0) / (outH || 1);
+    }
+    let f = t / Math.max(k.dur_s, 1e-6);
+    f = f <= 0 ? 0 : (f >= 1 ? 1 : (k.ease === 'quadOut' ? f * (2 - f) : f));
+    const val = from * (1 - f) + k.to * f;
+    if (k.prop === 'alpha') v.alpha = Math.min(v.alpha, Math.max(0, Math.min(1, val)));
+    else if (k.prop === 'scale') v.s = Math.min(v.s, val);
+    else if (k.prop === 'position') v.dy = val;
+  }
+  return v;
+}
+
+// 「打字光标」= 只画可见前缀（F-087）。与通道 2 的 `render_frame.typewriter_truncate`
+// 是**同一条律的两次实现**，表从模型里取（`seg.animations[].tw`，L1 从包内 lua 读出来的常量），
+// 页面不再自己抄一份 —— 两通道共用一份表，跨通道对数才有意义。
+function typewriterCount(seg, posUs, full) {
+  const a = (seg.animations || []).find((x) => x.name === '打字光标' && x.tw);
+  if (!a) return null;
+  // 时间轴 = 动画自己的 duration_us（本时间线 14 段全是 0.20 s），**不是片段时长**；
+  // 与通道 2 的 render_frame.typewriter_truncate 同一条式子，两边别再各错各的。
+  const segDur = seg.target.duration_us / 1e6;
+  const dur = (a.duration_us || 0) / 1e6 || segDur;
+  const n = [...full.replace(/\n/g, ' ')].length;
+  if (!(dur > 0) || !n) return null;
+  const table = (dur / n >= 0.15 ? a.tw.random_tween_time1 : a.tw.random_tween_time) || [];
+  if (!table.length) return null;
+  const w = []; let total = 0;
+  for (let i = 0; i < n; i++) { const v = table[i % table.length]; w.push(v); total += v; }
+  const local = (posUs - seg.target.start_us - (a.start_us || 0)) / 1e6;
+  const tau = 1.2 * Math.max(0, local) / dur;
+  let acc = 0, k = 0;
+  for (let i = 0; i < n; i++) {
+    if (tau >= acc + 0.9 * w[i] / total) { k += 1; acc += w[i] / total; } else break;
+  }
+  return k;
+}
+
+function applyTypewriter(node, seg, posUs) {
+  if (!APPLY_TW) return;
+  const full = node.__full ?? (node.__full = node.text ?? '');
+  const k = typewriterCount(seg, posUs, full);
+  if (k === null) return;
+  const chars = [...full.replace(/\n/g, ' ')];
+  const want = chars.slice(0, k).join('');
+  if (node.text !== want) node.text = want;   // 只在变化时改：Pixi 改 text 会重排字形
+}
+
+function applyAnim(node, seg, posUs, size, texH) {
+  applyTypewriter(node, seg, posUs);
+  const v = animValue(seg, posUs, texH, size.h);
+  if (!v) return;
+  // 自报里带上浏览器这一侧算出的曲线值：门会拿它和通道 2 的 anim_value 逐段对数，
+  // 于是「两条通道算的是不是同一条曲线」是可判的，而不是「看起来动了」。
+  const rec = { id: seg.id, name: ((seg.animations || [])[0] || {}).name || null,
+                alpha: +v.alpha.toFixed(4), s: +v.s.toFixed(4),
+                dy: +v.dy.toFixed(4), t_us: Math.round(posUs - seg.target.start_us) };
+  if (!ANIM_STATS.last.some((x) => x.id === rec.id)) ANIM_STATS.last.push(rec);
+  if (ANIM_STATS.last.length > 16) ANIM_STATS.last.shift();
+  node.alpha = (node.alpha ?? 1) * v.alpha;
+  if (v.s !== 1) node.scale.set(node.scale.x * v.s, node.scale.y * v.s);
+  if (v.dy) node.y -= v.dy * size.h / 2;   // y 轴向上为正（F-035/U-08）
+}
+
+function placeImage(node, clip, natural, size) {
+  const [lw, lh] = [natural.width || size.w, natural.height || size.h];
+  const c = clip || {};
+  // Uniform fit, centred: the anisotropic "fill both axes" law used for video stretches a
+  // 1242x330 logo by 4.4x. The anchor and base scale are still uncalibrated (P-11).
+  const fit = Math.min(size.w / lw, size.h / lh);
+  node.anchor.set(0.5);
+  node.scale.set((c.scale_x ?? 1) * fit, (c.scale_y ?? 1) * fit);
+  node.x = size.w / 2 + (c.x || 0) * size.w / 2;
+  node.y = size.h / 2 - (c.y || 0) * size.h / 2;
+  node.rotation = -(c.rotation || 0) * Math.PI / 180;
+  node.alpha = c.alpha ?? 1;
+}
+
+const active = (track, posUs) =>
+  track.segments.find((s) => s.visible !== false
+    && posUs >= s.target.start_us && posUs < s.target.start_us + s.target.duration_us);
+
+function place(node, clip, meta, rot, size) {
+  const W = size.w, H = size.h;
+  const tw = meta.width || node.texture.width || W, th = meta.height || node.texture.height || H;
+  const quarter = Math.abs((rot || 0) % 180) === 90;
+  // A quarter turn swaps which texture axis lands on which canvas axis; the coded frame here
+  // is 1920x1080 while the display frame is 1080x1920 (the Sony portrait-trap clips).
+  const sx = quarter ? H / tw : W / tw;
+  const sy = quarter ? W / th : H / th;
+  const c = clip || {};
+  node.anchor.set(0.5);
+  node.scale.set((c.scale_x ?? 1) * sx, (c.scale_y ?? 1) * sy);
+  node.x = W / 2 + (c.x || 0) * W / 2;
+  node.y = H / 2 - (c.y || 0) * H / 2;
+  node.rotation = (rot || 0) * Math.PI / 180 - (c.rotation || 0) * Math.PI / 180;
+  node.alpha = c.alpha ?? 1;
+}
+
+// A composite's own transform sits on top of children that already fit the canvas, so it must
+// not get the fit factor above - that would scale the whole group twice.
+function placeGroup(node, clip, child, size) {
+  const c = clip || {};
+  // Children are painted in canvas coordinates and centre themselves, so the group must be an
+  // identity transform for a null clip. Without the pivot the two centring steps add up and
+  // every composite child lands at twice the canvas centre - off-screen (seen 2026-10-22:
+  // main video, gold caption and logo all missing from the page while the scene graph said
+  // "visible"). Pivoting on the canvas centre keeps scale/rotation around the picture.
+  // Children are laid out in the sub-draft's own canvas units, so the group has to map child
+  // -> parent: fit by width, centre vertically (a 1080x1440 combination inside 1080x1920 gets
+  // 240 px of letterbox). F-074 confirmed that law against the real export - 34 positions across
+  // the child's span, median whole-frame corr 0.962 @64px - after F-070 disqualified the cover it
+  // was originally fitted against. The segment clip then rides on top of it in parent units (P-14).
+  const s = size.w / (child.w || size.w);
+  node.pivot.set((child.w || size.w) / 2, (child.h || size.h) / 2);
+  node.x = size.w / 2 + (c.x || 0) * size.w / 2;
+  node.y = size.h / 2 - (c.y || 0) * size.h / 2;
+  node.scale.set((c.scale_x ?? 1) * s, (c.scale_y ?? 1) * s);
+  node.rotation = -(c.rotation || 0) * Math.PI / 180;
+  node.alpha = c.alpha ?? 1;
+}
+
+const getOrAdd = (map, key, make) => (map.has(key) ? map.get(key) : (map.set(key, make()), map.get(key)));
+
+const rgbHex = (c) => {
+  if (!c || c.length < 3) return '#ffffff';
+  const q = (v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, '0');
+  return '#' + [c[0], c[1], c[2]].map(q).join('');
+};
+
+// em law from F-035/F-036: em_px = size x canvasWidth x 0.00574 (band .00574-.00578).
+// Shadow units from U-03: distance is the panel value 1:1 and diffuse = panel-blur / 600.
+// Both are panel-space, so they scale with the canvas the same way the font size does.
+// 草稿字体缺失时的回退：与通道 2 **同一条标定**（`caption_ink_check --sweep-fallbacks`，
+// 判据=字幕带内对成片的墨量与 corr）：雅黑粗体 墨 3961 / corr 0.777 胜过 黑体 1962/0.765、
+// 雅黑常规 2295/0.715、思源 VF 721/0.605；成片 3476。原来这里写死 'sans-serif'，
+// Chromium 落到雅黑**常规**，字幕墨量只有成片的 64%（2221 vs 3476）。
+// 缺的那款是 HelloFont_ID_JianSong_95（重宋），所以两条通道都该落到重字面，而不是各凭运气。
+const FALLBACK_FAMILY = 'Microsoft YaHei';
+let fontFallbacks = 0;
+
+function textStyleOf(st, size) {
+  const px = (st.size ?? 15) * size.w * K_EM;
+  const fam = fontFamilies.get(st.font_path);
+  const style = {
+    fontFamily: fam || FALLBACK_FAMILY,
+    fontSize: px,
+    fill: rgbHex(st.color),
+    align: 'center',
+    whiteSpace: 'pre',
+    breakWords: false,
+  };
+  if (!fam) {
+    if (!fontFallbacks) out(`字体回退：草稿面不在机器上 -> ${FALLBACK_FAMILY} 700（与通道 2 同一条标定，F-084）`);
+    fontFallbacks++;
+    style.fontWeight = '700';        // 让 Chromium 在同族里取 Bold 面（= msyhbd）
+  }
+  if (st.bold) style.fontWeight = 'bold';
+  if (st.italic) style.fontStyle = 'italic';
+  const stroke = (st.strokes || [])[0];
+  if (stroke) {
+    style.stroke = { color: rgbHex(stroke.color), width: (stroke.width ?? 0) * size.w / 1080 * 10 };
+  }
+  const sh = st.shadow;
+  if (sh) {
+    const rad = (sh.angle ?? 0) * Math.PI / 180;
+    const d = (sh.distance ?? 0) * size.w / 1080;
+    style.dropShadow = {
+      color: rgbHex(sh.color),
+      alpha: sh.alpha ?? 1,
+      blur: (sh.diffuse ?? 0) * 600 * size.w / 1080,
+      offset: { x: Math.cos(rad) * d, y: -Math.sin(rad) * d },
+    };
+  }
+  return style;
+}
+
+// styles[].range counts UTF-16 code units (U-01) and JS strings are UTF-16, so slice() is the
+// right primitive - Array.from() would shift every index that follows a surrogate pair.
+function layoutGroup(group, t, size) {
+  const txt = t.text || '';
+  const styles = (t.styles && t.styles.length) ? t.styles : [{}];
+  const widths = [];
+  group.children.forEach((node, i) => {
+    const st = styles[Math.min(i, styles.length - 1)] || {};
+    const r = st.range;
+    node.text = Array.isArray(r) ? txt.slice(r[0], r[1]) : (i ? '' : txt);
+    node.alpha = st.alpha ?? 1;
+    node.anchor.set(0, 0.5);
+    widths.push(node.width);
+  });
+  const total = widths.reduce((a, b) => a + b, 0);
+  let cursor = -total / 2;
+  group.children.forEach((node, i) => {
+    node.x = cursor;
+    cursor += widths[i];
+  });
+  return total;
+}
+
+function drawText(seg, zz, container, size, posUs) {
+  const t = seg.text || {};
+  const sig = JSON.stringify([t.text, t.styles, size.w]);
+  let group = texts.get(seg.id);
+  if (group && group._sig !== sig) {
+    group.destroy({ children: true });
+    texts.delete(seg.id);
+    group = null;
+  }
+  if (!group) {
+    group = new Container();
+    container.addChild(group);
+    texts.set(seg.id, group);
+    const styles = (t.styles && t.styles.length) ? t.styles : [{}];
+    for (const st of styles) group.addChild(new Text({ text: '', style: textStyleOf(st, size) }));
+    group._sig = sig;
+    layoutGroup(group, t, size);
+  }
+  const c = seg.clip || {};
+  // F-031: alignment is one mutually exclusive enum and both "居中" buttons write nothing, so
+  // absent and 1 are the same centred state; 0 left / 2 right / 3 top / 4 bottom.
+  const al = (t.alignment === undefined || t.alignment === null) ? 1 : t.alignment;
+  // Children are laid out in the canvas this call is drawing into (a combination's children
+  // live in the sub-draft's 1080x1440 space); W/H are the top-level canvas and put composite
+  // captions 169 px too low - the same child-vs-parent unit mix-up as P-13/P-14.
+  //
+  // Horizontal branch: F-031 reads 0 left / 2 right, but F-063's 2,071-draft distribution
+  // refutes edge anchoring - left-aligned captions sit at |x| p50 0.075, indistinguishable from
+  // the centred group's 0.028 near-edge share - so transform.x is the box centre regardless of
+  // alignment. (This line originally leaned on a cover bbox match; F-070 showed the cover is an
+  // independently rendered still, so it is not same-moment evidence.) Q-7's enum meaning stays open.
+  group.x = size.w / 2 + (c.x || 0) * size.w / 2;
+  const h = group.children[0] ? group.children[0].height : 0;
+  group.y = al === 3 ? h / 2 : al === 4 ? size.h - h / 2 : size.h / 2 - (c.y || 0) * size.h / 2;
+  // layoutGroup centres the children around the group origin, so the origin IS the text's
+  // centre and scale/rotation about it matches how the clip is authored. Without these the
+  // three emphasis subtitles here (scale 2.18 / 3.82 / 5.83, one turned 16.3 deg) previewed at
+  // 1x upright while channel 2 scaled them - a divergence between the two chains.
+  group.scale.set(c.scale_x ?? 1, c.scale_y ?? 1);
+  group.rotation = -(c.rotation || 0) * Math.PI / 180;
+  applyAnim(group, seg, posUs || 0, size, h);
+  group.zIndex = zz + (seg.render_index || 0);
+  group.visible = true;
+  visibleThisFrame.add(seg.id);
+}
+
+const childSize = (seg, size) => {
+  const c = seg.composite?.canvas || {};
+  return { w: c.width || size.w, h: c.height || size.h };
+};
+
+async function paintTracks(container, tracks, posUs, size, depth) {
+  await ANIM_READY;
+  const files = [];
+  const jobs = [];
+  let z = 0;
+  for (const track of tracks) {
+    const seg = active(track, posUs);
+    const zz = z;
+    z += 1e5;
+    if (!seg) continue;
+    mixRecord(seg);
+    if (track.type === 'text') {
+      if (seg.text?.text) drawText(seg, zz, container, size, posUs);
+      continue;
+    }
+      // A composite can carry no media of its own (this draft's track 6), so the recursion
+      // must be tested before the media guard or the whole child timeline is dropped.
+      if (seg.composite && depth < 2 && (!seg.media?.path || !seg.media.exists
+          || seg.media.container?.readable === false)) {
+        const comp = getOrAdd(comps, seg.id, () => {
+          const c = new Container();
+          c.sortableChildren = true;
+          container.addChild(c);
+          return c;
+        });
+        comp.zIndex = zz + (seg.render_index || 0);
+        comp.visible = true;
+        visibleThisFrame.add(seg.id);
+        const cs = childSize(seg, size);
+        placeGroup(comp, seg.clip, cs, size);
+        applyAnim(comp, seg, posUs, cs, null);
+        const sub = await paintTracks(comp, seg.composite.tracks,
+                                      (posUs - seg.target.start_us) * (seg.speed || 1), cs, depth + 1);
+        files.push(...sub.files);
+        continue;
+      }
+    if (!seg.media?.path || !seg.media.exists) continue;
+    liveThisFrame.add(seg.id);
+    if (IMAGE_CONTAINERS.has(seg.media.container?.container) || seg.material?.type === "photo") {
+      jobs.push((async () => {
+        const tex = await imageTexture(seg.media.path);
+        const sp = getOrAdd(sprites, seg.id, () => {
+          const n = new Sprite();
+          container.addChild(n);
+          return n;
+        });
+        sp.texture = tex;              // shared and cached: never destroyed by the frame loop
+        placeImage(sp, seg.clip, { width: tex.width, height: tex.height }, size);
+        applyAnim(sp, seg, posUs, size, tex.height);
+        sp.zIndex = zz + (seg.render_index || 0);
+        sp.visible = true;
+        visibleThisFrame.add(seg.id);
+        files.push(seg.media.path.split("/").pop());
+      })().catch((e) => out(`  ! img ${String(e.message || e).slice(0, 90)}`)));
+      continue;
+    }
+    const unreadable = seg.media.container && seg.media.container.readable === false;
+    if (unreadable && seg.composite && depth < 2) {
+      const comp = getOrAdd(comps, seg.id, () => {
+        const c = new Container();
+        c.sortableChildren = true;
+        container.addChild(c);
+        return c;
+      });
+      comp.zIndex = zz + (seg.render_index || 0);
+      comp.visible = true;
+      visibleThisFrame.add(seg.id);
+      const cs = childSize(seg, size);
+      placeGroup(comp, seg.clip, cs, size);
+        applyAnim(comp, seg, posUs, cs, null);
+      const childPos = (posUs - seg.target.start_us) * (seg.speed || 1);
+      const sub = await paintTracks(comp, seg.composite.tracks, childPos, cs, depth + 1);
+      files.push(...sub.files);
+      continue;
+    }
+    if (unreadable) {
+      // Requirement 5: an undecodable material says so out loud instead of painting black.
+      badge.visible = true;
+      badge.text = `\u26a0 \u52a0\u5bc6\u7d20\u6750\uff1a${seg.media.path.split('/').pop()}`
+                 + `\n  \u5b50\u65f6\u95f4\u7ebf\u5c55\u5f00\u8fbe\u5230\u6df1\u5ea6\u4e0a\u9650 ${depth}`;
+      continue;
+    }
+    const jobDbg = { st: null, refs_at_release: null };
+    jobs.push((async () => {
+      if (noVideoPaths.has(seg.media.path)) { stat.no_video_media = (stat.no_video_media || 0) + 1; return; }
+      // Hold across the fetch. When a segment has no forward pump (paused, or between seeks)
+      // frameFor falls back to sink.getSample with no reference of its own, and the LRU could
+      // dispose the stream underneath it - 12x "Input has been disposed" in one gate run, with
+      // the camera audio never starting because its video streams kept dying.
+      // 所有权必须和"插入池"处在**同一个同步步**。这条腿原来是 `streamFor(path)`（own=false）
+      // 之后再 `hold(st)`，中间隔着"我这次 await 的续延"那一拍——别人的 streamFor 完全可以在
+      // 那一拍走到驱逐分支，看到的正是我这个 refs=0 的新条目（音频腿按 own=true 修过，视频腿漏了）。
+      let st = await streamFor(seg.media.path, 'video', true);
+      jobDbg.st = st;
+      if (st.disposed) {
+        // 诊断抓到的就是这条道：`seg=… pooled=false refs=0 disposed=evicted pump=live`，
+        // 而那一跑的 `dispose_skipped_live=0` —— 驱逐发生在**泵建立之前**，
+        // 手里的句柄在用到之前已经是废的。驱逐侧再加守卫堵不住：窗口在"取到句柄"与
+        // "用到句柄"之间，不在"谁在册"里。所以用之前重取一次（配平靠 own=true + finally 的一次释放）。
+        release(st);
+        st = await streamFor(seg.media.path, 'video', true);
+        jobDbg.st = st;
+        poolStats.revalidated++;
+      }
+      let f;
+      const jl0 = now();
+      try {
+        const mediaSec = (seg.source.start_us + (posUs - seg.target.start_us) * (seg.speed || 1)) / 1e6;
+        // 只有"屏上已经有这一段的画面"才允许重复上一帧；截图与 seek 路径 playingNow=false，
+        // 永远走精确取帧——否则 L10 会把上一时刻的画面当成目标时刻来判（U-94 那一族风险）。
+        const havePicture = !!(HOLD_ON && playing && sprites.get(seg.id)?._bmp);
+        f = await frameFor(seg, st, mediaSec, playing, havePicture);
+      } finally {
+        // refs 要在**释放之前**读。catch 里那个 refs@catch 是 finally 之后才取的，永远是 0，
+        // 所以它答不了"被驱逐那一刻到底有没有人持用"——这正是 P-74 那次归因错位的来源。
+        jobDbg.refs_at_release = st.refs || 0;
+        release(st);
+        LEG.push([String(seg.id).slice(0, 8), Math.round(now() - jl0)]);
+      }
+      if (!f) {
+        // 真缺陷（P-92）：`HOLD_ON` 的契约是"押不到就重复上一帧"，可这里原先直接 return，
+        // 这一段就不进 visibleThisFrame，paint 末尾的清扫把 `node.visible=false` ⇒
+        // 一次取帧延迟被放大成**整层消失 ≥5 帧**（L6 的 black_streaks 全是这个形状）。
+        // 修法：屏上已经有它的画面就算本帧可见。负样本不受影响（那种段从来没有 `_bmp`），
+        // 所以黑屏守卫的牙齿保持在。
+        const held = sprites.get(seg.id);
+        if (HOLD_ON && held && held._bmp) { visibleThisFrame.add(seg.id); held.visible = true; }
+        return;
+      }
+      const sp = getOrAdd(sprites, seg.id, () => {
+        const n = new Sprite(Texture.EMPTY);
+        container.addChild(n);
+        return n;
+      });
+      if (!sp.texture || sp.texture === Texture.EMPTY || !sp.texture.source) {
+        sp.texture = Texture.from(f.bmp);
+      } else {
+        // Reuse the Texture/GPU object and only swap its image: allocating a fresh texture per
+        // frame is what kept the GPU process climbing (peak gpu-process 2978 MB at pool=4).
+        // v8 has no `source.image` - writing it left `resource` bound to the previous bitmap,
+        // which we then closed, so every frame after the first painted nothing (black video
+        // layer with a live bitmap in the scene graph, found 2026-10-22).
+        sp.texture.source.resource = f.bmp;
+        sp.texture.source.update();
+      }
+      const stale = sp._bmp;
+      sp._bmp = f.bmp;
+      if (stale && stale !== f.bmp) stale.close?.();
+      place(sp, seg.clip, { width: f.dw, height: f.dh }, f.rot, size);
+      sp.zIndex = zz + (seg.render_index || 0);
+      sp.visible = true;
+      visibleThisFrame.add(seg.id);
+      files.push(seg.media.path.split('/').pop());
+      framesDecoded++;
+    })().catch((e) => {
+      const msg = String(e && e.message || e);
+      if (/no video track/.test(msg)) {
+        // 解封装说这个文件没有视频轨：记下来，别逐帧再试一遍。漏了这一条时，同一跑里
+        // 攒出 3 次 throw + 9 次 `st.sink` 为 null 的崩溃（缓存命中后走进同步兜底）。
+        noVideoPaths.add(seg.media.path);
+        stat.no_video_media = (stat.no_video_media || 0) + 1;
+        out(`  · 素材无视频轨，按不成像处理：${String(seg.media.path).split('/').pop()}`);
+        return;
+      }
+      // 报"哪个句柄被用了但已经废了"，比只报异常更能定位：句柄对象、它还在不在池里、它的计数、
+      // 是否带 disposed / retiredUntil 标记、这一段的泵在不在册。
+      const st = jobDbg.st, idd = idOf.get(seg.media.path) || '';
+      // 把"这个媒体被驱逐时守卫看到什么"一起打出来——这才是在**动手时刻**取的数。
+      const evs = poolStats.evict_log.filter((x) => idd.endsWith(x.id)).slice(-2);
+      const ctx = st ? `handle=${st === pool.map.get(idd) ? 'current' : 'STALE'}`
+                   + ` born=${st.born} pooled=${pool.map.has(idd)} disposed=${!!st.disposed}`
+                   + ` refs@release=${jobDbg.refs_at_release} refs@catch=${st.refs || 0}`
+                   + ` evictedAs=[${evs.map((x) => `#${x.born} refs${x.refs}/pump${x.pump}/job${x.job}`
+                     + `/grace${x.grace}@${x.at}ms`).join(' ')}]`
+        : 'no-handle';
+      out(`  ! ${String(e.message || e).slice(0, 90)} [seg=${String(seg.id).slice(0, 8)} `
+        + `pump=${pumps.has(seg.id) ? 'live' : 'none'} ${ctx}]`);
+    }));
+  }
+  await Promise.all(jobs);
+  return { files };
+}
+
+const missStreak = new Map();   // segment id -> consecutive paints with no visible picture
+const blackSeen = new Set();    // ids that ever crossed BLACK_STREAK, for the report
+// 每次越线时的现场（位置/段内毫秒/泵状态）——只有 id 的话，下一个问题就答不了。
+const blackDetail = [];
+
+async function paint(posUs) {
+  window.__lastPaintUs = posUs;   // 截图电池靠它判断「目标帧真的画过了」
+  badge.visible = false;
+  liveThisFrame.clear();
+  visibleThisFrame.clear();
+  const { files } = await paintTracks(world, [...videoTracks, ...textTracks], posUs, { w: W, h: H }, 0);
+  mixApply();
+  flashApply(posUs);   // 全画布后处理：顺序与通道 2 一致（先糊后曝，`Exposure` 是最后一趟）
+  lastFiles = files;
+  // Only segments actually on screen keep a decoder running: five concurrent pumps
+  // oversubscribed the CPU and pushed the per-frame wait to 30 ms (17.48 fps / 0.864 rt).
+  for (const id of [...pumps.keys()]) {
+    const p = pumps.get(id);
+    if (liveThisFrame.has(id)) {
+      if (p?.warm) { p.warm = false; warmStats.used++; }   // 预热的泵真被用上了，转普通泵
+      continue;
+    }
+    // 预热的泵还没到剪切点：这一帧它不在屏上，但不能按老规矩立刻停掉，否则预热永远白做。
+    // 越过段尾还没被用上就是白热，照常回收并计一笔（wasted 是这条腿有效率的证据）。
+    if (p?.warm && p.seg && p.seg.target.start_us > posUs) continue;
+    // P-94 的真缺陷：播放头**还停在这一段上**时不能回收它的泵。这一段本帧没出图就不进
+    // liveThisFrame，于是清扫把刚建好、正在解首帧的泵也停掉 ⇒ 下一帧重新建泵、重新冷解，
+    // 每帧重付一次首帧解码，永远追不上（现场：pos=13.74、段内 143 ms、pump=none 连续 5 帧空窗）。
+    if (p?.seg && posUs >= p.seg.target.start_us
+        && posUs < p.seg.target.start_us + p.seg.target.duration_us) continue;
+    if (p?.warm) warmStats.wasted++;
+    stopPump(id);
+  }
+  warmAhead(posUs);
+  // Audio jobs used to outlive their segment: the pool cap was then unreachable (observed
+  // 7 entries with max=4) and eviction disposed a stream mid-iteration ("Input has been
+  // disposed", 11x per run). Jobs are released once their segment is >0.5 s behind the playhead.
+  for (const [id, j] of [...audioJobs]) {
+    const endUs = j.seg ? j.seg.target.start_us + j.seg.target.duration_us : null;
+    if (endUs !== null && posUs * 1 > endUs + 500000) stopAudioJob(id);
+  }
+  frameNo++;
+  for (const map of [sprites, texts, comps])
+    for (const [id, node] of map) {
+      if (visibleThisFrame.has(id)) { node._last = frameNo; continue; }
+      node.visible = false;
+      node._last = node._last || 0;
+    }
+  // A retained sprite keeps its 1080x1920 texture (≈8 MB) alive on both sides of the GPU.
+  // The 600 s soak proved that retaining one per segment is not affordable: peak RSS went
+  // from 1210 MB (no composites) to 5393 MB (composites on), still climbing at the end.
+  // So off-screen sprites are evicted outright once the cache passes SPRITE_CACHE, and the
+  // next appearance rebuilds them - a decode hitch on a cut is cheaper than an OOM.
+  const SPRITE_CACHE = 6;
+  if (sprites.size > SPRITE_CACHE) {
+    const stale = [...sprites.entries()].sort((a, b) => (a[1]._last || 0) - (b[1]._last || 0));
+    for (const [id, node] of stale.slice(0, sprites.size - SPRITE_CACHE)) {
+      if (visibleThisFrame.has(id)) continue;
+      sprites.delete(id);
+      node.destroy({ children: true, texture: true, textureSource: true });
+    }
+  }
+  world.sortChildren();
+  for (const c of comps.values()) c.sortChildren();
+  // Criterion 6 says an undecodable material must announce itself instead of painting black.
+  // P-12 proved the same rule is needed for a live segment that simply produces no picture:
+  // fps, decoded frames and byte counters all stayed green while the entire video layer was
+  // blank. A miss has to persist for BLACK_STREAK paints before it is flagged, so one dropped
+  // frame on a cut is not an alarm.
+  const BLACK_STREAK = 5;
+  const blacked = [];
+  for (const track of videoTracks) {
+    const s = active(track, posUs);
+    if (!s || !s.media?.path || !s.media.exists || s.media.container?.readable === false) continue;
+    // 这里**不设**"素材无视频轨"豁免。加过一次，门的 `L6 guard has teeth` 立刻抓到：
+    // 负样本 model-blacktest.json 的 black_streaks 被抹成 []，判据自己把自己弄瞎了。
+    // 视频轨上放 mp3 时"这一段没有画面"是用户看得见的空白，属于要报的事实，不属于要豁免的噪声；
+    // noVideoPaths 的作用只限于"别再逐帧重开一次流、别把同一件事刷成 12 条错误"。
+    const node = sprites.get(s.id);
+    if (node && node.visible) { missStreak.delete(s.id); continue; }
+    const n = (missStreak.get(s.id) || 0) + 1;
+    missStreak.set(s.id, n);
+    if (n >= BLACK_STREAK) {
+      blacked.push(s.id.slice(0, 8)); blackSeen.add(s.id.slice(0, 8));
+      // 只记 id 就永远只能猜。带上"这次空窗发生在段内第几毫秒 + 它的泵此刻是什么状态"，
+      // 才分得清两件事：**切点起步的那一帧没赶上**（age 小、泵刚建/队列空）
+      // 还是**播到一半断供**（age 大、队列被抽干）。前一种是预热/预解码的深度问题，
+      // 后一种是交付/驱逐问题——修法完全不同（P-92 就是因为只有 id 而定不了责）。
+      if (n === BLACK_STREAK && blackDetail.length < 40) {
+        const p = pumps.get(s.id);
+        blackDetail.push({ id: s.id.slice(0, 8), pos: +(posUs / 1e6).toFixed(2),
+          age_ms: Math.round(posUs - s.target.start_us),
+          pump: p ? (p.error ? 'err' : p.done ? 'done' : `q${p.q.length}`) : 'none',
+          warm: p?.warm ? 1 : 0, sprite: sprites.has(s.id) ? 1 : 0,
+          hold: HOLD_ON ? 1 : 0, priv_live: privLive });
+      }
+    }
+  }
+  // Cumulative, not a snapshot: the playhead moves on, and a report taken after a seek storm
+  // would otherwise read empty for a layer that was blank for seconds (the fixture run proved it).
+  stat.blackStreaks = [...blackSeen];
+  stat.blackDetail = blackDetail;
+  if (blacked.length) {
+    badge.visible = true;
+    badge.text = `\u26a0 \u8fde\u7eed ${BLACK_STREAK} \u5e27\u6ca1\u51fa\u56fe\uff1a${blacked.join(' ')}`;
+  }
+}
+
+async function loadFonts() {
+  // The draft records the absolute path of the face it used; serving it through the same
+  // id-addressed read-only route means the preview rasterises the same glyphs (F-036).
+  for (const f of model.fonts || []) {
+    const id = idOf.get(f.path);
+    if (!f.exists || !id) continue;
+    const fam = 'JY-' + (f.path.split('/').pop() || 'font').replace(/\.[^.]+$/, '') + '-' + id.slice(0, 6);
+    try {
+      const face = new FontFace(fam, `url(/media/${id})`);
+      await face.load();
+      document.fonts.add(face);
+      fontFamilies.set(f.path, fam);
+    } catch (e) {
+      out(`  ! font ${String(e && e.message || e).slice(0, 70)}`);
+    }
+  }
+  out(`字体：${fontFamilies.size}/${(model.fonts || []).length} 已注册`);
+}
+
+const hud = (id, v) => { document.getElementById(id).textContent = v; };
+let frameNo = 0;
+const tickErrors = [];
+const AVCLK_ON = Q.get('avclk') === '1';   // 默认仍走墙钟：实测两臂残差都是 −0.008 s（最大 +0.02 s），
+                                           // 换时钟**没有**改善音画对齐——停顿的效应是画面"跳一下"，
+                                           // 不是"落后于音频"（`pos += dt` 会把挡住的时间一次补回来）。
+                                           // 保留 &avclk=1 只是把这条否证留在仪器里，别下次又凭猜想改。
+let actxT0 = 0;
+let pos = 0, playing = false, measuring = false, lastWall = 0, frames = 0, winStart = 0, intervals = [], lastAt = 0, framesDecoded = 0, lastFiles = [];
+
+async function tick(t) {
+  if (measuring) { requestAnimationFrame(tick); return; }
+  let gapMs = -1, gapPos = 0;
+  if (playing) {
+    scheduleAudio(pos);
+    // 播放头跟随**音频时钟**，不再跟墙钟。这个文件的第 150 行早就写着
+    // "AudioContext is the clock authority"，但 tick() 一直用 performance.now() 推进——
+    // 于是每次 `await paint()` 超预算（实测整条时间轴累计 942 ms、21 帧过线），
+    // 画面冻住而音频照播 ⇒ 音频一路领先画面，听起来就是"轨道没混合、有的该响没响"。
+    // 视频跟音频是播放器的标准做法：超预算时宁可少画一帧，也不让两条时钟分叉。
+    const clk = (AVCLK_ON && actx) ? (actx.currentTime - actxT0) * 1000 : t;
+    if (lastWall) {
+      const dt = (clk - lastWall) / 1000;
+      pos = Math.min(DUR, pos + Math.max(0, dt));
+      if (pos >= DUR) toggle(false);
+    }
+    lastWall = clk;
+    if (!winStart) winStart = t;
+    if (lastAt) { gapMs = Math.round(t - lastAt); gapPos = +pos.toFixed(2); }
+    lastAt = t; frames++;
+  }
+  const paintT0 = now();
+  try { await paint(pos * 1e6); }
+  catch (e) { tickErrors.push(String(e && e.message || e).slice(0, 120)); }
+  // 当帧 paint 耗时和帧间隔一起记：gap≈paint 是我们画得慢，gap≫paint 是浏览器没给帧。
+  if (gapMs >= 0) intervals.push([gapMs, gapPos, Math.round(now() - paintT0)]);
+  hud('pos', `${pos.toFixed(2)} / ${DUR.toFixed(2)} s`);
+  hud('stat', `req ${stat.requests} / bytes ${(stat.bytes / 1e6).toFixed(1)} MB`);
+  hud('heap', performance.memory ? `heap ${(performance.memory.usedJSHeapSize / 1048576).toFixed(0)} MB` : 'heap -');
+  const el = (t - winStart) / 1000;
+  if (playing && el > 0.5) hud('fps', `fps ${(frames / el).toFixed(2)} 池 ${pool.map.size}`);
+  document.getElementById('play').style.left = `${(pos / DUR) * 100}%`;
+  requestAnimationFrame(tick);
+}
+
+function toggle(on) {
+  playing = on ?? !playing;
+  if (playing) {
+    ensureAudio();
+    actxT0 = (AVCLK_ON && actx) ? actx.currentTime : 0;   // 播放起点绑定到音频时钟
+    winStart = 0; frames = 0; lastWall = 0; lastAt = 0;
+  }
+  else { killPumps(); stopAudio(); }
+  hud('mode', `mode ${playing ? 'PLAY' : 'PAUSE'}`);
+}
+
+const bar = document.getElementById('bar');
+for (const track of [...videoTracks, ...textTracks]) {
+  for (const s of track.segments) {
+    const d = document.createElement('div');
+    d.className = 'seg';
+    d.style.left = `${(s.target.start_us / 1e6 / DUR) * 100}%`;
+    d.style.width = `${(s.target.duration_us / 1e6 / DUR) * 100}%`;
+    d.style.top = `${(track.index % 6) * 3 + 3}px`;
+    d.style.background = track.type === 'text' ? '#c73' : '#5a5';
+    bar.appendChild(d);
+  }
+}
+bar.onclick = (e) => seekTo(((e.clientX - bar.getBoundingClientRect().left) / bar.clientWidth) * DUR);
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); toggle(); }
+  if (e.code === 'ArrowLeft') seekTo(pos - 1);
+  if (e.code === 'ArrowRight') seekTo(pos + 1);
+});
+async function seekTo(t) {
+  const s0 = now(), b0 = stat.bytes, q0 = stat.requests;
+  toggle(false);
+  pos = Math.max(0, Math.min(DUR, t));
+  await paint(pos * 1e6);
+  const ms = +(now() - s0).toFixed(1);
+  hud('mode', `mode seek ${ms} ms`);
+  return { ms, bytes: stat.bytes - b0, requests: stat.requests - q0, file: lastFiles.join('+'),
+           got: lastFiles.length > 0 };
+}
+
+const pct = (a, p) => a.length ? a[Math.min(a.length - 1, Math.floor(a.length * p))] : null;
+const med = (a) => a.length ? a[(a.length - 1) >> 1] : null;
+
+async function battery() {
+  const r = { label: Q.get('label') || MODEL_URL, model_url: MODEL_URL, canvas: `${W}x${H}`, duration_s: +DUR.toFixed(3),
+              tracks: model.stats.track_count, segments: model.stats.segment_count,
+              media: model.stats.media_count, missing: model.stats.media_missing,
+              unreadable: model.stats.media_unreadable,
+              visibility: document.visibilityState, hasFocus: document.hasFocus(),
+              gpu: (() => { const gl = document.createElement('canvas').getContext('webgl2');
+                const e = gl && gl.getExtension('WEBGL_debug_renderer_info');
+                return e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : 'none'; })(),
+              raf: true };
+  const step_ms = 33;
+  r.apply_anim = APPLY_ANIM;
+  // 读数在**发送时**取，不在这里冻结（P-33 那次把 `ANIM_STATS` 写进对象字面量，报出去的是
+  // 取数时刻的 loaded=false，数组随后才填满）。分母由 mixStats 自己从模型数，见上。
+  Object.defineProperty(r, 'mix', { get: mixStats, enumerable: true });
+  const firstPlayable = (() => {
+    for (const t of videoTracks) for (const s of t.segments)
+      if (s.media?.exists && s.media?.container?.readable !== false) return s.target.start_us / 1e6 + 0.01;
+    return 0;
+  })();
+  r.first_playable_at_s = +firstPlayable.toFixed(2);
+  // warmStats 的归零必须在**prime 之前**：一开始我把它留在测量窗口开头（在 prime 之后），
+  // 于是 `primed` 报成 0，而起点那几帧明明已经从预建的泵里取到图了——
+  // 计数器的取样时刻比它的数值更容易骗人（P-86 的读数就是靠这条才没被写成"腿没跑"）。
+  Object.assign(warmStats, { started: 0, used: 0, wasted: 0, dropped: 0, open_ms_max: 0,
+                               opened_only: 0, primed: 0, err: '' });
+  let t0 = now();
+  // 起点没有"切点之前"可预热，而最坏帧恰恰压在这一帧（P-85④：t=1.82 一帧 153 ms）。
+  // 先把在场段的泵建起来再画第一帧：开流是并发的，墙钟 = max(开流)，不是 sum。
+  await warmAhead(firstPlayable * 1e6, true);
+  await paint(firstPlayable * 1e6);
+  ANIM_STATS.frames = ANIM_STATS.last.length ? 1 : 0;
+  r.first_frame_ms = +(now() - t0).toFixed(1);
+
+  const playMs = +(Q.get('playms') || 3000);
+  const b0 = stat.bytes, q0 = stat.requests, d0 = framesDecoded;
+  Object.assign(pumpStats, { hits: 0, misses: 0, dropped: 0, waits_ms: 0, decoded: 0, decode_ms: 0,
+                               stale_holds: 0, sync_fallbacks: 0 });
+  Object.assign(audioStats, { chunks: 0, nodes: 0, peak_rms: 0, peak_fs: 0, clipped_windows: 0, sample_rate: 0, audio_errors: 0,
+    loudness_applied: 0, fades_applied: 0, rms_windows: [], clamps: 0, clamp_ms_total: 0, clamp_ms_max: 0,
+    exp_s: 0, sched_s: 0, lost_s: 0, short_jobs: 0, interrupted_jobs: 0, jobs_started: 0, dropped_samples: 0,
+    flushes: 0, flushes_quiet: 0, flush_rms_sum: 0, per_seg: [] });
+  // rAF is frozen in a hidden/background tab (measured: 0 frames in 6 s), so the play leg paces
+  // itself on a timer and reports the rAF frame count alongside the visibility state.
+  measuring = true;
+  pos = firstPlayable;
+  playing = true;
+  const wall0 = now();
+  // Clock-authoritative loop: position comes from wall time, paint overruns show up as dropped
+  // frames rather than as a slow-motion picture (the serial version paced at 22.87 fps / 0.755 rt).
+  const targetFps = +(Q.get('fps') || 30);
+  let painted = 0, late = 0, next = wall0;
+  const phase = { paint_ms: 0, render_ms: 0, loop_ms: 0 };
+  const frameCost = [];   // [当帧耗时 ms, 播放头 s]，用来把卡顿对到具体时刻
+  // `painted` counts loop iterations, not new pictures: a 600 s soak reported 30 fps while
+  // only 21 fps of frames were actually fresh. Source advance is the modular forward distance
+  // and the headline for the 连续播放 判据 is new_frames_per_second.
+  const span = DUR - firstPlayable;
+  let walked = 0, prevPos = firstPlayable;
+  // 每帧的"责任"计数器：cost 之外再看这一帧发了几个 Range 请求、解了几帧、在 pump 上等了几 ms。
+  // 段头假设已经否掉（10 个最坏帧只有 3 个落在 50 ms 内），所以要拿证据分网络/解码/绘制。
+  let fReq = stat.requests, fDec = framesDecoded, fWait = pumpStats.waits_ms,
+      fSfb = pumpStats.sync_fallbacks;
+  while (now() - wall0 < playMs) {
+    const l0 = now();
+    const elapsed = (now() - wall0) / 1000;
+    pos = Q.has('loop') ? firstPlayable + (elapsed % span)
+                        : Math.min(DUR, firstPlayable + elapsed);
+    let d = pos - prevPos;
+    if (d < 0) d += span;
+    walked += d;
+    prevPos = pos;
+    scheduleAudio(pos);
+    measureAudio();
+    LEG.length = 0;
+    await paint(pos * 1e6);
+    const p1 = now();
+    // 每帧耗时按播放头记下来：门的 composited_fps 是「帧数/墙钟」的一个均值，
+    // 均值 30 fps 也能是「每三帧里有一帧花 90 ms」——那正是用户看到的"一顿一顿"。
+    frameCost.push([Math.round(p1 - l0), +pos.toFixed(2), stat.requests - fReq,
+                    framesDecoded - fDec, Math.round(pumpStats.waits_ms - fWait),
+                    pumpStats.sync_fallbacks - fSfb,
+                    [...LEG].sort((x, y) => y[1] - x[1]).slice(0, 2)]);
+    fReq = stat.requests; fDec = framesDecoded; fWait = pumpStats.waits_ms;
+    fSfb = pumpStats.sync_fallbacks;
+    app.render();
+    phase.paint_ms += p1 - l0;
+    phase.render_ms += now() - p1;
+    phase.loop_ms += now() - l0;
+    painted++;
+    next += 1000 / targetFps;
+    const wait = next - now();
+    if (wait > 0) await new Promise((res) => setTimeout(res, wait));
+    else if (wait < -100) { next = now(); late++; }
+  }
+  const wall = (now() - wall0) / 1000;
+  const costAt = (q) => { const xs = frameCost.map((x) => x[0]).sort((a, b) => a - b);
+    return xs.length ? xs[Math.min(xs.length - 1, Math.round(q * (xs.length - 1)))] : null; };
+  const fresh = framesDecoded - d0;
+  r.play = { painted_frames: painted, decoded: fresh, window_ms: +(wall * 1000).toFixed(0),
+             composited_fps: +(painted / (wall || 1)).toFixed(2),
+             fresh_track_frames_per_second: +(fresh / (wall || 1)).toFixed(2),
+             target_fps: targetFps, catch_up_skips: late,
+             source_seconds_advanced: +walked.toFixed(2),
+             realtime_factor: +(walked / (wall || 1)).toFixed(3),
+             pool: pool.map.size, pool_stats: { ...poolStats, refs_live: liveRefEntries() }, requests: stat.requests - q0, bytes: stat.bytes - b0,
+             phase_ms_per_frame: { paint: +(phase.paint_ms/painted).toFixed(1), render: +(phase.render_ms/painted).toFixed(1), loop: +(phase.loop_ms/painted).toFixed(1) },
+             // 帧预算的下界：这一帧从取数到画完花多久。中位数过线只说明"平均不卡"，
+             // p95/max 与它落在哪个播放头才是"一顿一顿"的成因（阈值 33 ms = 30 fps 的一帧）。
+             frame_cost_ms: { p50: costAt(.5), p90: costAt(.9), p95: costAt(.95), max: costAt(1),
+               over_33ms: frameCost.filter((x) => x[0] > 33).length,
+               over_100ms: frameCost.filter((x) => x[0] > 100).length, n: frameCost.length,
+               // 交互播放里播放头按墙钟推进、而 rAF 回调 `await paint()`——一帧超预算多久，
+               // 画面就比自己的音频**落后**多久（音频图跑在自己的时钟上）。这个累加值就是
+               // "声音跑到画前面"的预测量，不用等可见窗口也能判。
+               over_budget_ms: frameCost.reduce((s, x) => s + Math.max(0, x[0] - 33.3), 0),
+               worst: [...frameCost].sort((a, b) => b[0] - a[0]).slice(0, 10) },
+             audio: { ...audioStats, jobs: audioJobs.size },
+             pump: { ...pumpStats, live: pumps.size },
+             warm: { ...warmStats, on: WARM_ON, lead_s: VIDEO_LEAD, max: WARM_MAX,
+                     predecode: WARM_PREDECODE, inflight: warmInflight.size },
+             // 到货最慢的段：用它判断空窗到底是解码跟不上还是别的（P-92 的结论要靠它，而不是靠猜）
+             slowest_arrivals: [...arrivals.values()].sort((x, y) => y.max_ms - x.max_ms).slice(0, 16),
+             // 空窗那几段的到货记录必须在报告里，否则“慢名单没有它”既可能是真的没慢、也可能只是没进前 8
+             hole_arrivals: [...arrivals.values()].filter((x) => blackSeen.has(x.id)),
+             // 点名的腿无条件回送：A/B 要用它证明"这一臂的这条腿活着"，前 16 名做不到这一点。
+             probe_arrivals: [...arrivals.values()].filter((x) => PROBE_IDS.has(String(x.id).toUpperCase())),
+             raf_frames_observed: frames };
+  toggle(false);
+  const n = Q.has('seeks') ? +Q.get('seeks') : 8;
+  const list = [], per = [], noop = [], cold = [], warm = [];
+  for (let i = 0; i < n; i++) {
+    const to = DUR * (0.05 + 0.9 * (((i * 7) % n) / n));
+    const s = await seekTo(to);
+    // Three outcomes, only two of which are seek samples. A position whose only covering
+    // segment is an encrypted composite decoded nothing (noop). A seek served from the
+    // stream's own cache fetched 0 bytes but still produced a frame - that IS a sample,
+    // and calling it a noop under-samples the proxy run (its first draft of this counted
+    // 6 of 12 real seeks as "no decode" purely because nothing was fetched).
+    if (s.got) {
+      list.push(s.ms);
+      (s.requests > 0 ? cold : warm).push(s.ms);
+    } else noop.push(s.ms);
+    per.push([+to.toFixed(2), s.ms, s.bytes, s.requests, s.file || '-']);
+  }
+  const nums = list.slice().sort((a, b) => a - b);
+  r.seek = { n: nums.length, list: nums, median_ms: med(nums), max_ms: nums[nums.length - 1],
+             cold_n: cold.length, cold_median_ms: med(cold.slice().sort((a, b) => a - b)),
+             warm_n: warm.length, warm_median_ms: med(warm.slice().sort((a, b) => a - b)),
+             per_target: per, no_decode_positions: noop };
+  r.heap_mb = +(performance.memory ? performance.memory.usedJSHeapSize / 1048576 : 0).toFixed(1);
+  r.errors = (LOG.textContent.match(/!.*$/gm) || []).slice(0, 12);
+  r.tick_errors = [...new Set(tickErrors)].slice(0, 6);
+  (r.play = r.play || {}).audio_rates_seen = [...audioRates].sort();
+  // Criterion 6 as a number: segments that were on screen but painted nothing for BLACK_STREAK
+  // paints in a row. Empty means "no silent black frame observed", which the counters could not
+  // say before (P-12 shipped a whole black video layer with every other metric green).
+  r.black_streaks = stat.blackStreaks || [];
+  r.black_detail = stat.blackDetail || [];
+  r.uncovered_tracks = UNCOVERED_TRACKS;   // 门/人看得到“丢了哪些轨”，不再只有‘画面正常’   // 空窗的现场：切点起步 vs 播到一半断供，靠这个分
+  // 「不成像」的素材要报出来，而不是攒成一串崩溃：分母（跳过几帧）+ 名单（哪些文件）。
+  r.no_video_media = { frames_skipped: stat.no_video_media || 0,
+                       paths: [...noVideoPaths].map((p) => String(p).split('/').pop()) };
+  // anim 必须在发报告时再取一次：写在对象字面量里等于在创建时拍快照，
+  // 于是 last（数组，按引用）看得到后续帧、loaded（布尔，按值）永远停在 false。
+  r.anim = { loaded: ANIM_STATS.loaded, noCurve: ANIM_STATS.noCurve.slice(0, 12),
+             frames: ANIM_STATS.frames, last: ANIM_STATS.last };
+  // 入场动画这条渲染路径的自证：表有没有载到、几帧应用过、最后一次 E/V 与糊到多少 px。
+  // 分母（应用帧数）必须报出来——0 段应用与"这条草稿本来没有 AE 表段"是两种不同的事。
+  r.flash = { loaded: AE.loaded, packages: AE.n, step_us: AE.step_us || 0,
+    applied_frames: AE.applied, e_mean: +(AE.eSum / Math.max(1, AE.applied)).toFixed(4),
+    v_mean: +(AE.vSum / Math.max(1, AE.applied)).toFixed(2), lastE: AE.lastE, lastV: AE.lastV,
+    blur_px: AE.blurPx, missing: AE.missing.slice(0, 8), on: AO_ON, k: AO_SIGMA_PER_V };
+  // 录的音频随报告一起发：这样"这 0.5 s 有无声"不再靠轮询自证，而是有一段真波形可判。
+  r.audio_capture = await postCapture('preview-' + (Q.get('tag') || 'run'));
+  await fetch('/report', { method: 'POST', body: JSON.stringify({ tag: Q.get('tag') || 'playback', ...r }) });
+  out('BATTERY ' + JSON.stringify(r, null, 1));
+  measuring = false;
+  document.title = 'DONE';
+}
+// Exposed so an MCP-driven test can seek and read counters without restarting the page.
+window.__player = { seekTo, toggle, paint, model, stat, pool, sprites, texts, comps, imageTex, tickErrors,
+                    app, get pos() { return pos; }, get intervals() { return intervals; },
+                    get playing() { return playing; }, get lastPaintUs() { return window.__lastPaintUs; } };
+out(`模型就绪：${DUR.toFixed(2)} s  ${W}x${H}  ${model.stats.track_count} 轨 / ${model.stats.segment_count} 段  `
+   + `素材 ${model.stats.media_count}（缺 ${model.stats.media_missing}，不可解封装 ${model.stats.media_unreadable}）`);
+requestAnimationFrame(tick);
+if (Q.get('shots')) {
+  // 浏览器自己把画出来的帧回传给网关 /shot：门的 L2/L3 一直用通道 2 出图，
+  // 交互预览内核（产品本体）的画面从没被像素判过。降采样到 540 宽再发，
+  // 免得 1080x1920 的 PNG base64 顶穿网关上限；判据端用同一尺度比。
+  const w2 = 540;
+  for (const tt of Q.get('shots').split(',')) {
+    const t = Number(tt);
+    if (!Number.isFinite(t)) continue;
+    await seekTo(t);
+    // seek 之后出帧是异步的，只等两次 rAF 会拍到**上一帧**（t=1.0 那跑跨通道只有 0.91 就是这么来的）。
+    // 等到 paint 报回的位置落在目标附近，再多等三帧稳定，才截图。
+    await new Promise((resolve) => {
+      let tries = 0;
+      const tick = () => {
+        tries += 1;
+        if (Math.abs(((window.__lastPaintUs || 0) / 1e6) - t) < 0.01 || tries > 90) {
+          requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          return;
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+    let png = null, w = w2, h = 0, why = '';
+    try {
+      const px = app.renderer.extract.pixels(app.stage);
+      const buf = px.pixels instanceof Uint8ClampedArray ? px.pixels : new Uint8ClampedArray(px.pixels);
+      const src = document.createElement('canvas');
+      src.width = px.width; src.height = px.height;
+      src.getContext('2d').putImageData(new ImageData(buf, px.width, px.height), 0, 0);
+      h = Math.max(1, Math.round(px.height * w2 / px.width));
+      const c2 = document.createElement('canvas'); c2.width = w2; c2.height = h;
+      const ctx = c2.getContext('2d');
+      ctx.imageSmoothingEnabled = true; ctx.drawImage(src, 0, 0, w2, h);
+      png = c2.toDataURL('image/png').split(',')[1];
+    } catch (e) { why = String(e && e.message || e).slice(0, 90); }
+    await fetch('/shot', { method: 'POST',
+      body: JSON.stringify({ tag: 'shot', t, png, w, h, why,
+                          t_paint_us: window.__lastPaintUs || 0,
+                          // 截图这一路也带上混合模式读数：L10 只看像素的话，
+                          // "这模型本来没混合段"和"混合段一个没挂"是同一个数
+                          mix: mixStats() }) });
+  }
+}
+if (Q.get('seek')) await seekTo(+Q.get('seek'));
+if (Q.get('autostart') === '1') battery();
+if (+Q.get('liveplay')) await liveplay(+Q.get('liveplay'));
+
+// 交互播放的**卡顿**判据。门的 L4 用 battery() 那条定时器补帧循环，它把 gap 亲手修平成
+// 33 ms（`next += 1000/fps`），所以中位 29 fps 全绿也照样看不见用户说的"一顿一顿"：
+// 中位数对抖动天然瞎（同族教训：F-072 整帧相关看不见单层、F-080 质心被同色字幕劫持）。
+// 这条只走真实 rAF 路径，报帧间隔分布 + 每个大间隔的播放头位置与当帧 paint 耗时。
+async function liveplay(ms) {
+  const firstPlayable = (() => {
+    for (const t of videoTracks) for (const s of t.segments)
+      if (s.media?.exists && s.media?.container?.readable !== false) return s.target.start_us / 1e6 + 0.01;
+    return 0;
+  })();
+  // 起点没有"切点之前"可预热，而最坏帧恰恰压在这一帧（P-85④：t=1.82 一帧 153 ms）。
+  // 先把在场段的泵建起来再画第一帧：开流是并发的，墙钟 = max(开流)，不是 sum。
+  await warmAhead(firstPlayable * 1e6, true);
+  await paint(firstPlayable * 1e6);
+  intervals = []; lastAt = 0; lastWall = 0; winStart = 0; frames = 0;
+  pos = firstPlayable;
+  // 时钟轨：每 200 ms 记一条 [墙钟ms, 播放头s, 音频时钟s]。
+  // 有了它，"画面比音频落后多少"就不是拿我用来推进的那把尺子自己量自己（那是恒 0 的空检验），
+  // 而是可以把录音里的**声音起点**换算到墙钟，再和"播放头走到那段内容的墙钟"直接相减。
+  const clockTrack = [];
+  const sampler = setInterval(() => clockTrack.push(
+    [Math.round(now()), +pos.toFixed(3), actx ? +(actx.currentTime * 1000).toFixed(0) : null]), 200);
+  toggle(true);
+  // 本机三次独立实测（headless、Qoder 内置浏览器、我自己起的带头 Chrome）都是 rAF **0 帧**，
+  // 所以真实帧节奏在自动判据里量不到。但 tick() 本来就是 rAF 不等它返回的 fire-and-forget：
+  // 用定时器按同一帧率去敲同一个函数体，`await paint()` 挡住下一拍的效应完全一样，
+  // 于是"画面推进 vs 音频时钟"的残差就自动可测。用 &drive=timer 显式声明，不冒充真实 rAF。
+  let pump = null;
+  if (Q.get('drive') === 'timer') {
+    pump = setInterval(() => {
+      try { tick(now()); } catch (e) { tickErrors.push(String((e && e.message) || e)); }
+    }, Math.round(1000 / (+(Q.get('fps') || 30))));
+  }
+  await new Promise((res) => setTimeout(res, ms));
+  if (pump) clearInterval(pump);
+  toggle(false);
+  clearInterval(sampler);
+  const pct = (xs, p) => (xs.length ? xs[Math.min(xs.length - 1, Math.round(p * (xs.length - 1)))] : null);
+  const gaps = intervals.map((x) => x[0]).sort((a, b) => a - b);
+  const paints = intervals.map((x) => x[2]).sort((a, b) => a - b);
+  const r = { tag: Q.get('tag') || 'playback', model_url: MODEL_URL.split('/').pop(),
+    canvas: `${W}x${H}`, visibility: document.visibilityState, raf: frames > 0,
+    live: { window_ms: ms, frames: intervals.length,
+      gap_p50_ms: pct(gaps, 0.5), gap_p90_ms: pct(gaps, 0.9), gap_p95_ms: pct(gaps, 0.95),
+      gap_max_ms: gaps.length ? gaps[gaps.length - 1] : 0,
+      gaps_over_50ms: gaps.filter((g) => g > 50).length,
+      gaps_over_100ms: gaps.filter((g) => g > 100).length,
+      gaps_over_200ms: gaps.filter((g) => g > 200).length,
+      paint_p50_ms: pct(paints, 0.5), paint_p95_ms: pct(paints, 0.95),
+      paint_max_ms: paints.length ? paints[paints.length - 1] : 0,
+      worst_gap_ms: gaps.length ? gaps[gaps.length - 1] : 0,
+      // [gap_ms, 播放头 s, 当帧 paint ms]：位置用来把卡顿对到切点/段头，paint 用来分责任
+      worst: [...intervals].sort((a, b) => b[0] - a[0]).slice(0, 10),
+      clock_track: clockTrack.slice(0, 400), driver: Q.get('drive') || 'raf',
+      // 预热带在真实帧节奏里是否真跑起来了：started=建了几个预热泵、used=有几个被到点的第一帧
+      // 真取走、wasted=白热了几个。没有这三个数，"gap 变小"可能只是别的改动带来的。
+      warm: { ...warmStats, on: WARM_ON, lead_s: VIDEO_LEAD, max: WARM_MAX },
+      avclk: AVCLK_ON },
+    black_streaks: stat.blackStreaks || [], tick_errors: [...new Set(tickErrors)].slice(0, 6) };
+  r.capture = await postCapture('live-' + (Q.get('tag') || 'liveplay'));
+  await fetch('/report', { method: 'POST', body: JSON.stringify(r) });
+  out('LIVEPLAY ' + JSON.stringify(r.live));
+  document.title = 'DONE';
+}
+</script>
