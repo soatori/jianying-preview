@@ -1,6 +1,6 @@
 ---
 name: jianying-preview
-description: 只读预览与校验剪映(JianYingPro)草稿：解析/解密 draft_content.json，在浏览器按时间线复现画面与声音（多轨叠序、文本样式/描边/阴影/渐变、动画、转场、混音、复合子画布），并提供无浏览器的离线合成通道与 21 层回归门。当用户要求"预览剪映草稿""看看改完的效果""不开剪映能不能看到时间线""草稿截图""校验/验证剪映改动"，或在自动化剪辑改完草稿后需要确认结果时使用。绝不修改草稿内容。
+description: 只读预览与校验剪映(JianYingPro)草稿：解析/解密 draft_content.json，在浏览器按时间线复现画面与声音（多轨叠序、文本样式/描边/阴影/渐变、动画、转场、混音、复合子画布），并提供无浏览器的离线合成通道与回归门（全量跑 28 条判据，逐层报 PASS/FAIL/SKIP）。当用户要求"预览剪映草稿""看看改完的效果""不开剪映能不能看到时间线""草稿截图""校验/验证剪映改动"，或在自动化剪辑改完草稿后需要确认结果时使用。绝不修改草稿内容。
 ---
 
 # 剪映草稿只读预览与校验（M2）
@@ -19,10 +19,10 @@ description: 只读预览与校验剪映(JianYingPro)草稿：解析/解密 draf
 |---|---|---|
 | L1 模型 | `scripts/playback_model.py` | 解密/解析草稿 → `model.json`（段、几何、字体、动画引用、音量、断言） |
 | 安装定位 | `scripts/jy_paths.py` | 自动检测剪映安装（`ffmpeg.exe` / `videoeditor.dll` / `canvas_agent` 的 js 目录都从这里取），结果记在 `config.local.json`；不再往脚本里写死盘符 |
-| 网关 | `scripts/preview_gateway.py` | 只绑 127.0.0.1、GET/HEAD、Range + keep-alive；媒体与字体按不透明 id 供；`/report` `/shot` `/wave` 回收入口 |
-| 浏览器通道 | `player/player.html` | Pixi 8 合成 + mediabunny 解码 + WebAudio 混音；运行副本在 `temp/playback-test/player.html`（门会逐字节校验） |
+| 网关 | `scripts/preview_gateway.py` | 只绑 127.0.0.1、GET/HEAD、Range + keep-alive；媒体与字体按不透明 id 供；`/report` `/shot` `/wave` 回收入口。日志行以 `epoch=<毫秒>` 开头（页面回送 `epoch_base`，于是页内 await 窗能与服务端窗 `[epoch-ms, epoch]` **逐窗相交**）；`--log` / `--log-max-mb`（默认 64，超限**改名归档不删**）/ `--run-id` 让每轮有独立可筛的日志 |
+| 浏览器通道 | `player/player.html` | Pixi 8 合成 + mediabunny 解码 + WebAudio 混音；运行副本在 `temp/playback-test/player.html`（门会逐字节校验）。仪表开关：`&split=0/1`（默认 1；**0 = 改前那段循环原样**，用作新通路自己的负样本）、`&slowleg=<ms>`（慢腿入册门槛，默认 100）、`&probe=<8位id,…>`（点名腿无条件回送，**判活只认它且 `pushes>0`**，"没进前 16 名"证明不了任何事）；报告里 `play.slow_legs={gaps,over,dropped,rows}` 的**分母是 `gaps`**，`play.switches` 回映生效值并附整条 `search` |
 | 离线通道 | `scripts/render_frame.py` | PIL/ffmpeg 同律渲染，用于像素级对照与成片比对 |
-| 门 | `scripts/playback_check.py` | 21 层判据，非零退出即失败；自己起停网关 |
+| 门 | `scripts/playback_check.py` | 回归门，**判据条数随开关变化**：P-97 全量跑 28 条 = 22 判绿 + 3 INFO + 3 红；`--skip-jank` 会为 `L4 frame budget` 与 `L4 live pacing` 各留一行 SKIP。末尾那行"N of N checks passed"**把 SKIP 计作未失败**，所以报绿必须连 SKIP 条数一起报。`--settle-seconds`（默认 12）在相邻浏览器阶段交界处空机等待——理由是 `browser_soak` 返回时只 terminate 自己的主进程，gpu/renderer 与 profile 落盘还在收尾，背靠背会同时污染 live pacing、L6 与 RSS peak |
 
 播放器依赖的 `pixi.js` / `mediabunny` 从 `temp/px-probe/node_modules` 取本地固定版本——**不走 CDN**，
 因为换版本就是换像素，历史对照会失真。
