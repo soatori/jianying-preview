@@ -475,6 +475,12 @@ def main() -> int:
                         f"；预热泵 {w.get('used')}/{w.get('started')} 被到点取用"
                         f"（开={w.get('on')} 白热={w.get('wasted')} 废={w.get('dropped')}）"
                         + ("" if ok else f" | worst={fc.get('worst', [])[:3]} fps={pl.get('composited_fps')}"))
+            else:
+                # 跳过时要留一行的理由：这层是"整条时间轴会不会冻住"的唯一判据，而末尾的绿色总数
+                # 是按 checks 计数、SKIP 也计入"未失败"。不留行，`--skip-jank` 的一跑就会以
+                # "N of N 全绿"的名义，宣称一个从没测过的判据通过了。
+                checks.append(("L4 frame budget (whole timeline, tail not mean)", "SKIP",
+                               "--skip-jank：整条时间轴的 p95/max 未测，本层的判据不在这一跑里"))
             # ---- 4c. L4 直播节奏（tick 那条真实通路，用 drive=timer 敲同一个函数体）--------------
             # 其余各腿都跑在 battery() 自己按墙钟补帧的循环上；本机 headless、Qoder 内置浏览器、
             # 我自己起的带头 Chrome 三处都实测 **rAF 0 帧**，真实 rAF 自动测不到。
@@ -518,19 +524,26 @@ def main() -> int:
                         f"（p95<=50 / max<=150）；音画残差 max={None if av_max is None else round(1000*av_max)} ms"
                         f"（<=50，截到播放头走完为止）；paint p95={lv.get('paint_p95_ms')} "
                         f"driver={lv.get('driver')} avclk={lv.get('avclk')} 错误={len(ld.get('tick_errors') or [])}")
+            else:
+                checks.append(("L4 live pacing + A/V residual (drive=timer, not real rAF)", "SKIP",
+                               "--skip-jank：直播节奏这条真实通路的 tick 未测"))
 
             # L6 的分母原本只有 10 s 电池那几条跑，于是**整条时间轴那跑里的黑屏从来没被 judge 过**。
             # P-85 就是这么一条：flag=2 叠层 `C7817`（窗口 10.733–12.467 s）在整条跑里连续 ≥5 帧没出图，
             # 同跑 L6 仍报 0/1。判"有没有静默黑屏"却不看用户实际会走完整条的那一遍，等于只在一小段
             # 采样里有牙齿。现在把整条跑（jank）与直播节奏跑（livepacing）一起纳入，并按路径标注，
             # 免得两个分母混成一个数。
-            extra_runs = [("整条时间轴", jd), ("直播节奏", ld)]
+            extra_runs = [(n, d) for n, d in (("整条时间轴", jd), ("直播节奏", ld)) if d]
+            # --skip-jank 时 jd/ld 是空 dict。空 dict 的 black_streaks 是 falsy，原来会被当成
+            # "0 条黑屏"计进 2 的分母 ⇒ 用没跑过的跑充数。只计真取到读数的跑，缺几条写进 detail。
+            missing_x = 2 - len(extra_runs)
             bad = [d for d in runs if d.get("black_streaks") or d.get("errors")]
             bad_x = [(name, d) for name, d in extra_runs
                      if isinstance(d, dict) and (d.get("black_streaks") or d.get("errors"))]
             verdict("L6 no silent black frame", not bad and not bad_x,
                     f"{len(bad)}/{len(runs)} 电池跑 + {len(bad_x)}/{len(extra_runs)} 整条/直播跑"
                     f" 有 black_streaks 或 errors"
+                    + (f"；整条/直播跑缺 {missing_x} 条（--skip-jank），分母随之缩小" if missing_x else "")
                     + (f"; e.g. {bad[0].get('black_streaks')} {bad[0].get('errors')[:1]}" if bad else "")
                     + "".join(f" | {n}: {d.get('black_streaks')} {(d.get('errors') or [''])[0][:70]}"
                               f" (max帧时 {(d.get('play') or {}).get('frame_cost_ms', {}).get('max')} ms"

@@ -693,47 +693,159 @@ const pumpStats = { hits: 0, misses: 0, dropped: 0, waits_ms: 0, decoded: 0, dec
 // 有记录且 pushes>0 才算活腿，缺记录就是死腿——死腿的"停顿消失"不能当成效果。
 const PROBE_IDS = new Set((Q.get('probe') || '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
 const arrivals = new Map();
+
+// ---- S1 仪表：把一次 push 拆成 await / convert / park 三段 ----------------------------------
+// P-95 把记账错的位置核到了行：旧循环先取到货戳 `tArr = now()`、写 `p.lastArr`，**之后**才
+// `while (p.q.length >= QMAX) await p.sleep()` ⇒ 第 i 次到货与第 i-1 次的墙钟差 =
+// `await_i + convert_i + park_{i-1}`，泵等消费者唤醒的那段（背压，供给 > 需求）被算进了
+// "下一帧的到货延迟"。所以这一轮把三段分别计时，到货记录同时给两个口径：
+//   gap_with_park = tArr_i - tArr_{i-1}      （旧口径，逐毫秒与历史读数可比）
+//   gap_nopark    = gap_with_park - park_{i-1}（新口径：只剩本帧的取字节+解封装+解码+转换）
+// `&split=0` 走**改前那段循环原样**（for await + 只记旧口径），它是这条新通路自己的负样本：
+// 两臂的 gap_with_park 必须同框，否则"拆分把现象抹掉了"这句话没法否证。
+const SPLIT_ON = Q.get('split') !== '0';
+const SLOW_LEG_MS = +(Q.get('slowleg') || 100);   // 进慢腿名单的门槛（gap_nopark 口径）
+// 慢腿名单带**窗口两端**的时间戳（performance.now 口径）。报告另回送
+// `epoch_base = Date.now() - performance.now()`，于是每个 await 窗能直接和网关同窗口的
+// 请求行相交（S2）。`gaps` 是算出过间隔的腿次数（分母），`over` 是命中数，`dropped` 是
+// 超过在册上限被丢弃的条数——分母不写清就等于没说。
+const slowLegs = { gaps: 0, over: 0, dropped: 0, rows: [], cap: 200 };
+
 function makePump(seg, st, fromSec, toSec, gen) {
   const p = { q: [], waiters: [], done: false, killed: false, error: null, gen, seg, st, stId: st.id,
-               lastArr: 0, maxGapMs: 0, maxGapAt: null, gaps50: 0 };
+               lastArr: 0, maxGapMs: 0, maxGapAt: null, gaps50: 0,
+               lastParkMs: 0, pushIdx: 0, srcStartS: (seg.source && seg.source.start_us || 0) / 1e6 };
   p.sleep = () => new Promise((res) => p.waiters.push(res));
   p.wake = () => { p.waiters.splice(0).forEach((r) => r()); };
   hold(st);
   (async () => {
     try {
-      for await (const s of st.sink.samples(fromSec, toSec)) {
-        if (!s) continue;
-        if (gen !== playGen) { s.close?.(); break; }
-        const d0 = now();
-        const vf = s.toVideoFrame();
-        const item = { ts: s.timestamp, rot: s.rotation || 0, dw: vf.displayWidth, dh: vf.displayHeight,
-                       bmp: await createImageBitmap(vf, { resizeWidth: vf.codedWidth, resizeHeight: vf.codedHeight }) };
-        vf.close();
-        s.close();
-        pumpStats.decoded++;
-        pumpStats.decode_ms += now() - d0;
-        // 到货节奏：空窗那次只证明了"队列是空的"，没证明"解码跟不上"。两者要分开，
-        // 所以每个泵记自己相邻两次 push 的最大墙钟间隔（含首帧：从泵建立算起）。
-        const tArr = now();
-        // 账要无条件记：`pushes` 从**第一次 push 就计**（此前它写在 `if (p.lastArr)` 里面，
-        // 于是"只解出一帧"的腿在名单里根本不存在，死腿和极短腿分不开）。间隔仍只在第二次起算。
-        const rec = arrivals.get(seg.id) || { id: String(seg.id).slice(0, 8),
-              file: String(seg.media && seg.media.path || '').split('/').pop(),
-              max_ms: 0, over50: 0, pushes: 0 };
-        rec.pushes++;
-        if (p.lastArr) {
-          const g = tArr - p.lastArr;
-          if (g > p.maxGapMs) { p.maxGapMs = g; p.maxGapAt = +s.timestamp.toFixed(3); }
-          if (g > 50) p.gaps50++;
-          if (g > rec.max_ms) { rec.max_ms = g; rec.at = +s.timestamp.toFixed(2); }
-          if (g > 50) rec.over50++;
+      if (!SPLIT_ON) {
+        // ============ 改前原样（S1 的负样本）============
+        // 冻结：这里不加任何东西，它的价值就是"和历史那份账同一尺度"。
+        for await (const s of st.sink.samples(fromSec, toSec)) {
+          if (!s) continue;
+          if (gen !== playGen) { s.close?.(); break; }
+          const d0 = now();
+          const vf = s.toVideoFrame();
+          const item = { ts: s.timestamp, rot: s.rotation || 0, dw: vf.displayWidth, dh: vf.displayHeight,
+                         bmp: await createImageBitmap(vf, { resizeWidth: vf.codedWidth, resizeHeight: vf.codedHeight }) };
+          vf.close();
+          s.close();
+          pumpStats.decoded++;
+          pumpStats.decode_ms += now() - d0;
+          // 到货节奏：空窗那次只证明了"队列是空的"，没证明"解码跟不上"。两者要分开，
+          // 所以每个泵记自己相邻两次 push 的最大墙钟间隔（含首帧：从泵建立算起）。
+          const tArr = now();
+          // 账要无条件记：`pushes` 从**第一次 push 就计**（此前它写在 `if (p.lastArr)` 里面，
+          // 于是"只解出一帧"的腿在名单里根本不存在，死腿和极短腿分不开）。间隔仍只在第二次起算。
+          const rec = arrivals.get(seg.id) || { id: String(seg.id).slice(0, 8),
+                file: String(seg.media && seg.media.path || '').split('/').pop(),
+                max_ms: 0, over50: 0, pushes: 0 };
+          rec.pushes++;
+          if (p.lastArr) {
+            const g = tArr - p.lastArr;
+            if (g > p.maxGapMs) { p.maxGapMs = g; p.maxGapAt = +s.timestamp.toFixed(3); }
+            if (g > 50) p.gaps50++;
+            if (g > rec.max_ms) { rec.max_ms = g; rec.at = +s.timestamp.toFixed(2); }
+            if (g > 50) rec.over50++;
+          }
+          arrivals.set(seg.id, rec);
+          p.lastArr = tArr;
+          while (p.q.length >= QMAX && !p.killed && gen === playGen) await p.sleep();
+          if (p.killed || gen !== playGen) { item.bmp.close?.(); break; }
+          p.q.push(item);
+          p.wake();
         }
-        arrivals.set(seg.id, rec);
-        p.lastArr = tArr;
-        while (p.q.length >= QMAX && !p.killed && gen === playGen) await p.sleep();
-        if (p.killed || gen !== playGen) { item.bmp.close?.(); break; }
-        p.q.push(item);
-        p.wake();
+      } else {
+        // ============ S1 三段拆分 ============
+        // 必须自己驱动迭代器：`for await` 把 `next()` 的阻塞时间混进了循环体，量不到
+        // "这一次 await 花了多久"。退出时显式 `it.return()`，复现 for-await 在 break 时的清理语义。
+        const it = st.sink.samples(fromSec, toSec)[Symbol.asyncIterator]();
+        try {
+          for (;;) {
+            const a0 = now();
+            const step = await it.next();
+            const awaitMs = now() - a0;      // 取字节 + 解封装 + 解码（Chrome 侧，Python 不在里面）
+            if (step.done) break;
+            const s = step.value;
+            if (!s) continue;
+            if (gen !== playGen) { s.close?.(); break; }
+            const c0 = now();
+            const vf = s.toVideoFrame();
+            const item = { ts: s.timestamp, rot: s.rotation || 0, dw: vf.displayWidth, dh: vf.displayHeight,
+                           bmp: await createImageBitmap(vf, { resizeWidth: vf.codedWidth, resizeHeight: vf.codedHeight }) };
+            vf.close();
+            s.close();
+            const convertMs = now() - c0;    // toVideoFrame + createImageBitmap（+close）
+            pumpStats.decoded++;
+            pumpStats.decode_ms += convertMs;   // 与旧臂 `now() - d0` 同尺度，可直接对表
+            const tArr = now();
+            const prevArr = p.lastArr;
+            p.pushIdx++;                    // 本泵的第几次到货（剪切点后的帧序号要从它读，不是媒体时刻猜）
+            const rec = arrivals.get(seg.id) || { id: String(seg.id).slice(0, 8),
+                  file: String(seg.media && seg.media.path || '').split('/').pop(),
+                  max_ms: 0, over50: 0, pushes: 0,
+                  // 旧口径最大间隔（`max_ms`）那一腿自己的三段 —— S1 验收的关键证据形态：
+                  // "wp 350 ms" 必须能写成 `park_prev 343 + await 2.5 + convert 0.2`，
+                  // 否则只是换了个数，没把它归类。
+                  park_at_wp: 0, await_at_wp: 0, convert_at_wp: 0, other_at_wp: 0,
+                  age_wp: null, pushes_wp: 0, warm_at_wp: false, gen_at_wp: null,
+                  // 新口径（不含 park）的最大间隔 + 那一腿自己的三段与位置，S3 直接读这些
+                  max_np: 0, over100_np: 0, at_np: null, await_np: 0, convert_np: 0,
+                  other_np: 0, park_np: 0, gen_np: null, age_np: null, warm_np: false, pushes_np: 0 };
+            rec.pushes++;
+            if (prevArr) {
+              const wp = tArr - prevArr;                       // 旧口径
+              const np = Math.max(0, wp - p.lastParkMs);       // 新口径
+              const other = np - awaitMs - convertMs;          // 事件循环杂项（不是 park）
+              if (wp > p.maxGapMs) { p.maxGapMs = wp; p.maxGapAt = +s.timestamp.toFixed(3); }
+              if (wp > 50) p.gaps50++;
+              if (wp > rec.max_ms) {
+                rec.max_ms = wp; rec.at = +s.timestamp.toFixed(2);
+                rec.park_at_wp = +p.lastParkMs.toFixed(1);
+                rec.await_at_wp = +awaitMs.toFixed(1); rec.convert_at_wp = +convertMs.toFixed(1);
+                rec.other_at_wp = +other.toFixed(1); rec.age_wp = +(s.timestamp - p.srcStartS).toFixed(3);
+                rec.pushes_wp = p.pushIdx; rec.warm_at_wp = !!p.warm; rec.gen_at_wp = gen;
+              }
+              if (wp > 50) rec.over50++;
+              slowLegs.gaps++;
+              if (np > rec.max_np) {
+                rec.max_np = np; rec.at_np = +s.timestamp.toFixed(2);
+                rec.await_np = +awaitMs.toFixed(1); rec.convert_np = +convertMs.toFixed(1);
+                rec.other_np = +other.toFixed(1); rec.park_np = +p.lastParkMs.toFixed(1);
+                rec.gen_np = gen; rec.age_np = +(s.timestamp - p.srcStartS).toFixed(3);
+                rec.warm_np = !!p.warm; rec.pushes_np = p.pushIdx;
+              }
+              if (np > SLOW_LEG_MS) {
+                slowLegs.over++;
+                const row = {
+                  id: rec.id, file: rec.file,
+                  np: +np.toFixed(1), wp: +wp.toFixed(1),
+                  await_ms: +awaitMs.toFixed(1), convert_ms: +convertMs.toFixed(1),
+                  park_prev: +p.lastParkMs.toFixed(1), other_ms: +other.toFixed(1),
+                  gen, warm: !!p.warm, push_idx: p.pushIdx,   // push_idx = 本泵第几次到货
+                  at: +s.timestamp.toFixed(3),                // 媒体时刻
+                  age_s: +(s.timestamp - p.srcStartS).toFixed(3),   // 相对剪切点的年龄
+                  // 窗（performance.now；报告带 epoch_base，换算 = x + epoch_base）
+                  w0: +(prevArr + p.lastParkMs).toFixed(1), w1: +tArr.toFixed(1),        // gap_nopark 窗
+                  aw0: +(tArr - convertMs - awaitMs).toFixed(1), aw1: +(tArr - convertMs).toFixed(1),  // await 窗
+                  pw0: +prevArr.toFixed(1), pw1: +(prevArr + p.lastParkMs).toFixed(1),   // 上一帧的 park 窗
+                };
+                if (slowLegs.rows.length < slowLegs.cap) slowLegs.rows.push(row);
+                else slowLegs.dropped++;
+              }
+            }
+            arrivals.set(seg.id, rec);
+            p.lastArr = tArr;
+            const k0 = now();
+            while (p.q.length >= QMAX && !p.killed && gen === playGen) await p.sleep();
+            p.lastParkMs = now() - k0;   // 记在 park 之后：下一帧的间隔要把它减掉
+            if (p.killed || gen !== playGen) { item.bmp.close?.(); break; }
+            p.q.push(item);
+            p.wake();
+          }
+        } finally { await it.return(); }
       }
     } catch (e) { p.error = String(e && e.message || e); }
     finally { release(st); }
@@ -1820,10 +1932,22 @@ async function battery() {
                      predecode: WARM_PREDECODE, inflight: warmInflight.size },
              // 到货最慢的段：用它判断空窗到底是解码跟不上还是别的（P-92 的结论要靠它，而不是靠猜）
              slowest_arrivals: [...arrivals.values()].sort((x, y) => y.max_ms - x.max_ms).slice(0, 16),
+             // S1 的新口径名单（按 gap_nopark 排序）：`max_ms` 是旧口径（含 park），`max_np` 是不含
+             // park 的那笔，`await_np/convert_np/park_np/other_np` 是那一腿的三段归属，
+             // `age_np`（相对剪切点的媒体秒）与 `pushes_np`（本泵第几次到货）用来判"是不是钉在剪切点后第 4 帧"。
+             arrivals_np: [...arrivals.values()].sort((x, y) => (y.max_np || 0) - (x.max_np || 0)).slice(0, 16),
+             // S2 要用它和网关的请求行相交：`gaps` 是分母（算出过间隔的腿次数），`over` 是
+             // `np > slowleg_ms` 的条数，`dropped` 是超过在册上限丢的条数（0 才算名单完整）。
+             slow_legs: { gaps: slowLegs.gaps, over: slowLegs.over, dropped: slowLegs.dropped,
+                          threshold_ms: SLOW_LEG_MS, rows: slowLegs.rows },
              // 空窗那几段的到货记录必须在报告里，否则“慢名单没有它”既可能是真的没慢、也可能只是没进前 8
              hole_arrivals: [...arrivals.values()].filter((x) => blackSeen.has(x.id)),
              // 点名的腿无条件回送：A/B 要用它证明"这一臂的这条腿活着"，前 16 名做不到这一点。
              probe_arrivals: [...arrivals.values()].filter((x) => PROBE_IDS.has(String(x.id).toUpperCase())),
+             // 开关的**生效值**回映（不只看 URL 写了什么）：同名参数会被前面那个遮蔽（P-83/P-87 死开关家族）。
+             switches: { split: SPLIT_ON, qmax: QMAX, warm: WARM_ON, warm_lead_s: VIDEO_LEAD,
+                         warm_predecode: WARM_PREDECODE, hold: HOLD_ON, slowleg_ms: SLOW_LEG_MS,
+                         probe: [...PROBE_IDS], search: location.search },
              raf_frames_observed: frames };
   toggle(false);
   const n = Q.has('seeks') ? +Q.get('seeks') : 8;
@@ -1872,6 +1996,12 @@ async function battery() {
     blur_px: AE.blurPx, missing: AE.missing.slice(0, 8), on: AO_ON, k: AO_SIGMA_PER_V };
   // 录的音频随报告一起发：这样"这 0.5 s 有无声"不再靠轮询自证，而是有一段真波形可判。
   r.audio_capture = await postCapture('preview-' + (Q.get('tag') || 'run'));
+  // S2 的时钟对接：页内所有戳（slow_legs 的 w0/w1/aw0/aw1/pw0/pw1）都是 performance.now 口径，
+  // `epoch_base + x` 就是 epoch 毫秒，于是每个 await 窗能和网关日志里同窗口的请求行直接相交。
+  // `epoch_sent` 是发报告这一刻的 Date.now()：和网关收到 POST 的 epoch 相减 = 两条墙钟的错位量，
+  // 相交之前先看它（同一台机器应当只有几毫秒）。
+  r.epoch_base = Math.round(Date.now() - now());
+  r.epoch_sent = Date.now();
   await fetch('/report', { method: 'POST', body: JSON.stringify({ tag: Q.get('tag') || 'playback', ...r }) });
   out('BATTERY ' + JSON.stringify(r, null, 1));
   measuring = false;
@@ -1992,6 +2122,13 @@ async function liveplay(ms) {
       avclk: AVCLK_ON },
     black_streaks: stat.blackStreaks || [], tick_errors: [...new Set(tickErrors)].slice(0, 6) };
   r.capture = await postCapture('live-' + (Q.get('tag') || 'liveplay'));
+  // 同 battery()：页内戳换成 epoch 毫秒用的基准（S2 的窗相交）。
+  r.epoch_base = Math.round(Date.now() - now());
+  r.epoch_sent = Date.now();
+  r.slow_legs = { gaps: slowLegs.gaps, over: slowLegs.over, dropped: slowLegs.dropped,
+                  threshold_ms: SLOW_LEG_MS, rows: slowLegs.rows };
+  r.switches = { split: SPLIT_ON, qmax: QMAX, warm: WARM_ON, warm_lead_s: VIDEO_LEAD,
+                 probe: [...PROBE_IDS], search: location.search };
   await fetch('/report', { method: 'POST', body: JSON.stringify(r) });
   out('LIVEPLAY ' + JSON.stringify(r.live));
   document.title = 'DONE';
