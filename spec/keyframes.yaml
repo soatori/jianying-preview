@@ -1,0 +1,99 @@
+# 关键帧（common_keyframes）真实形状 —— 关闭 U-14
+# 实测：2,052 份去重内容（**r2 分母**，快照 2026-10-16；r3 是 2,050，本文件的 8395/2869 未按 r3 重取）；
+# 8,395 个关键帧控制点、2,869 条关键帧记录来自 temp/spec-audit/structures.json（scripts/spec_audit.py，含嵌套草稿口径）
+
+container:
+  location: segment.common_keyframes[]                      # verified（带该键的 segment 17,411 个，其中空数组占绝大多数）
+  record_keys: [id, material_id, property_type, keyframe_list]   # verified（含嵌套口径各 2869/2869/2869/2847，来自 `temp/spec-audit/structures.json`）
+  note: >-
+    记录本身带 material_id，即关键帧挂在 material 上、由 segment 引用；
+    同一条记录的 keyframe_list 是同一 property_type 的控制点序列。
+  material_id_join: >-
+    `material_id` 为空串 = 关键帧作用于**片段自身**的属性（位置/缩放/旋转/透明度/调色滑杆全都是空串）；
+    非空时它指向的是**某个 bucket 条目的 `constant_material_id`**，不是条目的 `id`。
+    r3 实测（`temp/corpus-detail/relations.csv`）：非空的 389 条里 **228 条能按 `constant_material_id` 命中**、
+    **0 条能按条目 `id` 命中**、**161 条两边都命不中**（集中在 `KFTypeContourPath` 与部分 `KFTypeCommonMask*`，
+    命中/未命中按类型分布见 `temp/check-1016/probe6.txt`）。目前只有两类属性会走这条绑定：
+    `KFTypeCommonMask*`（蒙版，宿主 `common_mask[].constant_material_id`）与 `KFTypeHsl*Intensity`
+    （宿主 `hsl.constant_material_id`，10月16日 草稿实测 3 条对 1 条）。未命中的 161 条见 U-43。
+
+single_frame_skeleton:
+  observed: >-
+    2026-10-18 差分（F-027）实测：一个**没有做过任何动画**的画面片段带着 31 条 `common_keyframes` 轨道，
+    每个可动画属性一条，每条 `keyframe_list` 长度 1、帧**没有 `time_offset` 键**、
+    `left_control`/`right_control` 都是 `{x:0.0, y:0.0}`、`values` 就是该属性的当前标量值。
+    观测到的属性：`KFTypePositionX/Y`、`KFTypeScaleX`、`KFTypeRotation`、`KFTypeVolume` + 26 个调色类
+    （`KFTypeBrightness/Contrast/Saturation/…/KFTypePrimaryColorWheelIntensity`）。
+  sync_rule: >-
+    **骨架帧值与标量字段同步写**：把 `clip.scale.x` 从 1.3 改到 2.0 时，`KFTypeScaleX` 那一帧的 `values[0]`
+    同时从 1.3 变到 2.0。所以我们的编辑器只改 `clip.*` 而不同步骨架，就会与剪映的读法不一致
+    （到底哪一侧优先未定 → U-45）。
+  not_guaranteed: >-
+    「每属性恒有一条」不成立：等比缩放关闭时应用**新建**了 `KFTypeScaleY` 轨道，恢复等比时又把它**删除**，
+    而之后 y 值仍然变化却没有重建。轨道的创建/删除时机是 U-45 的核心问题。
+  counts: "带 `common_keyframes` 的片段 17,411 个（多数为空数组）；骨架是否普遍存在未做全量统计——语料侧可用「keyframe_list 长度全为 1 且无 time_offset」筛出这类轨道"
+
+keyframe_item:
+  keys:
+    id: 8395
+    left_control: 8395
+    right_control: 8395
+    values: 8395
+    time_offset: 7304          # 87%；缺省时含义见下
+    curveType: 3687            # 44%；缺省即按 Line 或按宿主记录的类型
+    graphID: 2884
+    string_value: 1739
+  sample: '{"id": "...", "left_control": {"x": 0.0, "y": 0.0}, "right_control": {"x": 0.0, "y": 0.0},
+            "time_offset": 1266666, "values": [0.12852459016393447]}'
+  semantics:
+    time_offset: 相对片段起点的微秒偏移                       # verified（量级与 duration 一致）
+    values: 数值数组，标量属性长度为 1                        # verified
+    left_control/right_control: 贝塞尔控制柄 {x,y}，(0,0) 表示无手动缓动  # verified（两键 100% 存在）
+    string_value: 非数值型关键帧（如颜色/文本相关）的字符串载体；含义待逐型确认  # open（U-33；此处旧标 U-24 是撞号遗留）
+    graphID: 与顶层 keyframe_graph_list 关联的图 id（顶层键 15 个未记录项之一）  # open（U-34；旧标 U-25）
+
+curveType:                              # verified —— 与 capcut-cli 声称的 Hold/Smooth/Beizer 不符（conflicts C-009）
+  observed: {Line: 2192, FreeCurveInOut: 1213, FreeCurveIn: 145, FreeCurveOut: 141, CurveInOut: 1}
+  basis: >-
+    r3 起这五个数由 `corpus_scan.py` 直接在**顶层 segment 口径**上统计（`stats.json -> keyframe_curve_types`，
+    控制点总数 `keyframe_control_points` = 8,447，其中 3,692 条带 `curveType` = 43.7%，缺省 56.3%）。
+    旧版此处写的 3,687 / 8,395 来自 `spec_audit.py` 的**含嵌套草稿**口径，两数不可混用但结论一致。
+  absent_rate: 56%                      # 缺省即「按控制柄/线性」，见 implementation
+  reading: >-
+    Line = 线性；FreeCurveIn/Out/InOut = 自由曲线的手动/入场/出场/双端形态，配合左右控制柄使用；
+    CurveInOut 为个例（1 次），疑为 UI 预设写入的变体。
+  implementation: 渲染器按「有控制柄即用三次贝塞尔缓动，否则线性插值」即可覆盖全部观测形态
+
+property_types:
+  count: 70                                 # r3 `stats.json -> keyframe_property_types`（此前这里写 51，是早期小样本遗留；spec/panel-map.yaml 的「measured: 51」同源）
+  vocabulary_source: ../evidence/tables/keyframe_types.csv
+  picture: [KFTypePositionX, KFTypePositionY, KFTypeScaleX, KFTypeScaleY, KFTypeRotation,
+            KFTypeGlobalAlpha, KFTypeAlpha, KFTypeFade]
+  mask: [KFTypeCommonMaskPositionX, KFTypeCommonMaskPositionY, KFTypeCommonMaskSizeWidth,
+         KFTypeCommonMaskSizeHeight, KFTypeCommonMaskRotation, KFTypeCommonMaskFeather,
+         KFTypeCommonMaskExpansion, KFTypeCommonMaskRoundCorner,
+         KFTypeMaskSizeX, KFTypeMaskSizeY, KFTypeMaskPostionX, KFTypeMaskPostionY,   # 官方拼写 Postion
+         KFTypeMaskRotation, KFTypeMaskFeather, KFTypeMaskRoundCorner, KFTypeContourPath]
+  text: [KFTypeTextColor, KFTypeBorderAlpha, KFTypeBackgroundAlpha, KFTypeShadowAlpha]
+  effect_params: [effects_adjust_size, effects_adjust_intensity, effects_adjust_vertical_shift,
+                  effects_adjust_horizontal_shift, effects_adjust_color, effects_adjust_blur,
+                  effects_adjust_speed, effects_adjust_texture, effects_adjust_filter,
+                  effects_adjust_range, effects_adjust_background_animation]
+  audio: [KFTypeVolume, KFTypeLastVolume]
+  color_skip: [KFTypeBrightness, KFTypeContrast, KFTypeHue, KFTypeFilter, KFTypeColorMatch,
+               KFTypeSmartColorAdjust, KFTypeChromaIntensity, KFTypeLightSensatione, KFTypeSharpen,
+               KFTypeVignetting]        # 调色类，按 phase 划分不渲染
+  color_skip_r3_additions: [KFTypeTemperature, KFTypeSaturation, KFTypeNaturalSaturation, KFTypeHightLight,
+                            KFTypeShadow, KFTypeWhite, KFTypeBlack, KFTypeClear, KFTypeFade, KFTypeParticle,
+                            KFTypeColorDehaze, KFTypeColorBacklightCorrection, KFTypeColorLevel,
+                            KFTypeColorRestoreDetail, KFTypeColorSoften, KFTypeHslHueIntensity,
+                            KFTypeHslSaturationIntensity, KFTypeHslLightnessIntensity,
+                            KFTypeLogColorWheelIntensity, KFTypePrimaryColorWheelIntensity]
+  # 说明：后 20 个是 r3 补全（10月16日 草稿一次把整块调色面板 + HSL + 两套色轮都打了关键帧，实测 31 条记录）。
+  # 两个官方拼写错误照原样保留：`KFTypeHightLight`（Hight）、`KFTypeLightSensatione`（结尾多个 e）。
+  # 按 phase 划分全部不渲染，但**读回写回必须保真**（keyframe_list 结构同 keyframe_item）。
+
+interpolation:
+  rule: 控制点之间按 curveType/控制柄求值，值域为 values 数组的对应分量
+  units: time_offset 为微秒，需按 segment.target_timerange 换算到时间线
+  pending: 首个控制点之前的取值（是否钳制为首值）与最后控制点之后的钳制规则未实测   # open（U-35；旧标 U-26）

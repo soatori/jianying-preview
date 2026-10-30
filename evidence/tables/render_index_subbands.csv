@@ -1,0 +1,20 @@
+section,key,value
+free_render_index_mode_on_per_content,False,648
+free_render_index_mode_on_per_content,None,1402
+sub_band,type=text base=17000,even=7 odd=1
+sub_band,type=text base=15000,even=9 odd=0
+sub_band,type=text base=16000,even=7 odd=0
+sub_band,type=text base=15000,even=10 odd=0
+sub_band,type=text base=15000,even=5 odd=0
+sub_band,type=text base=15000,even=5 odd=0
+sub_band,type=text base=19000,even=29 odd=22
+sub_band,type=text base=19000,even=29 odd=23
+sub_band,type=text base=19000,even=29 odd=22
+sub_band,type=text base=17000,even=7 odd=0
+sub_band,type=text base=15000,even=9 odd=0
+sub_band,type=text base=16000,even=7 odd=0
+sub_band,type=text base=15000,even=53 odd=53
+sub_band,type=sticker base=15000,even=3 odd=3
+sub_band,type=text base=15000,even=26 odd=36
+sub_band,type=text base=19000,even=29 odd=24
+sub_band,type=text base=15000,even=0 odd=48

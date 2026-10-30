@@ -1,0 +1,6 @@
+type,entries,duration_values,duration_min,duration_max,start_nonzero,start_zero
+caption,158,51,533333,3000000,0,158
+group,129,55,100000,4700000,10,119
+in,8388,135,33333,4200000,0,8388
+loop,1587,64,0,5000000,0,1587
+out,303,32,0,3100000,108,195

@@ -1,0 +1,435 @@
+# 画面（video/photo/adjust/effect/sticker）属性 → 渲染效果对照
+# 实测范围：2050 份去重内容、51,718 个顶层 segment（r3，快照 2026-10-16）；来源 temp/corpus-scan/stats.json、temp/corpus-detail/*.csv（口径与漂移见 ../evidence/findings.md F-019/F-020）
+# 等级：verified / single / open（详见 ../evidence/unresolved.md）
+
+tracks:
+  types_measured: {video: 3195, audio: 2582, text: 2439, mixed: 825, effect: 410, sticker: 277, adjust: 194, filter: 68}   # 按去重内容里出现的轨道条数计（r3；2026-10-20 全量重跑逐位复现，F-048）
+  note: 轨道与 segment 都不带显式 z；层级由索引字段决定（见 compositing_order）
+  segment_has_no_type: segment 自身没有 `type` 键（51,718 个片段全测），类型只由所属 `track.type` + `material_id` 指向的 bucket 决定
+  track_type_material_map: >-
+    `track.type` → `material_id` 实际落到的 bucket.type（r3 全量，按片段计；F-048）：
+    video → `videos.{video 13,893 / photo 1,186 / image 2}`（**图片不是独立轨道类型，是 videos 里的 photo**）；
+    audio → `audios.{sound 7,069 / video_original_sound 3,062 / music 1,302 / text_to_audio 1,143 / extract_music 166}`；
+    text → `texts.{subtitle 17,016 / text 2,077 / lyrics 50}` + `text_templates.{text_template 804 / _subtitle 30 / _lyrics 1}`；
+    sticker → `stickers.sticker 377` + `shapes.shape 21`；effect → `video_effects.{video_effect 466 / face_effect 79}`；
+    filter → `effects.filter 111`；adjust → `placeholders.adjust 473`；
+    **mixed → 同时指 video/photo/text/subtitle/lyrics/text_template/video_effect/placeholder 多类**（videos.video 1,511、
+    texts.subtitle 564、texts.text 233、videos.photo 44、video_effects 26、placeholders 10、text_templates 1）
+    ⇒ `mixed` 是「混合内容轨」，不是某一种素材类型，不能按类型分派渲染分支
+
+clip:
+  location: segment.clip                                  # 42,135 个 segment 带 clip 键（segment 总数 51,718；另有 4,325 条 clip 整值为 null）。旧行写 42,215 / 51,784 是错的，2026-10-20 按全量重跑更正（F-048）
+  fields_measured:
+    transform: 37890
+    flip: 37890
+    scale: 32855
+    rotation: 13505
+    alpha: 12586
+  shape:
+    transform: {x: float, y: float}                       # verified：子键恒为 x,y，**无 z**
+    scale: {x: float, y: float}
+    flip: {horizontal: bool, vertical: bool}
+    rotation: float
+    alpha: float
+  absent_defaults:                                        # 字段缺失时的取值（open：需成片确认）
+    transform: {x: 0, y: 0}
+    scale: {x: 1, y: 1}
+    rotation: 0
+    alpha: 1
+    flip: {horizontal: false, vertical: false}
+  uniform_scale_note: 该字段在 segment 上，不在 clip 内    # verified（与 capcut-cli 文档冲突，见 conflicts C-002）
+
+coordinates:
+  law: >-
+    渲染：offset_px = (transform.x × width / 2, -transform.y × height / 2)，原点在画布中心、
+    **y 轴向上为正（负值向下）**、锚点=字框中心（F-035 导出实测）。
+    面板：显示值 = transform.x × width、transform.y × height —— **是真实位移的 2 倍**（U-51）。
+    第二画幅复核：同一条时间线原地 9:16→16:9 后，实测偏移 +238.0/+88.5 对预测 +239.1/+88.9（≤1.1px），
+    「× 边长」假说被 2 倍否掉
+  canvas_scope: "**画幅是 per-timeline 的**：同一草稿四条时间线可以两种比例并存（实测 9:16 与 16:9 各两条），根镜像只反映 `main_timeline_id` 那一条 → 渲染/写回必须按目标时间线取 `canvas_config`"
+  disproved: 无 —— 参考文档的「半画幅归一 + y 轴向上」**是对的**，F-032 一度推翻它，是我把面板单位当成了画布像素（F-035 已改判）
+  precision: 命中整数的那批偏差约 1e-15（double 精确），**不经 float32**；位置与阴影距离那类 float32 抖动是两回事
+  ratio_trap: >-
+    存值冻结在**写入当时**的画幅：1080x1440 草稿里 46.35% 的 y 只在 ×1920 时整数（×1440 仅 3.47%）。
+    成对观测已钉死机制（F-033）：9:16 上键入的 `100/1080`、`-850/1920` 改画幅到 16:9 后**逐位不变**，
+    面板只是乘上新边长再**就近取整**显示（177.7778→178、-478.125→-478）→ 面板整数是显示值不是存值；`.5` 一侧实测 `-637.5 → -638`（进位，非向零截断）
+    （U-49 结案。**重键实验已做**：把 178 原样键回，剪映还原成 ≈177.7778/1920 而不是 178/1920 → 面板整数不是真值，未改过的 transform 要原样搬运；`.5` 舍入方向见 U-50）
+  integer_share: text.y 52.09% @1080x1920 / 64.59% @1920x3414（同组按 1920 只 8.99%）；text.x 12.84%、video.y 10.69% → 水平位置多由 alignment 承载（F-031），画面侧多为自由浮点
+  source: tables/position_quantum.csv（30 行，`build_evidence_tables.py -> position_quantum()`）
+
+fit_and_canvas:
+  root_field: canvas_config{width, height, ratio}
+  ratio_values_measured: {"9:16": 867, original: 341, "3:4": 123, "16:9": 95, "1:1": 4, "4:3": 3}
+  original_ratio: 含义为「按素材原始尺寸成画」，具体宽高来源未定            # open U-09
+  draw_size: 绘制尺寸 = contain(素材 → 画布) × scale，且用未旋转包围盒比较    # single
+  ratio_switch: 切换画幅是重算布局而非拉伸                                   # single
+  per_segment_background:
+    bucket: materials.canvases[]
+    fields_measured: {id: 16492, type: 16492, blur: 5816, color: 4880, album_image: 4856, image: 4856, image_id: 4856, image_name: 4856, source_platform: 4856, team_id: 4856}
+
+crop:
+  location: materials.videos[].crop                        # 顶层 16,634 个 video material 全部带该键（`stats.json -> bucket_keys.videos.crop`）
+  shape: {upper_left_x, upper_left_y, upper_right_x, upper_right_y, lower_left_x, lower_left_y, lower_right_x, lower_right_y}
+  corner_counts: {upper_left_x: 4987, upper_left_y: 4992, upper_right_x: 5010, upper_right_y: 4992, lower_left_x: 4987, lower_left_y: 4991, lower_right_x: 5010, lower_right_y: 4991}
+  related: [videos.crop_ratio(4995), videos.crop_scale(4950)]
+  four_state: >-
+    键存在 ≠ 有值 ≠ 非默认，这里是教科书案例（r3，`stats.json -> field_states.videos.crop`）：
+    `{}` 空占位 **11,589** / 8 键 **4,955** / 4 键 68 / 2 键 21 / 6 键 1。
+    而 4,955 个满形里 **4,875 恰好等于满框恒等** `upper_left(0,0) upper_right(1,0) lower_left(0,1) lower_right(1,1)`，
+    **真裁剪只有 80 条**（`tables/video_crop_census.csv`，脚本 `scripts/field_census.py`）
+  normalization: >-
+    已判（F-049）：**源素材归一化 [0,1]、左上为原点、y 向下**，满框 = 上面那个恒等八元组。
+    官方对同一坐标系的声明见 `…/references/segment-packages.md:24-25`
+    「0 为左边，1 为右边，以**未裁剪、未变换**的源素材为基准」「0 为上边，1 为下边，左上角 (0,0)、右下角 (1,1)」。
+    已测极值只是 80 条样本的**观测下界**，不是协议上限（`upper_*_y` 0..0.8685、`lower_*_y` 0.4563..1、
+    `*_left_x` 0..0.6053、`*_right_x` 0.2342..1）
+  semantics: 四角多边形（非 rect）；归一化已定，上限与成片裁剪结果仍待标定      # open U-10（已收窄）
+  crop_ratio: >-
+    是**字符串**枚举不是数：`free` 4,914 / 16:9 51 / 9:16 17 / 3:4 6 / 4:3 5 / 1:1 2；
+    官方模型层默认逐字写 `crop_ratio="free"` ⇒ 两路一致。协议侧对应 `transform.crop`（比例串）
+    + `crop_position`（8 个锚点枚举 left/top/right/bottom/left_top/right_top/left_bottom/right_bottom，省略=居中）
+    + `crop_rotation`（度，默认 0）
+  crop_scale: 4,949 / 4,950 恒为 1.0 ⇒ schema 占位，不承载缩放（别当缩放读）
+  note: 旧行写 16,585 是 r2 遗留，r3 实为 16,634（2026-10-21 就地更正）；r1 的 13,828 是「每 bucket 只采样前 20 条」的下界
+
+speed:
+  location: segment.speed                                  # verified（19,603 个片段带，缺席 32,115）
+  mirror: materials.speeds[].speed                         # 存在时**必然等于** segment.speed：11,680 / 11,680（r3 relations.csv）
+  mirror_forms: 29,376 个 speeds 条目里 17,696 个不带 speed 键（这才是 stub）、8,293 个 =1、3,387 个带非 1 真实倍速；`speed != 1` 的片段全部有镜像
+  relation: target_duration == source_duration / speed     # verified（10月16日 草稿复现：990000 / 0.9 = 1100000）
+  note: 旧版「speeds 多为无值 stub、倍速只在 segment」的表述把「可以整键缺席」说成了「无值」，已改判见 conflicts C-011
+  curve_speed: "变速曲线（`speeds[].mode` 实测 0:8810 / 1:298，`curve_speed` 存在 9,109 条）不在 phase-1"
+
+derived_caches:                           # r3 逐片段 join 实测（temp/corpus-detail/relations.csv），M2 渲染与 M3 写回都依赖
+  speeds_mirror: "materials.speeds[].speed == segment.speed，11,680 / 11,680 无例外；speed != 1 的片段全部有镜像"
+  uniform_scale_value: "uniform_scale.value == clip.scale.x / clip.scale.y，12,465 命中 / 8 过期；{on:false} 的 35 条全部 x != y"
+  uniform_scale_switch: >-
+    勾选态用**缺席**表示 true：等比开=不写 `on`（或 `on:true`），等比关=写 `on:false`。
+    `value` 只在等比开着时维护——2026-10-18 差分实测：关掉等比后 `{on:false}` 连 `value` 键都不写，
+    再开回来则写 `{value: x/y}` 且**不改 `clip.scale`**（UI 单滑杆读写 x、y 留旧值，value 即恢复比例 y·value=x）。
+    语料独立复核（含嵌套）：`on:false` 的 102 个各向异性样本 `value` 恒 1.0，`on` 缺席且各向异性的 16 例 `value==x/y`。
+    渲染时用 x 覆盖两轴还是 (x, y·value) 判不了 → U-44
+  keyframe_skeleton: >-
+    同一份差分还暴露一条同步规则：片段可带 N 条**单帧关键帧骨架**轨道（每个可动画属性一条，
+    `keyframe_list` 长度 1、无 `time_offset`、控制点 `(0,0)`）。改 `clip.scale.x` 时 `KFTypeScaleX` 的帧值同步变化，
+    等比关闭时应用**新建** `KFTypeScaleY` 轨道、恢复等比时又**删除**它，而之后再把缩放拖到 200%（x、y 同乘）
+    却没有重建 Y 轨道。所以「骨架恒在」不成立，且**只改标量字段不改骨架帧就会与剪映不一致** → U-45
+  shadow_point: "|shadow_point| == 0.18 × shadow_distance，19,847 命中 / 963 过期 / 266 无可用距离；方向 == (cos,sin)(shadow_angle)，20,834 / 21 不符"
+  rule: >-
+    三者都是「源字段 + 派生缓存」。渲染层**只读源字段**（speed / clip.scale / shadow_distance+angle），
+    写回时要么同步缓存、要么整键删除；`|point| == shadow_alpha` 那种吻合是 alpha 常等于 0.18×distance 的
+    巧合别名，不是公式（见 ../evidence/findings.md F-023 与 write-rules.md §3 的三条同步不变式）。
+
+segment_extra_fields:                     # r3 field_states 实测，规格此前零记录（../evidence/findings.md F-024）
+  hdr_settings: "present 28,261：缺席 23,457 / null 11,879 / `{mode:1}` 10,980 / `{intensity,mode,nits}` 约 4,903（mode 另见过 2 一次）。HDR 输出参数，phase-1 不渲染但要原样读写"
+  caption_info: "present 13,835，**全部为 null**（另缺席 37,883）→ 纯 schema 占位，解析器不要为它写分支"
+  color_correct_alg_result: "6,011 条：字符串里套 JSON，键名带官方拼写错误 `*IntensityFisrt`；与 enable_color_correct_adjust / color_match / smart_color 同现，是 AI 调色结果缓存（调色按用户要求跳过，只需保真读写）"
+  render_timerange: "present 40,934：`{}` 34,925 / 缺席 10,784 / **两键有值 6,009** —— 与 responsive_layout 不同，它真的有内容，不能一律当占位忽略（语义待 M2）"
+  source: "present 34,567，标量；实测只见 `segmentsourcenormal` 一种取值，缺席 17,151"
+  preserved_segment_keys: >-
+    其余未逐条解释但必须原样保留的 segment 键（r3 出现次数，`stats.json -> segment_keys`）：
+    `keyframe_refs` 16,792、`template_id` 17,699、`template_scene` 16,752、`track_attribute` 18,188、
+    `is_placeholder` 16,689、`is_tone_modify` 17,194、`intensifies_audio` 16,689、`group_id` 16,691、
+    `cartoon` 16,689、`reverse` 16,868、`visible` 18,621、`digital_human_template_group_id` 6,008、
+    `is_loop`/`lyric_keyframes`/`raw_segment_id`/`state`/`desc` 各 6,178（音频/歌词族）、
+    `segment_color_tag` 2、`hdr_vivid_settings` 2（与 hdr_settings 同族，语料里几乎没出现过）、
+    `caption_info` 13,835（恒 null）、`color_correct_alg_result` 6,011。
+    另有两个蒙版开关：`enable_mask_shadow` 8、`enable_mask_stroke` 12（分属 17 个片段），见 U-38。
+    全集与逐条记录状态见 `coverage.md` 指向的台账 CSV。
+  path_macro: "字符串值里可能出现 `##_draftpath_placeholder_<uuid>_##/…`（1,311 / 2,050 份内容、58,108 次），展开 = **草稿自身目录**；uuid 身份未知（U-41）。资源解析必须先展开，写回不得展开也不得改写 uuid"
+  videos_misc: "corner_pin 11 条（10 dict + 1 null，`corner_pin_info` 四/五角点，未动过写 -1.0；与 `crop` 是两套）；smart_motion 4,858 条带键但 **4,855 为 null**、仅 3 条有值；crop 全带（`{}` 11,589 / 8 角点 4,955）；video_mask_shadow/stroke 见 mask 段与 F-021"
+  picture_stroke: >-
+    画面侧「描边」= **资源包效果**，不是标量字段（2026-10-18 差分结案 U-39）。
+    `materials.video_strokes[]` 条目在类型选「无」时只有 `{id, type:"video_stroke", enable_video_stroke:true,
+    resource_id:"", path:""}`——语料里「只有开关落盘」的真相就是类型还停在「无」；
+    选「单层描边」后长成 `{…, resource_id, path, resource_name, source_platform:1, color, adjust_params[]}`，
+    形状与 `effects[]` 同类。三条换算：`color == [1.0, R, G, B]`（`#12AB34` → `[1.0, 0.0705882, 0.6705882, 0.2039216]`，
+    **首位不是 alpha**、顺序是 RGB）；`adjust_params.effects_adjust_size == UI 大小 ÷100`（27→0.27）；
+    `effects_adjust_alpha == UI 不透明度 ÷100`（60→0.6）；另有 UI 不暴露的 `min_scale`（默认 320.0）。
+    每个 `adjust_params` 项带 `default_value`，恰等于 UI 默认（10→0.1、100→1.0），可直接当校准锚点。
+    描边「类型」（无/单层/发光/虚线/手绘）= 选不同 `resource_id`，**不是枚举字段** →
+    要复现描边必须解析 `Cache/effect/<resource_id>/<md5>` 资源包。`audio_pannings[]` 的左右平衡值仍未定位。
+
+opacity:
+  sources: [clip.alpha, KFTypeGlobalAlpha, KFTypeAlpha]
+  blend_before_opacity: 不透明度与混合模式的先后未定（影响合成结果）           # open U-11
+
+blend_mode:
+  model: >-
+    不是 segment 字段。语料里不存在 blend_mode/mix_mode 键；混合模式以特效资源实现：
+    materials.effects[] 中 type == "mix_mode"（去重内容里 166 次，落在 82 份内容；r1 的 332 属翻倍口径）的条目，name 为中文名，
+    path 尾段是包 md5，resource_id / effect_id 与安装内索引逐字段相同。
+  join_authority: >-
+    直连键是 Resources/MixMode/MixMode.json（10 条 {nameId, effectId, resourceId, path=包 md5}），
+    r3 全量 join **166/166 命中、0 未匹配** → 不需要再逐包锚定（U-12 结案，F-049）。
+    但 **nameId 不能当语义用**：`color_filter` 这条 nameId 指向的包既是 ScreenBlendPreMul、又被草稿写成「滤色」（C-013）。
+  available_ops_measured: >-
+    协议枚举 12 个模式（multiply overlay screen darken lighten soft_light hard_light color_burn
+    color_dodge linear_burn difference color_filter，`…/references/segment-visual.md:205`），
+    本机只有 **10 个包** ⇒ **差值(difference) 与 颜色滤镜(color_filter) 无本地资源包**，M2 遇到必须显式降级、不许黑帧。
+  package_table: tables/mixmode_packages.csv     # md5 ↔ GLSL 函数 ↔ resourceId/effectId ↔ 草稿中文名与出现数
+  draft_witnessed: >-
+    6 个包有草稿见证：变亮=Lighten(99 次/56 份)、滤色=Screen(37/22)、线性加深=LinearBurn(17/16)、
+    正片叠底=Multiply(6/3)、变暗=Darken(4/2)、叠加=Overlay(3/2)。
+    其余 4 包语料零引用，「柔光=SoftLight / 强光=HardLight / 颜色加深=ColorBurn / 颜色减淡=ColorDodge」
+    是 GLSL 函数名 + 官方中文名单按位配对推断（配对法本身已被上面 6 项独立验证），**不是草稿见证**。
+  mapping_to_css:                       # 名称 → CSS mix-blend-mode（预乘 alpha 语义）
+    正片叠底: multiply
+    滤色: screen
+    叠加: hard-light      # F-077 源码级更正：包内 OverlayPreMul 按背景分支(2.0*bc < ba)，等于 CSS hard-light
+    柔光: vendor-sqrt-only   # F-077：包内是经典 sqrt 形式，与 CSS soft-light 的多项式形式差 11/255，CSS 名不可用（要移植包内数学）
+    强光: overlay         # F-077：包内 HardLightPreMul 按前景分支(2.0*fc < fa)，等于 CSS overlay
+    变暗: darken
+    变亮: lighten
+    颜色减淡: color-dodge
+    颜色加深: color-burn
+    线性加深: linear-burn     # 旧注「线性减淡(添加)」是错的；官方中文名 = 线性加深（F-049）
+    差值: difference          # 无本地包
+    颜色滤镜: color           # 协议叫 color_filter，= 颜色(饱和度/明度互换)；无本地包
+    排除: exclusion           # 本机与协议都没有这一模式，保留给 CSS 侧对照
+    色相: hue                 # 同上：不在协议 12 项内，属我们的候选补齐面
+    饱和度: saturation        # 同上
+    亮度: luminosity          # 同上；注意语料里名为「亮度」的 effects 条目 type 是 brightness（调色），不是混合模式
+  authoritative_math: >-
+    以包内 Library/ShaderData/*/shaderGLES/*.frag 的 GLSL 为准（明文可读）；
+    浏览器 CSS 混合本身按预乘 alpha 合成，与 *BlendPreMul 一致，但仍需逐式核对。
+    包内 config.json 统一 alphaState=2（10 包全同），但 **它不是 shader 的 `blendAlphaState`**：`blend.material` 属性表只有 inputWidth/inputHeight/_alpha/baseTex/_MainTex（10 包同形），三个 alpha 状态 uniform 由引擎给 ⇒ 走哪条分支包内不可判（F-077 → U-90）；frag 自带注释给的是 `1: pre-multiplied, 2: straight`。**逐式核对已完成（F-077）**：screen/darken/lighten/multiply/linearBurn 五包与 W3C 标准式在 1/255 内等价；`叠加/强光` 与 CSS 同名模式互为反面；`柔光` 须移植包内 sqrt 形式；`颜色减淡/颜色加深` 预乘支有极值点系统差（U-90）。**实现状态（F-079）**：出厂 GLSL 由 `scripts/mixmode_shaders.py` 从包内原文**切片**（不誊写），通道 2 用 `scripts/mixmode_blend.py`（numpy，外部逐格核对过），两侧对包内原文 maxΔ = 0 / 1；浏览器侧尚未接线（U-92）
+  keyframable: effects_adjust_* 系列关键帧作用于特效参数               # verified（property_type 频次）
+
+mask:
+  two_buckets:                             # verified
+    common_mask:
+      drafts: 197            # 条目 391 个（r3 去重内容；r2 是 196/390，r1 记 412/42 为翻倍口径）
+      fields: [category, category_id, category_name, config, constant_material_id, id, name,
+               path, resource_id, resource_type, source_platform, text_config, type,
+               contour_path, loader_work_space, track_segment, is_old_version, platform, position_info]
+      config_keys: [width, height, centerX, centerY, feather, rotation, invert, roundCorner, aspectRatio, expansion]
+      config_counts: {width: 390, height: 315, centerY: 250, centerX: 206, feather: 172, rotation: 140, invert: 94, roundCorner: 65, aspectRatio: 42, expansion: 34}
+      text_config_keys: [align_type, font_name, font_path, font_resource_id, bold_width, char_spacing,
+                         content, font_size, has_underline, italic_degree, line_gap, scale]   # 后 11 个键 r2 去截断后才显形（各 33-35 个条目）
+      contour: contour_path(38) 与 KFTypeContourPath(35) 对应，轮廓蒙版是关键帧化的   # r1 的 76/70 是翻倍口径
+      other_counts: {resource_type: 388, category_name: 276, category_id: 276, loader_work_space: 36, track_segment: 36, is_old_version: 35}
+    masks:
+      drafts: 21             # 条目 46 个
+      fields: [config, id, name, path, platform, position_info, resource_id, resource_type, type]
+      config_keys: [centerX, centerY, feather, aspectRatio, width, height, invert, rotation, roundCorner]   # r2 实测 46 个条目全部带齐这 9 个键
+  keyframe_prefixes: [KFTypeCommonMaskPositionX, KFTypeCommonMaskPositionY, KFTypeCommonMaskFeather,
+                      KFTypeCommonMaskSizeWidth, KFTypeCommonMaskSizeHeight, KFTypeCommonMaskRotation,
+                      KFTypeCommonMaskExpansion, KFTypeCommonMaskRoundCorner,
+                      KFTypeMaskSizeX, KFTypeMaskSizeY, KFTypeMaskPostionX, KFTypeMaskPostionY,   # 注意官方拼写 Postion
+                      KFTypeMaskRotation, KFTypeMaskFeather, KFTypeMaskRoundCorner, KFTypeContourPath]
+  segment_switch: segment.enable_adjust_mask（37,040 次）与蒙版生效关系未定     # open U-13
+  pixel_conversion: >-
+    官方把换算式直接写出来了（`…/references/segment-visual.md:142`，F-049）：
+    `w = width*canvas_width`、`h = height*canvas_height`、
+    `cx = canvas_width/2 + center_x*canvas_width/2`、`cy = canvas_height/2 - center_y*canvas_height/2`
+    ⇒ center_y **向上为正**、±1 对应画布边缘，和 U-08 的位移律同一条 `/2`。
+    渲染器可以直接照抄，不必再从 config 反推。注意键名两套：`common_mask.config` 用 `centerX/centerY`（驼峰），
+    协议与跟踪框用 `center_x/center_y`。
+  range_notes: >-
+    协议侧给的值域：width/height 0..1（占画布比例）、center_x/center_y -1..1、feather 0..1、round_corner 0..1、
+    rotation 度且顺时针为正、invert 默认 false；跟踪框 width/height 是 **0..2**（可以大于画布）。
+    官方给的 feather 分档：0..0.05 近硬边、0.06..0.12 常规融合、0.13..0.2 明显柔化、0.21..0.3 强融合
+  rendering: phase-1 需支持形状蒙版（矩形/圆角/椭圆按 config 推断）+ 反相 invert + 羽化 feather  # 部分 open
+
+transitions:
+  location: 挂在**前一个** segment 的 extra_material_refs，指向 materials.transitions[]   # single
+  bucket_drafts: 705
+  distinct_measured: 2193
+  fields: [name, id, category_name, effect_id, resource_id, path, duration, is_overlap]
+  fields_status: >-
+    `resource_id` / `path` / `is_overlap` 此前漏记（2026-10-28 单例补齐）：`resource_id` 与 `effect_id` 在该例同值，
+    `path` 指向 `Cache/effect/<resource_id>/<md5>`，**复现转场内核必须走这三键**（与动画同构，见 `animations.yaml`）。
+    `duration` 早期标 `(待确认)` 已作废 —— 与 `format-reference.md` §6 的「100% 存在」冲突，以那条为准。
+  duration_level: verified        # 2,343 / 2,343 都带 duration，时长是资源自带而非由片段反推
+  is_overlap_level: single        # 只部分条目带该键，值语义（真重叠渲染 / 仅标记）未验证
+  window_hypothesis: 以切点为中心 [cut - d/2, cut + d/2]，不改变片段时长        # single → M2 实测
+  window_status_2026_10_28: >-
+    「不改变片段时长」已有一条成片支持：转场挂在切点**前一段**的 extra_material_refs，下一段起点减本段终点
+    = 0.000 s（相邻段仍首尾相接、未被吃掉 d/2）；半窗落在哪一侧仍未见（见 `../evidence/case-crosscheck.md`）。
+  category_examples: [叠化, 转场效果, 热门, diehua123]                          # verified（存在这些取值）
+
+effects_picture:
+  bucket: materials.effects[]
+  type_taxonomy_measured_top: {figure: 36621, smart_color_adjust: 3980, brightness: 3895, contrast: 3170,
+    text_effect: 3016, makeup_root: 2567, sharpen: 2561, clear: 2545, shadow: 2487, highlight: 2460,
+    light_sensation: 2430, temperature: 2096, black: 1910, saturation: 1120, white: 855, color_correct: 686,
+    tone: 577, natural_saturation: 299, mix_mode: 166, filter: 127, lut: 98, vignetting: 97, fade: 69,
+    color_match: 66, particle: 43, text_shape: 11, video_animation: 11}
+  type_taxonomy_tail: {color_dehaze: 1, backlight_correction: 1, restore_detail: 1, color_levels: 1, color_soften: 1, bloom: 1}   # r3：这 6 种各 1 次，**全部由 10月16日 草稿单独带入**（排除它只剩 27 种，probe6.txt / U-40）
+  distinct_types: 33                       # r1 记 22，r2/r3 未闭合；引用时必须带上「其中 6 种是单样本」这句
+  parameter_envelope: >-
+    effects 条目有一套固定外壳键（r3，`stats.json -> bucket_keys.effects`）：`intensity_key` 38,918（取值是
+    `face_adjust_*` / `body_adjust_*` 这类**滑杆身份名**，美颜美体靠它定位）、`adjust_params[]{name,value,default_value}`
+    30,889、`face_adjust_params[]` 21,112、`exclusion_group[]` 21,113、`item_effect_type` 35,663、
+    `algorithm_artifact_path` 41,193（指向草稿内 `video/figure_algorithm/<material id>`）、`lumi_hub_path` 31,477、
+    `value` 53,471、`version` 32,322；另有 `panel_id`/`bloom_params` 各 19,492、`apply_target_type`/
+    `enable_skin_tone_correction`/`formula_id`/`time_range` 各 19,491、`covering_relation_change` 8,084 ——
+    这些**大多恒为 null/空串**，是 schema 占位，不能当功能开关用（F-022 的方法论教训）。
+  phase1_scope: 只实现 mix_mode（混合模式）与 scene 类转场相关；其余画面特效归 phase-3
+  skip_phase1: 色彩/亮度/对比度/饱和度/色温/LUT/HSL/锐化/磨皮 等属调色，按用户要求跳过（只记录不渲染）
+
+keyframes:
+  location: segment.common_keyframes[]
+  property_types_measured_distinct: 70            # r1 记 50 是早期小样本遗留
+  picture_relevant: [KFTypePositionX, KFTypePositionY, KFTypeScaleX, KFTypeScaleY, KFTypeRotation,
+                     KFTypeGlobalAlpha, KFTypeAlpha, KFTypeVolume, KFTypeTextColor, KFTypeBorderAlpha,
+                     KFTypeBackgroundAlpha, KFTypeShadowAlpha, KFTypeFade, KFTypeContourPath, KFTypeMask*]
+  effect_relevant: [effects_adjust_size, effects_adjust_intensity, effects_adjust_vertical_shift,
+                    effects_adjust_horizontal_shift, effects_adjust_color, effects_adjust_blur,
+                    effects_adjust_speed, effects_adjust_texture, effects_adjust_filter,
+                    effects_adjust_range, effects_adjust_background_animation]
+  counts_source: ../evidence/tables/keyframe_types.csv（KFTypePositionX/Y 各 517、ScaleX 514、Rotation 463、GlobalAlpha 124 …；r1 的 1048/1040/938/246 属翻倍口径）；带 `common_keyframes` 键的 segment **17,411** 个，其中**非空只有 836 个**（旧行写 17,408，与 `keyframes.yaml` 的 17,411 不一致，2026-10-20 全量重跑裁定为 17,411，F-048）
+  curve_fields: 插值字段形状已在 `keyframes.yaml` 清点（记录 `{id, material_id, property_type, keyframe_list[]}`、控制点 `{id, left_control{x,y}, right_control{x,y}, values[], time_offset, curveType?, graphID?, string_value?}`）   # U-14 已结案；旧行写「尚未清点 open U-14」是本文件没跟上 keyframes.yaml（F-048）
+  curve_types_claimed: [Line, Hold, Smooth, Beizer, FreeCurveInOut]     # single（capcut-cli 文档，需语料核对）；实测五类见 keyframes.yaml 的 curveType（C-009）
+  trap: 「alpha 关键帧不渲染」的说法来自参考文档，需实测                # open
+
+compositing_order:
+  root_flag: {render_index_track_mode_on: {true: 1978, false: 63}}       # verified（r3 去重内容）
+  track_level: track_render_index 在轨道内恒定（8584 恒定 / 1 变化）      # verified
+  segment_level: render_index 按元素类别分带                              # verified
+  bands_measured: >-
+    旧行只写了「video/audio/adjust 0+、filter 10000+、effect 11000+、text/sticker/mixed 14000+」。
+    2026-10-20 全量重跑（51,718 个顶层片段）给出逐类型落带表：
+    video `0-999` 7,288 / `1000-9999` 15；audio `0-999` 3,920；adjust `0-999` 290；
+    filter `10000-10999` 106；effect `11000-13999` 542 / `0-999` 3；
+    text `14000-14999` 19,467 / `15000-15999` 254 / `16000-18999` 29 / `19000+` 207 / `1000-9999` 1；
+    sticker `14000-14999` 392 / `15000-15999` 6；
+    **mixed 跨四个带** `0-999` 257 / `10000-10999` 1 / `11000-13999` 26 / `14000-14999` 757。
+    主带仍是「元素类别」带（0 画面 / 10000 滤镜 / 11000 特效 / 14000 文字贴纸），
+    两处更正：mixed 不是 14000+ 专属（它是混合内容轨，天然跨带 → U-62）；
+    另有 `15000-15999`/`16000-18999`/`19000+` 三个次带共 496 段，全部落在 text 与 sticker（语义未定 → U-63）。F-048
+  array_order: >-
+    tracks[] 归一化数组位置均值 video 0.266 → adjust 0.346 → effect/mixed 0.406 → filter 0.432 →
+    sticker 0.448 → text 0.468 → audio 0.863；video 先于 audio 5864 对（反向仅 9），
+    video 先于 text 4729 对但 text 先于 video 也有 1814 对（27.7%）。
+    结论：数组顺序与层级相关但不是绘制权威；绘制次序应由 track_render_index + render_index 决定。
+  monotonic_within_track: {monotonic: 2070, not_monotonic: 589}    # 判据：轨道内 ≥2 个带 render_index 的片段；若取 ≥3 则为 1523/510
+  direction: 升序是「更靠下」还是「更靠上」未定 —— 必须由 <DRIVE_E>/输出 成片判定     # open U-15
+  allocator_rules:                 # 2026-10-21 读出 RenderIndexUtils 全文（F-052，JS 原文，非推断）
+    source: app/static/js/ai-creation~15.f6ca3ef2.js 表 tables/render_index_allocators.csv
+    non_free_branch:               # 语料实际走这一支
+      nextFilterRenderIndex: 'max===0 ? 10000 : max+1'                    # 基座 10000
+      nextVideoEffectRenderIndex: 'max===0 ? 11000 : max+1'               # 基座 11000
+      nextPluginEffectRenderIndex: 'max===0 ? 15000 : max+1'              # 基座 15000（语料里没有 plugin_effect 轨）
+      nextTextAndStickerRenderIndex: 'max===0 ? 14000 : max+2'            # 基座 14000，步长 +2；text 与 sticker 共用同一个分配器
+      nextVideoRenderIndex: 'max+1'                                       # 无基座 ⇒ 对应语料 video 0-999
+      nextAdjustRenderIndex: 'max+1'                                      # 无基座 ⇒ 对应语料 adjust 0-999
+    free_branch: 基座换成 video 2000 / adjust 7000 / videoEffect 11000 / text&sticker 14000，公式是 基座 + count + 2
+    free_mode_never_used: >-
+      根键 free_render_index_mode_on 在 2,050 份内容里 **缺席 1,402 / false 648 / true 0** ⇒ 桌面草稿从不走 free 分支。
+      注意它与 render_index_track_mode_on（true 1,978 / false 63）是**两个不同的根键**，别混用
+    layer_is_second_write_point: >-
+      贴纸与文字模板落地时同一段 render_index 会再写进 clip 的层级两处
+      （t.filter.filterLayer = BigInt(renderIndex) 与 r.layer = BigInt(v)）⇒ 改 render_index 不同步这两处即为静默不一致
+    subband_falsification: >-
+      次带**不能**由 text&sticker 分配器产生：该分支从偶数基座每次 +2，只会得到偶数并连续填满 14000..19000，
+      而语料次带里 text 有 **229 个奇数**、18000 段**一条都没有**、同一份草稿的 19000 段里 29 偶 22 奇并存（F-052，
+      tables/render_index_subbands.csv）⇒ 排除「+2 溢出」；15000 基座那个函数只可能解释 15000 段。分配者未找到（U-63）
+    monotonic_newer_is_larger: 六个函数一律 max+1 / max+2 ⇒ 新片段索引必然更大（U-15 的方向性旁证之二）
+  track_type_wire_values: >-
+    厂商 TrackType 的 13 个 wire 值：none video audio sticker text effect filter adjust
+    text_to_video_text text_to_video_text_audio composition plugin_effect adcube。
+    语料 8 个值里 7 个逐字命中，**唯独 mixed 不在词表内**，且 mixed 只活在 11.1.0~11.4.2 这 5 个版本（825 条），
+    11.5.0/11.6.0 为 0 ⇒ mixed 是那一代某功能的落盘名，不是通用「混装容器」；11.6 侧按排除法最可能是 composition，
+    但同一性两侧都没证过，**写回不得直接改名**（F-052，tables/track_type_by_app_version.csv）
+  z_order_warning: >-
+    2026-10-21（F-049）拿到一条**反向**证据，堵掉一条捷径：协议里确有 `z_order`
+    （`…/references/segment-visual.md:254`「同层片段的画面层级；数值越大越靠前」，且只有 `<video>` 有、`<image>` 没有），
+    但剪映自己的草稿写入层 `runtime/app-server.mjs` 里 `z_order`/`zOrder`/`z_index` **0 命中**，
+    而自带工具链的 `layer-planner.mjs:47` 明写 `z_order_is_design_intent_only` 与
+    `spatial overlaps require measured occlusion order`（`:173` `native_z_order_emitted:false`）
+    ⇒ **官方自己也不靠草稿字段决定叠放**。不许把 XML `z_order` 当 `render_index` 的别名来排层，
+    也不许按 `tracks[]` 数组位置直接排。
+  group_fields: [group_container, group_id, is_group]                     # 存在但交互未定  # open
+
+picture_misc:
+  per_segment_flags_measured: {enable_lut: 39783, enable_adjust: 39780, enable_adjust_mask: 37040,
+    enable_hsl: 34859, responsive_layout: 51615, uniform_scale: 34843, extra_material_refs: 51053}   # r3（含 null 值形态；与 r2 的 51,681/34,923/51,122 差异属真实漂移）
+  video_material_fields: [matting(抠像), stable(防抖), freeze(定格), reverse_path(倒放),
+    video_mask_stroke, video_mask_shadow, beauty_face_auto_preset, smart_motion, cartoon_path,
+    aigc_type, crop, crop_ratio, crop_scale, corner_pin, video_algorithm, category_name, local_material_id]
+  nested_drafts: 复合片段 = materials.drafts[]（1,262 份去重内容含；r1 的 2650 属翻倍口径），内部再嵌一份完整草稿结构     # verified
+  phase1_scope: [clip 变换, crop, speed, opacity, blend_mode, common_mask/masks, transitions, keyframes(position/scale/rotation/alpha), 复合片段展开]
+  phase3_scope: [figure/makeup/scene 特效, video_trackings, shapes, manual_deformations, smart_relights, smart_crops]
+
+
+verified_additions:                        # 2026-10-16 实测补录（scripts/spec_audit.py，2051 份去重内容）
+  transitions_record:
+    keys_always: [id, type, name, effect_id, resource_id, path, duration, category_id]   # 2343/2343
+    category_name: 2332
+    request_id: 2327
+    third_resource_id: 1944
+    source_platform: 1943
+    is_overlap: 1765            # 75% 才有；缺省含义待判
+    platform: 549
+    consequence: 转场时长是资源自带字段（duration），不再需要从片段时长反推；窗口仍需成片确认（与 U-15 同批）
+  mask_vocabulary:              # verified：common_mask 的具名形状
+    types: {mask: 321, none: 68, empty_string: 2}   # r3：第三种是空串，来自 10月16日 草稿的 adjust 蒙版，渲染层要当「无」处理（F-018 更新）
+    names: {矩形: 150, 镜面: 104, 线性: 74, 圆形: 46, 钢笔: 9, 抠像: 3}
+    note: 钢笔/抠像与 contour_path、matting 相关，属可编辑轮廓而非参数化形状
+  responsive_layout:            # 关闭 U-06，但形态范围按 F-020 更正
+    shape: {enable: false, horizontal_pos_layout: 0, vertical_pos_layout: 0, size_layout: 0, target_follow: ""}
+    observed: 三种形态 —— `{}` 34,926、五键 16,689（五键全等于该默认值）、缺席 103（r3 `stats.json -> field_states`）；语料没有第四种取值
+    version_note: 五键形态只出现在 ≤8.0 的写入器，但 8.0.0/5.9.0 两种并存、≥8.7 只见 `{}` → **版本不是判别式**，不要写成「某版本以后」的分区结论
+    rule: 两种形态都不携带非默认信息 → 渲染器一律忽略；该字段也不能用来解释「画布对齐按钮」（见 U-32 的修正）
+  mask_shadow_stroke:           # 新增 U-38，阴影侧结案见 F-021
+    segment_switches: [enable_mask_shadow, enable_mask_stroke]   # r3：8 / 12 个片段带（共 17 个片段）
+    material_params: [videos.video_mask_shadow, videos.video_mask_stroke]   # r3 顶层带键各 8,505 个条目（占位 8,498 / 8,489，带参数 7 / 16）；含嵌套口径未重测，旧值 19,348 不可复核
+  track_fields:
+    keys: [attribute, flag, id, is_default_name, name, segments, type]
+    n_tracks_total: 9,990（2,050 份内容，八类相加；F-048 全量重跑）
+    key_presence: >-
+      `id` 与 `type` 9,990（每条轨道必带）；`segments` 9,962（缺席 28 条 = video 25 + mixed 3，即「有轨道壳但没写片段数组」）；
+      `is_default_name` 9,908；`flag` 5,597；`name` 3,365；`attribute` 3,466。
+      `name` 按类型：video 1,158 / text 963 / audio 866 / effect 143 / sticker 140 / filter 51 / adjust 44 / **mixed 0**
+      ⇒ mixed 轨道从不写 `name`，判据不能依赖它
+    is_default_name_values: {true: 9898, absent: 82, false: 10}   # 值域首次实测（此前规格只列键名）；false 集中在 video 5 / text 3 / sticker 2
+    attribute_values: {0: 3231, 1: 170, 2: 38, 4: 10, 6: 8, 3: 4, 16: 2, 8: 2, 17: 1}   # 位标志疑义 -> U-37（旧行漏了 17:1 这一条，F-048 补上）
+    segment_mirror_key: >-
+      `attribute` 不只挂在轨道上：官方 draft 模型层（`ai-creation~11`，F-049）在 **segment** 上声明了同名镜像键
+      `track_attribute`、默认 **0**，与 `render_index`/`track_render_index` 并列；r3 实测 51,718 个顶层片段里
+      **18,188 个带 `track_attribute`**（`track_render_index` 42,407 个）。读侧两处都要看，写侧要同步，
+      谁是权威未判（U-37）
+    flag_values_by_type: >-
+      video 2/缺席/0 = 1,662/958/575；text 1/缺席/0/3 = 1,004/827/606/2；audio 缺席/0 = 1,722/860（audio 从不用非零值）；
+      mixed 2/缺席 = 510/315；effect 缺席/0 = 267/143；sticker 0/缺席 = 140/137；adjust 缺席/0 = 150/44；filter 0/缺席 = 51/17。
+      合计 absent 4,393 / 0 2,419 / 2 2,172 / 1 1,004 / 3 2 ⇒ `flag==2` 只出现在 video 与 mixed，`flag==1` 只在 text。
+      **U-61 已结案（F-050）**：`flag` 是官方轨道内容类别枚举
+      `FlagNone=0 / FlagTextSubtitle=1 / FlagSubVideo=2 / FlagTextLyric=3 / FlagVideoSubtitle=4 /
+      FlagAudioSubtitle=5 / FlagAiScriptSubtitle=6`，桌面写入器只用 0/缺席/1/2/3，4/5/6 零出现。
+      正面语义：2 = **非首条** video 轨（首条从不为 2），1 = 装 `texts.type=="subtitle"` 的字幕轨（971/1,004 = 96.7%），
+      0 与整键缺席等价。完整枚举、位置交叉表与 mixed 的双形态见 `layout.yaml -> main_track.flag_axis`
+      与 `tables/track_flag_semantics.csv`
+    mixed_two_forms: >-
+      mixed 的两种 flag 形态对应两种内容构成，不是同一类（F-050，U-62 已改写）：
+      `flag` 缺席的 315 条里 **298 条纯装 `videos.video`（+7 photo）、一条都不装文字** ⇒ 实质是「另一种视频轨」；
+      `flag==2` 的 510 条里 227 装 `texts.text`、206 `videos.video`、34 字幕、13 photo、9 `video_effects`、8 `placeholders.adjust`
+      ⇒ 才是真混装容器。按 `track.type` 分派渲染时还要再按 `flag` 分一次，且 mixed 从不写 `name`（F-048），面板上两类都没有轨道名
+  segment_shapes:                     # 片段键集不是由轨道类型决定（F-048，此前规格没有这一节）
+    distinct_keysets: {video: 524, mixed: 104, text: 32, audio: 31, adjust: 26, sticker: 20, effect: 13, filter: 10}
+    canonical_full_45: >-
+      全语料有且只有一种 45 键的「完整形」（无第二种变体），共 **6,004 个片段**带它（audio 2,244 / text 2,237 / video 1,233 /
+      effect 109 / adjust 78 / sticker 58 / filter 45）：比常见形多出
+      `caption_info, color_correct_alg_result, desc, digital_human_template_group_id, is_loop, lyric_keyframes,
+      raw_segment_id, state` 与一组 `enable_*` 开关
+    canonical_full_34: 另一种 34 键形（缺上面那批音频/歌词族与占位键）出现在 video/effect/sticker/filter 的主干上
+    minimal_by_type: >-
+      每类的高频最小形：audio 13 键（43.1%，5,489）、text 15 键（34.7%，6,940）、mixed 15 键（30.5%，729）、
+      effect 12 键（46.6%，254）、adjust 8 键（18.4%，87）、sticker 14 键（13.6%，54，但 sticker 最常见的其实是 34 键形 25.4%）、
+      video 13 键（9.9%，1,486）但 video 的形状极度分散（524 种）；**filter 反过来——它的多数形就是 45 键完整形（40.5%，45/111）**
+    rule: >-
+      解析器不能按「轨道类型 → 固定字段表」写分支：同一类型里最小形与完整形并存。
+      可读的判据是「键是否存在 + field_states 四态」，缺失即按默认处理；写回时**不得**因为片段是 audio 就补出 video 侧的键
+
+known_limits:                     # 已定位、量级已知、**决定不修**的偏差（与 text.yaml: fonts.known_ceiling 同族）
+  browser_decode_luma_bias:
+    measured: "浏览器比两条离线腿亮 +1.09 码值（t=7.0，solo 模型，中心框 23.7%）；同一条代理帧**不经 Pixi** 回读就 +0.86；已知 RGBA 纹理过 Pixi 上屏回读 Δ 全 0"
+    cause: "浏览器 NV12→RGB 与 ffmpeg 在 limited range / 取整上的实现差（代理帧自带 colorSpace={bt709,bt709,bt709,fullRange:false}，coded 1088×1920 vs display 1080×1920）"
+    magnitude: "0.86–1.09 码值 = 满量程 0.34%；素材自身帧间起伏就有 ±0.4 码值"
+    decided: "不修。要修只能在 VideoFrame→bitmap 处自做转换（每帧全幅代价），换 0.3% 码值；且会引入「与 ffmpeg 谁对」的新判据问题"
+    do_not: "不要去动 Pixi 的 colorSpace——F-091 已证明上屏通道逐码值中性"
+    evidence: "F-090 / F-091 / F-092；仪器 colour_range_probe.py、pixi-colour-readback.html、webcodecs-rgb-readback.html"
+  geometry_warning:
+    rule: "任何跨腿的码值/亮度比较，必须先核验三腿的**宽高比与中心框比例一致**（浏览器截图是 stage 内容包围盒，540 宽常配 540×953，不是 540×960）"
+    why: "本项目已两次把几何失配读成色彩差：F-083 的猜带、P-39 的 256 像素固定中心框（假 +21 码值）"

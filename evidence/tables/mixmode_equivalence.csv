@@ -1,0 +1,11 @@
+name_id,glsl_op,w3c_op,passes,channel_comparisons,over_tolerance,premul_branch_max_abs_255,premul_worst_case,straight_branch_max_abs_255,straight_worst_case,shipped_vs_vendor_max_abs_255,numpy_vs_vendor_max_abs_255,numpy_cells_over_tolerance,numpy_cells_total,impl_passes,verdict
+color_filter,ScreenBlendPreMul,screen,24,27744,0,1,fa=0.9 ba=0.25 _alpha=0.5,1,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,等价
+dark_en,DarkenBlendPreMul,darken,24,27744,0,1,fa=0.9 ba=0.25 _alpha=0.5,1,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,等价
+bright_en,LightenBlendPreMul,lighten,24,27744,0,1,fa=0.9 ba=0.25 _alpha=0.5,1,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,等价
+over_lay,OverlayBlendPreMul,overlay,24,27744,9021,255,fa=0.9 ba=0.25 _alpha=0.5,255,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,必须移植包内数学（标准式/CSS 混合会改变像素）
+glare_pc,HardLightBlendPreMul,hardLight,24,27744,9021,255,fa=0.9 ba=0.25 _alpha=0.5,255,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,必须移植包内数学（标准式/CSS 混合会改变像素）
+soft_light,SoftLightBlendPreMul,softLight,24,27744,375,11,fa=0.9 ba=0.25 _alpha=0.5,11,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,必须移植包内数学（标准式/CSS 混合会改变像素）
+linear_deepening,LinearBurnBlendPreMul,linearBurn,24,27744,0,1,fa=0.9 ba=0.25 _alpha=0.5,1,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,等价
+darken_color,ColorBurnBlendPreMul,colorBurn,24,27744,36,255,fa=0.9 ba=0.25 _alpha=0.5,1,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,必须移植包内数学（标准式/CSS 混合会改变像素）
+color_dodge,ColorDodgeBlendPreMul,colorDodge,24,27744,72,255,fa=0.9 ba=0.25 _alpha=0.5,255,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,必须移植包内数学（标准式/CSS 混合会改变像素）
+multiply_blend_mode,MultiplyBlendPreMul,multiply,24,27744,0,1,fa=0.9 ba=0.25 _alpha=0.5,1,fa=0.9 ba=0.25 _alpha=0.5,0,1,0,13872,12,等价

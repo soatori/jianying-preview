@@ -1,0 +1,11 @@
+package_md5,name_id,effect_id,resource_id,glsl_blend_function,draft_names_occurrences,draft_name_set,occurrences,contents,index_only
+d9c1d4ca7ab91df4f48d12b339f2da88,color_filter,871339,6758325170760323597,ScreenBlendPreMul,滤色=37,滤色,37,22,no
+420c92a2b480dc8e402d9269a5f83515,dark_en,871342,6758324839670354445,DarkenBlendPreMul,变暗=4,变暗,4,2,no
+b0e90c43dc266a317b05b0cd3ca5bfba,bright_en,871341,6758324919789949453,LightenBlendPreMul,变亮=99,变亮,99,56,no
+e6a48579910dfe831ba53a6acc6737f9,over_lay,871340,6758324989931295240,OverlayBlendPreMul,叠加=3,叠加,3,2,no
+840ca85a1a33e6fc3ea78bbdb2db8f60,glare_pc,871338,6758325264670790152,HardLightBlendPreMul,,,0,0,index_only_never_referenced
+042aa15b71b1e17bca0bd928eec6fba7,soft_light,871337,6758325439212556814,SoftLightBlendPreMul,,,0,0,index_only_never_referenced
+655f3590dd07ece41209fb312348ffe9,linear_deepening,871336,6758325619253056013,LinearBurnBlendPreMul,线性加深=17,线性加深,17,16,no
+b76087cda4833f553cf09e82fb81c463,darken_color,871335,6758325724848853518,ColorBurnBlendPreMul,,,0,0,index_only_never_referenced
+f979dd10def50fad3ffb77c7f0df3db7,color_dodge,871334,6758325800031752712,ColorDodgeBlendPreMul,,,0,0,index_only_never_referenced
+8001e07eefc5d8b69572b977ca14bef9,multiply_blend_mode,871333,6758325895519277582,MultiplyBlendPreMul,正片叠底=6,正片叠底,6,3,no

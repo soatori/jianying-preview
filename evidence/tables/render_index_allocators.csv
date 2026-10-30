@@ -1,0 +1,31 @@
+allocator,args,numeric_constants,free_mode_branch,step_plus_2,body
+nextVideoRenderIndex,"e,t","[0, 1, 2, 2000]",free mode,+2,"if(e===c.$U)return g;return t.getDraftProperty().freeRenderIndexModeOn?2e3+this.getVideoCount(t,!0)+2:this.getMaxVideoRenderIndex(t)+1"
+nextVideoRenderIndexWithTimeRange,"e,t,r","[0, 1]",,,"if(e===c.$U)return g;var n=this.buildRenderLayers(r),a=0;if(0===n.size)a=1;else{var i=n.entries(),l=0,s=!0,u=!1,d=void 0;try{for(var f,m=i[Symbol.iterator]();!(s=(f=m.next()).done);s=!0){var y=f.value;y[0]>l&&(l=(0,o._)(y,1)[0])}}catch(e){u=!0,d=e}finally{try{s||null==m.return||m.return()}finally{if(u)throw d}}a=l+1}for(;a>1&&this.layerHasEnoughSpace(n.get(a-1)||[],t);)--a;return a"
+nextFilterRenderIndex,e,"[0, 1, 10000]",,,var t=this.getMaxFilterRenderIndex(e);return 0===t?1e4:t+1
+nextAdjustRenderIndex,e,"[0, 1, 2, 7000]",free mode,+2,"return e.property.freeRenderIndexModeOn?7e3+this.getAdjustCount(e,!0)+2:this.getMaxAdjustRenderIndex(e)+1"
+nextVideoEffectRenderIndex,e,"[0, 1, 2, 11000]",free mode,+2,"var t=-1;if(e.getDraftProperty().freeRenderIndexModeOn)t=11e3+this.getVideoEffectCount(e,!0)+2;else{var r=this.getMaxVideoEffectRenderIndex(e);t=0===r?11e3:r+1}return t"
+nextPluginEffectRenderIndex,e,"[0, 1, 15000]",,,var t=this.getMaxPluginEffectRenderIndex(e);return 0===t?15e3:t+1
+nextTextAndStickerRenderIndex,e,"[0, 1, 2, 14000]",free mode,+2,var t=-1;if(e.getDraftProperty().freeRenderIndexModeOn)t=14e3+this.getStickerCount(e)+2;else{var r=this.getMaxStickerRenderIndex(e);t=0===r?14e3:r+2}return t
+ENUM Flag,,,,,0|1|11|16|2|32|37|4|5|63|64|65535|7|8|_staging_flag
+ENUM FlagAiScriptSubtitle,,,,,6
+ENUM FlagAudioSubtitle,,,,,5
+ENUM FlagNone,,,,,0
+ENUM FlagSubVideo,,,,,2
+ENUM FlagTextLyric,,,,,3
+ENUM FlagTextSubtitle,,,,,1
+ENUM FlagVideoSubtitle,,,,,4
+ENUM Flags,,,,,0
+ENUM FlagsProvider,,,,,export-behavior-flags-provider
+ENUM TrackTypeAdCube,,,,,adcube
+ENUM TrackTypeAdjust,,,,,adjust
+ENUM TrackTypeAudio,,,,,audio
+ENUM TrackTypeComposition,,,,,composition
+ENUM TrackTypeFilter,,,,,filter
+ENUM TrackTypeNone,,,,,none
+ENUM TrackTypePluginEffect,,,,,plugin_effect
+ENUM TrackTypeSticker,,,,,sticker
+ENUM TrackTypeText,,,,,text
+ENUM TrackTypeTextToVideoText,,,,,text_to_video_text
+ENUM TrackTypeTextToVideoTextAudio,,,,,text_to_video_text_audio
+ENUM TrackTypeVideo,,,,,video
+ENUM TrackTypeVideoEffect,,,,,effect

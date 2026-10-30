@@ -1,0 +1,11 @@
+shadow_key,occurrences,contents,distinct_numeric_values,min,max,top_values,panel_divisor_fit
+angle,14552,571,42,-180,134.53125,-45:14417 0:58 -29:8 -90:7 -90.263931:7,
+content,14552,571,0,,,,
+distance,14552,571,66,0,25.964912,5.0:12915 8.000065:704 8:656 3:72 0:68,
+alpha,14443,562,84,0,1.0,0.9:11788 0.8:830 0.43316:455 0:163 0.528986:142,
+diffuse,13032,505,14,0,0.055,0.025:12697 0.010266:143 0.016667:109 0:44 0.008333:22,12874/13032 land on an integer panel value at panel/600
+thickness_projection_angle,5368,206,2,-45,0,-45:5346 0:22,
+thickness_projection_distance,5368,206,1,0,0,0:5368,
+thickness_projection_enable,5368,206,0,,,,
+feather,1518,86,39,0,0.16667,0.055556:1193 0.055:131 0:90 0.001667:19 0.05555:9,247/1518 land on an integer panel value at panel/600
+strokes,22,15,0,,,,

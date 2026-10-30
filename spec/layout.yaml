@@ -1,0 +1,190 @@
+# 草稿目录布局、版本判别与写入选址
+# 实测（快照 2026-10-16，**r3**，出处 `temp/corpus-scan/manifest.json` 的 2,450 条记录）：
+#   1,475 个草稿目录，其中 407 个含 Timelines/；内容文件 2,215 份，按内容去重 2,050 份
+#   （r2 曾写 1,531 目录 / 463 含 Timelines / 2,216 文件 / 2,052 内容，2026-10-20 按 r3 重排）
+# 证据：docs/evidence/findings.md F-004/F-015/F-019；本文件不含任何具体草稿名或用户路径
+
+layout_detection:
+  principle: 能力探测，不查版本号。版本字符串会跨布局，布局才是可执行事实。
+  kinds:
+    legacy_single:
+      test: 存在 <draft>/draft_content.json 且不存在 <draft>/Timelines/
+      count_dirs: 833
+    hybrid:
+      test: 存在 <draft>/Timelines/project.json
+      count_dirs: 407        # 349 个同时有根 draft_content.json，58 个只有 Timelines/ 里的副本
+      root_mirror_dirs: 349  # 其中只有 229 个能枚举到 Timelines/<id>/draft_content.json，另 120 个一条都没有（U-57）
+    draft_info_only:
+      test: 只有 <draft>/draft_info.json（5.9 时代单草稿架构）
+      count_dirs: 0          # r1 记 6，r2 语料中已不存在此类目录
+    no_content:
+      test: 既无 draft_content.json 也无 Timelines/（空目录、素材副本目录或未完成写入）
+      count_dirs: 235
+  file_counts_by_layout:      # 按内容文件计（2,215 份；按去重内容则是 hybrid 1,028 / legacy 831 / 仅根镜像 191）
+    hybrid: 1033
+    legacy: 833
+    hybrid_root_mirror: 349
+
+timeline_index:
+  path: <draft>/Timelines/project.json        # 实测为明文 JSON（数百字节级）
+  top_level_keys: [config, create_time, id, main_timeline_id, timelines, update_time, version]
+  timeline_entry_keys: [create_time, id, is_marked_delete, name, update_time]
+  active_selection:
+    field: main_timeline_id                   # 活动时间线以它为准，不靠目录顺序或名称
+    filter: is_marked_delete == false
+    note: 时间线名称（如「时间线01」）是用户可见标签，不可作为标识
+  per_timeline_dir: <draft>/Timelines/<timeline_id>/
+
+replicas:
+  rule: 副本集合必须由「解码后的 content-id == timeline-id」推导，绝不按固定文件名假设数量或身份
+  observed_candidates:
+    - draft_content.json
+    - draft_content.json.bak
+    - "template*.tmp"                    # 实测有 template.tmp 与 template-2.tmp 两种；后者常是**完整第三副本**（10月16日 草稿里它与 draft_content.json 密文逐字节相同）
+    - project.json / project.json.bak        # 索引层副本，同样存在
+  census_floor: >-
+    扫描器只跟 `draft_content.json`，所以「内容文件数」是**下界**。r3 同时清点了未解析的副本
+    （`stats.json -> corpus.replica_census_not_parsed`）：`draft_content.json.bak` 2,803、
+    `template-2.tmp` 2,888、`template.tmp` 1,800。判读纪律：**长度不同 ⇒ 内容不同（重加密等长），
+    等长而摘要不同 ⇒ 不能判**，必须解密比 content-id（F-003/U-20/F-025）。
+  byte_divergence: >-
+    实测同一草稿根下 draft_content.json 与 draft_content.json.bak 大小不同
+    （例：348,948 B vs 349,060 B）。因此「哪个文件是当前状态」只能靠解码后的
+    content-id 与时间线 id 匹配来确定，不能靠 mtime 或文件名。
+  write_obligation: 写回时必须发现并同步全部可写副本；漏同步会让剪映读到旧副本
+
+not_draft_folders:
+  - 语料根目录本身散落的 draft_content.json（驱动器根 <DRIVE_D>/、<DRIVE_E>/ 下的不属于任何草稿）
+  - no_content 目录（无内容文件即不可作为时间线目标）
+
+never_write_paths:
+  description: 剪映运行时与用户资源目录，只读；本项目产物一律不得写入草稿目录（见 crypto.md 第 4 节的写围栏）
+  entries:
+    - deepagent/          # 语料中 7 个草稿含此目录
+    - subdraft/           # 226 个草稿含此目录（内置草稿/复合片段运行时产物）
+    - Resources/          # 385 个
+    - matting/            # 382 个（抠像缓存）
+    - adjust_mask/
+    - common_attachment/
+    - .backup/
+    - "*.db"              # 7 个草稿根下有 sqlite 运行库
+    - crypto_key_store.dat / crypto_key_store.dat.bak   # 每草稿密钥库，含密钥材料，不读内容、不写
+  note: >-
+    旧版预览工具曾在 75 个草稿目录留下 .jypreview/ 缓存。本项目 M1 全程只读，
+    不新增此类目录；如需缓存，只进仓库 temp/（受 .gitignore 忽略，不进历史）。
+
+draft_folder_inventory_sample:   # 一个 hybrid 草稿根目录的典型成员（名称通用化，去除用户内容）
+  files: [draft_content.json, draft_content.json.bak, draft.extra, draft_agency_config.json,
+          draft_agency_info.json, draft_biz_config.json, attachment_editing.json,
+          attachment_pc_common.json, crypto_key_store.dat, crypto_key_store.dat.bak, draft_cover.jpg,
+          draft_meta_info.json, draft_settings, draft_virtual_store.json, key_value.json,
+          performance_opt_info.json, timeline_layout.json, "template-2.tmp"]
+  dirs: [.backup, adjust_mask, common_attachment, Resources, Timelines, matting, subdraft,
+         video, loudness, smart_crop, qr_upload, deepagent]
+  runtime_dirs_that_matter: >-
+    `Resources/videoAlg/`、`video/figure_algorithm/<video material id>`、`Resources/audioAlg/`、`matting/`、
+    `loudness/`、`smart_crop/` 是 `##_draftpath_placeholder_<uuid>_##/` 宏展开后的实际落点
+    （宏 = **草稿自身目录**，见 F-024 / write-rules §3）。其中 `matting/<md5>` 可以是「引用存在但文件未生成」，
+    解析器必须容忍缺文件而不是报错。
+
+container_json_set:            # 剪映自己认定的「一份草稿由哪些 JSON 组成」——安装包内常量，不是本项目推断
+  confidence: verified
+  source: "<DRIVE_D>/\Program Files\\JianyingPro\\11.6.0.14552\\Resources\\canvas_agent\\runtime\\app-server.mjs（9,206,933 B，sha256 4f027a06…，常量组 custom-agent.jianying-draft-understanding.v1）"
+  members: [draft_info.json, draft_meta_info.json, draft_content.json, draft_virtual_store.json, draft_agency_config.json]
+  main_draft_candidates: [draft_content.json, draft_info.json]
+  cover_candidates: [draft_cover.jpg, draft_cover.png, cover.jpg, cover.png]
+  name_keys: [draft_name, draftName, draft_title, draftTitle, project_name, projectName, name, title]
+  modify_time_keys: [draft_modify_time, draftModifyTime, modify_time, modifyTime, updated_at, updatedAt, mtime]
+  counts_dirs_basis: >-
+    只读 find -maxdepth 2 实测（2026-10-20，目录口径 = r3 的 1,475 个草稿目录）：
+    draft_content.json 1,190 / draft_meta_info.json 1,497 / draft_agency_config.json 1,487 /
+    draft_virtual_store.json 1,184 / draft_info.json 6
+  virtual_store_shape: >-
+    draft_virtual_store.json 形如 {draft_materials:[], draft_virtual_store:[{type, value:[{child_id, parent_id,
+    sort_type, subdraft_filter_type, filter_type, import_time, import_time_us, creation_time, display_name}]}]}，
+    是 subdraft/（226 个草稿有）的**父子索引**，复合片段/嵌套草稿解析要用它，不能当噪声目录处理。
+    出处：F-047；此前本规格的目录成员样本漏了这一个文件。
+
+platform_block:                # 根级 platform 与 last_modified_platform 的字段身份
+  confidence: verified         # 两条独立通道：安装包常量 + r3 冻结明文逐字段同名
+  keys: [os, os_version, app_id, app_version, app_source, device_id, hard_disk_id, mac_address]
+  desktop_app_observed:        # r3 冻结明文抽样 416 份（步长 [::5]）
+    os: "windows 415 / iOS 1"
+    app_source: "lv 416/416"
+    app_id: "3704 300/300（步长 [::5] 前 300 份）"
+    app_version: "与草稿来源同域（5.7.0 … 11.6.0），见 tables/alignment_by_version.csv"
+  built_in_agent_writes:       # 同一安装包内 agent 的成片草稿构造器（源码字面量，wl0 / 常量 gh1）
+    os: web
+    app_id: 348188
+    app_version: "15.4.0"
+    app_source: ""
+    device_id: ""
+    hard_disk_id: ""
+    mac_address: ""
+  rule: >-
+    这八字段是**身份块**，不参与渲染，也不决定布局。写回默认整块不动——改它等于冒充别的客户端。
+    到底该 stamp 桌面值还是 agent 值归 U-60。
+
+main_track:                    # 「主轨/副轨」这条结构轴此前不在规格里
+  confidence: verified
+  rule: >-
+    视频主轨 = **首条 `type=="video"` 的轨道，且它的 `flag ∈ {0, 整键缺席}`**；其余轨道是副轨。
+    存在多条 video 轨（画中画）时不改写这条，但**非首条的 video 轨必然 `flag==2`**
+  measured: >-
+    r3 冻结明文抽样 500 份（步长 [::4][:500]）：370 份含 video 轨，其中 **370/370** 的 tracks[0].type == "video"；
+    206/370（55.7%）有多于一条 video 轨。
+    2026-10-21 全量交叉表（2,050 份内容、9,990 条轨道、3,195 条 video 轨，`tables/track_flag_semantics.csv`）：
+    **首条 video 轨 flag 为 0 的 575 条、整键缺席 958 条、等于 2 的 0 条**（合计 1,533 份有 video 轨的内容）；
+    **非首条 video 轨 flag==2 的 1,662 条、其他取值 0 条** ⇒ 判据与标记两边互相蕴含，无一例外
+  second_source: >-
+    安装包内 agent 的构造器把 tracks[0] 当视频主轨，取不到就抛「成片草稿缺少视频主轨」；
+    xmldraft/v1 协议把主轨列为一等公民——唯一 main 容器、只承载 video/image、按文档顺序连续，
+    且往主轨开头插入片段时，底层 apply 会把 multi 片段整体自动后移。
+    前端 chunk 里另有三处同型规则 `track.type === TrackTypeVideo && track.flag === FlagNone → FlagSubVideo`
+    （插入新 video 轨时补 flag=2），这解释了为什么主轨是 0 或缺席、其余全是 2
+  flag_axis: >-
+    `tracks[].flag` 是**官方枚举**，不是主轨标记也不是笼统的「类型 tab」（U-61 结案，F-050）：
+    `FlagNone=0 / FlagTextSubtitle=1 / FlagSubVideo=2 / FlagTextLyric=3 / FlagVideoSubtitle=4 /
+    FlagAudioSubtitle=5 / FlagAiScriptSubtitle=6`（枚举值直接从 `app/static/js/` 的
+    `e[e.FlagNone=0]` 反向映射里读出，官方模型层 track 构造器声明 `e.flag=a.JO.FlagNone`）。
+    桌面写入器只用 0/缺席/1/2/3：**1 = 字幕轨**（1,004 条 text 轨里 971 条即 96.7% 装 `texts.type=="subtitle"`，
+    对照 flag=0 只 10.1%、缺席 13.3%）、**2 = 副视频轨**（见上）、**3 = 歌词轨**（仅 2 条，推断级）。
+    `0` 与「整键缺席」等价，读侧必须合并处理、写侧不得为补齐而写 `flag:0`。
+    4/5/6（视频字幕/音频字幕/AI 脚本字幕）在 2,050 份内容里**零出现** ⇒ 合法但本机未见，属 agent/云侧识别产物的类别，
+    M3 不要主动生成、也不要改写掉
+  excluded: >-
+    旧行写「tracks[].flag 不是主轨标记，唯一 flag==2 落在首条 video 轨 0/206」——结论方向对但当时只做成否定，
+    没读出正面语义（那份数字是抽样口径：video 2/缺席/0 = 407/239/131、text 1/缺席/0/3 = 230/214/143/3、audio 缺席/0 = 331/241）。
+    2026-10-21 全量正解：**flag==2 就是「不是主轨的那条 video 轨」**，主轨反而从不写 2；根因是当时没有去
+    `app/static/js/` 读枚举定义，只拿语料做了排除法
+
+version_axis:                  # 根级 version / new_version 的实测形状（写回 stamp 问题归 U-60）
+  install_dir_names_are_not_a_version_axis: >-
+    2026-10-21 只读清点（F-051）：安装根下 15 个子目录，**只有 2 个是完整安装**
+    （`11.6.0.14552` 5,192 文件、`11.1.0.14287 - 副本` 4,052 文件），其余 12 个版本名目录是**更新载荷**
+    （37~77 文件、顶层项带 `_d_<7位hex>` 后缀、没有 `Resources/`、没有 `JianyingPro.exe`），
+    `202687173850092_1` 是 11.2.0.14339 的更新包暂存目录（`JianyingProPacket.xml` 直读）。
+    ⇒ **版本判别只许读草稿自己的 `platform.app_version` + 根 `version`/`new_version`，不许按安装目录名推**；
+    需要装机对照时唯一可用的对是 `11.1.0.14287 - 副本` ↔ `11.6.0.14552`（注意不是不带后缀的那个 11.1.0）。
+    附带边界：`canvas_agent` / `agent_runtime` / `agent_runtime_env` 三个资源项只在 11.6 存在，
+    所以 F-047/F-049/F-050 读到的协议层与 draft 模型层描述的是 **11.6 新增的 web/agent 写入面**，
+    对 4.8~11.5 的语料草稿只能作旁证，不能当「桌面编辑器历代都这么写」
+  confidence: verified
+  root_version: 桌面剪映写的草稿恒为整数 360000（693 份抽样，步长 [::3]，693/693，含 app_version 11.6.0 的草稿）
+  new_version: 字符串形如 "N.0.0"，随 platform.app_version 单调（配对来自 300 份交叉表，步长 [::5][:300]：11.1.0→179、11.2.0→181/183/189、11.3.0→183/185、11.4.x→185、11.5.0→187、11.6.0→189；693 份里共 36 个不同值）
+  built_in_agent_writes: 400000，且不动 new_version
+  rule: >-
+    解析器只读不判版本——布局判别一律走上面的 layout_detection 能力探测（版本字符串会跨布局）。
+    F-016 是这条轴此前唯一的单草稿记录（10月16日 草稿：version 360000 / new_version "189.0.0" / app_id 3704）。
+
+minimal_drafts:
+  marker: is_minimal_draft == true
+  shape: 顶层含 canvas_config/config/materials/keyframes/path/platform/new_version 等，但没有 tracks 键
+  measured: 2,050 份去重内容中 278 份（13.6%，r3 `temp/corpus-detail/root_flags.csv`）
+  rule: 解析器不得假设 tracks 存在；渲染器对无 tracks 的时间线显示空轨道列表而非报错
+
+root_mirror:
+  phenomenon: hybrid 草稿在根目录保留一份 draft_content.json（活动时间的镜像）
+  measured_files: 349                     # 其中 191 份内容只存在于根镜像；r1 的 698 属翻倍口径
+  drift: 已知镜像可能与时间线副本不一致          # single：待 M2 用写入实验确认同步时机
+  rule: 写非活动时间线不会自动刷新根镜像；是否刷新需按目标一致性显式决定（见 write-rules.md）

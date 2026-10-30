@@ -1,0 +1,7 @@
+case,count
+mode=True|render_index_ascending=False|track_order_monotonic=True,916
+mode=True|render_index_ascending=True|track_order_monotonic=True,136
+mode=False|render_index_ascending=False|track_order_monotonic=True,16
+mode=False|render_index_ascending=True|track_order_monotonic=True,3
+mode=None|render_index_ascending=True|track_order_monotonic=True,2
+mode=None|render_index_ascending=False|track_order_monotonic=True,2
