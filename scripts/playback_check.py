@@ -211,7 +211,14 @@ def main() -> int:
     ap.add_argument("--seeks", type=int, default=12)
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--repeat", type=int, default=3,
-                    help="battery runs per criterion; verdicts are medians")
+                    help="battery runs per criterion; verdicts are medians. "
+                         "自 2026-10-29 起也覆盖 `L4 frame budget`：整条时间轴那层会跑 "
+                         "repeat 个点（每点约 +1~2 分钟墙钟，含交界 settle）")
+    ap.add_argument("--settle-seconds", type=float, default=12.0,
+                    help="相邻**起浏览器的阶段**之间的空机等待，语义同 "
+                         "temp/playback-test/s1_split_ab.py 的 S1_SETTLE（等上一轮 Chrome 连同 "
+                         "gpu-process/renderer 彻底退出、profile 落盘结束）。0 = 关掉，回到 "
+                         "P-97 那一跑的背靠背形态。生效交界见 settle_before() 的注释")
     ap.add_argument("--cover-frame", default="",
                     help="native cover to score the VIDEO layer against (F-066 band metric)")
     ap.add_argument("--band", default="0.02-0.42", help="y range of the intact band, as a-b")
@@ -252,6 +259,35 @@ def main() -> int:
 
     def verdict(name: str, ok: bool, detail: str) -> None:
         checks.append((name, "PASS" if ok else "FAIL", detail))
+
+    # ---- 阶段交界的空机等待（P-97 ④ 第 4 条钉出来的结构问题）------------------------------
+    # 理由不是"慢一点更稳"，是**读数会互相纠缠**：browser_soak 返回时只保证它 terminate 了自己那个
+    # Chrome 主进程（scripts/browser_soak.py:124-134），gpu-process / renderer / profile 落盘还在收尾，
+    # 下一个 Chrome 就在这条尾巴里起跑 ⇒ 门里 `L4 live pacing`（n=662 帧、paint p50 1516 ms）、
+    # `L6` 同跑那条 `['846DA305']`、RSS peak 6251 MB 三处红出自**同一条被污染的跑**，
+    # 而空载 + 臂间 settle 的独立复测 5 次都不可复现（P-97 ③④）。
+    # 生效交界 = 相邻两次"起 Chrome 的阶段"之间，按跑序：
+    #   电池 check0 → check1 → …（每个 repeat 点各一次）
+    #   → 整条时间轴帧预算 jank0 → jank1 → …
+    #   → 直播节奏 livepacing → L10 浏览器截图 → 负样本 check-neg
+    #   → L7 混合模式浏览器腿 → L7 GPU 三方
+    # 不起浏览器的阶段（L1 建模、L2/L3 的 ffmpeg 出图、L8/L9/L11 离线判定）之间**不等**，
+    # 第一个起浏览器的阶段也不等（那一刻还没有我们启动的 Chrome）。
+    _browser_stage: list[str] = []
+
+    def log(s: str) -> None:
+        try:
+            print(s, flush=True)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write((s + "\n").encode("utf-8", "replace"))
+
+    def settle_before(stage: str) -> None:
+        prev = _browser_stage[-1] if _browser_stage else ""
+        if prev and args.settle_seconds > 0:
+            log(f"[settle] {prev} -> {stage}: 空机 {args.settle_seconds:g} s"
+                "（等上一轮 Chrome 彻底退出；--settle-seconds 0 可关）")
+            time.sleep(args.settle_seconds)
+        _browser_stage.append(stage)
 
     # ---- 0. L0: the player under test must be the tracked one -------------------------------
     # The runtime copy sits in temp/ because that is where the gateway's static root and the
@@ -395,6 +431,7 @@ def main() -> int:
 
         def battery(url_model: str, tag: str, playms: int | None = None,
                     seeks: int | None = None) -> dict:
+            settle_before(f"电池 {tag}")
             before = len(report.read_text(encoding="utf-8").splitlines()) if report.exists() else 0
             url = (f"http://127.0.0.1:{port}/playback-test/{args.player}"
                    f"?autostart=1&model={url_model}"
@@ -446,35 +483,74 @@ def main() -> int:
             verdict("L4 Range streaming", (med(reqs) or 0) > 0,
                     f"median {med(reqs)} ranged requests per {args.battery_ms} ms window")
 
-            # ---- 4b. L4 帧预算：整条时间轴跑一遍，判尾部而不是均值 ----------------------------
-            jd: dict = {}
+            # ---- 4b. L4 帧预算：整条时间轴跑 repeat 遍，判尾部而不是均值 -----------------------
+            jd: list[dict] = []
             ld: dict = {}   # --skip-jank 时这两个不进 L6 的分母，但名字必须存在（L6 要引用）
             # 用户报"一顿一顿"而门全绿，有两条理由：①`composited_fps` 是帧数÷墙钟的**均值**，
             # 一帧 1.2 s 的停顿摊进均值只剩 0.03 fps；②电池只跑 10 s 还带 seek，实测最坏那十帧
             # 落在 5.7~16.4 s，从没被覆盖过。这层自己走完整条时间轴，判 p95/max，并把
             # "重复上一帧"的次数与新帧速率一起报出来——否则"不卡"可能只是"冻住了"。
+            # 「把单点当分布」的更正（P-97 ② 第 2 条 / ⑦ 第 2 条）：这一层原先写在 repeat 循环
+            # **之外**，所以 `--repeat 2` 也只产 1 个帧预算点，而 P-96/P-97 是按"分布"在读的
+            # （靠事后另开 p97_jank_repeat.py 补到 4 点）。现在点数 = args.repeat。
+            # **代价（明写）**：每个点多跑一条整条时间轴（本机 duration≈36.8 s + 交界 settle），
+            # ≈ +1~2 分钟墙钟；`--repeat 3`（默认）比改前多约 2~4 分钟。
+            # **判据一个数没动**：线仍是 p95<=33.4 / max<=150，且**每个点各自吃线、全部过才绿**
+            # ——不取中位，取中位会让一个被污染的点被其余点平均掉，那是悄悄放宽。
             if not args.skip_jank:
                 dur_ms = int(round(m["duration_us"] / 1000)) + 700
-                jd = battery(Path(media_model).name, "jank", playms=dur_ms, seeks=0)
-                pl = jd.get("play") or {}
-                fc = pl.get("frame_cost_ms") or {}
-                p95, mx, n = fc.get("p95"), fc.get("max"), fc.get("n") or 0
-                ok = (n > 0 and isinstance(p95, (int, float)) and isinstance(mx, (int, float))
-                      and p95 <= CRITERIA["frame_cost_p95_ms_max"]
-                      and mx <= CRITERIA["frame_cost_max_ms_max"])
-                w = pl.get("warm") or {}
+                for i in range(args.repeat):
+                    d = battery(Path(media_model).name, f"jank{i}", playms=dur_ms, seeks=0)
+                    if d:
+                        jd.append(d)
+                num = lambda v: isinstance(v, (int, float))  # noqa: E731
+                pts = []
+                for i, d in enumerate(jd):
+                    pl_i = d.get("play") or {}
+                    fc_i = pl_i.get("frame_cost_ms") or {}
+                    p95_i, mx_i, n_i = fc_i.get("p95"), fc_i.get("max"), fc_i.get("n") or 0
+                    pts.append({"i": i, "d": d, "pl": pl_i, "fc": fc_i, "n": n_i,
+                                "p95": p95_i, "max": mx_i,
+                                "ok": (n_i > 0 and num(p95_i) and num(mx_i)
+                                       and p95_i <= CRITERIA["frame_cost_p95_ms_max"]
+                                       and mx_i <= CRITERIA["frame_cost_max_ms_max"])})
+                bad_pts = [p for p in pts if not p["ok"]]
+                p95s = [p["p95"] for p in pts if num(p["p95"])]
+                maxs = [p["max"] for p in pts if num(p["max"])]
+                # 详字段（>33ms/重复帧/预热分母）钉在 **max 最大的那个点**上，与历史单点读数同框可比
+                worst = max(pts, key=lambda p: p["max"] if num(p["max"]) else -1) if pts else None
+                w = ((worst or {}).get("pl") or {}).get("warm") or {}
+                ok = bool(pts) and not bad_pts
                 verdict("L4 frame budget (whole timeline, tail not mean)", ok,
-                        f"n={n} p50={fc.get('p50')} p90={fc.get('p90')} p95={p95} max={mx} ms"
-                        f"（p95<={CRITERIA['frame_cost_p95_ms_max']} / "
-                        f"max<={CRITERIA['frame_cost_max_ms_max']}）；"
-                        f">33ms {fc.get('over_33ms')} >100ms {fc.get('over_100ms')}；"
-                        f"重复上一帧 {pl.get('pump', {}).get('stale_holds')} 次，"
-                        f"新帧 {pl.get('fresh_track_frames_per_second')}/s"
-                        # 预热这条腿的分母：max 过线也可能因为它根本没跑（页侧默认开，一旦被改坏
-                        # 就退化成"别处巧合让 max 达标"）。used≠started 就是有白热的解码器。
-                        f"；预热泵 {w.get('used')}/{w.get('started')} 被到点取用"
-                        f"（开={w.get('on')} 白热={w.get('wasted')} 废={w.get('dropped')}）"
-                        + ("" if ok else f" | worst={fc.get('worst', [])[:3]} fps={pl.get('composited_fps')}"))
+                        f"n={len(pts)} 个点（--repeat={args.repeat}；绿=**每个点**都过 "
+                        f"p95<={CRITERIA['frame_cost_p95_ms_max']} / "
+                        f"max<={CRITERIA['frame_cost_max_ms_max']}，不取中位）"
+                        f"；p95 各点 {[p['p95'] for p in pts]} 中位 {med(p95s)}"
+                        f"；max 各点 {[p['max'] for p in pts]} 中位 {med(maxs)}"
+                        + (f"；点数缺 {args.repeat - len(pts)}（页面没自报）"
+                           if len(pts) < args.repeat else "")
+                        + ("" if not worst else
+                           f" | 详读点#{worst['i']}（max 最大）n={worst['n']} "
+                           f"p50={worst['fc'].get('p50')} p90={worst['fc'].get('p90')} "
+                           f"p95={worst['p95']} max={worst['max']} ms；"
+                           f">33ms {worst['fc'].get('over_33ms')} >100ms {worst['fc'].get('over_100ms')}；"
+                           f"重复上一帧 {(worst['pl'].get('pump') or {}).get('stale_holds')} 次，"
+                           f"新帧 {worst['pl'].get('fresh_track_frames_per_second')}/s"
+                           # 预热这条腿的分母：max 过线也可能因为它根本没跑（页侧默认开，一旦被改坏
+                           # 就退化成"别处巧合让 max 达标"）。used≠started 就是有白热的解码器。
+                           f"；预热泵 {w.get('used')}/{w.get('started')} 被到点取用"
+                           f"（开={w.get('on')} 白热={w.get('wasted')} 废={w.get('dropped')}）")
+                        + ("" if ok else
+                           f" | 未过线点 {[p['i'] for p in bad_pts]}"
+                           + (f" worst={worst['fc'].get('worst', [])[:3]} "
+                              f"fps={worst['pl'].get('composited_fps')}" if worst else "")))
+            else:
+                # 跳过时要留一行的理由：这层是"整条时间轴会不会冻住"的唯一判据，而末尾的绿色总数
+                # 是按 checks 计数、SKIP 也计入"未失败"。不留行，`--skip-jank` 的一跑就会以
+                # "N of N 全绿"的名义，宣称一个从没测过的判据通过了。
+                checks.append(("L4 frame budget (whole timeline, tail not mean)", "SKIP",
+                               f"--skip-jank：整条时间轴的 p95/max 未测（本应有 --repeat={args.repeat} "
+                               "个点），本层的判据不在这一跑里"))
             # ---- 4c. L4 直播节奏（tick 那条真实通路，用 drive=timer 敲同一个函数体）--------------
             # 其余各腿都跑在 battery() 自己按墙钟补帧的循环上；本机 headless、Qoder 内置浏览器、
             # 我自己起的带头 Chrome 三处都实测 **rAF 0 帧**，真实 rAF 自动测不到。
@@ -488,6 +564,7 @@ def main() -> int:
                 # 症状是"页面什么都没回答"。所以 URL 里写死 tag，读的也就是那个文件。
                 lrep = OUT / "report-livepacing.jsonl"
                 before = len(lrep.read_text(encoding="utf-8").splitlines()) if lrep.exists() else 0
+                settle_before("直播节奏 livepacing")
                 run([PY, "scripts/browser_soak.py", "--url",
                      f"http://127.0.0.1:{port}/playback-test/{args.player}"
                      f"?liveplay={live_ms}&model={Path(media_model).name}"
@@ -516,21 +593,35 @@ def main() -> int:
                 verdict("L4 live pacing + A/V residual (drive=timer, not real rAF)", okl,
                         f"n={nfr} 帧 gap p50={lv.get('gap_p50_ms')} p95={p95} max={mx} ms"
                         f"（p95<=50 / max<=150）；音画残差 max={None if av_max is None else round(1000*av_max)} ms"
-                        f"（<=50，截到播放头走完为止）；paint p95={lv.get('paint_p95_ms')} "
+                        f"（<=50，截到播放头走完为止）；paint p50={lv.get('paint_p50_ms')} "
+                        f"p95={lv.get('paint_p95_ms')} "
                         f"driver={lv.get('driver')} avclk={lv.get('avclk')} 错误={len(ld.get('tick_errors') or [])}")
+            else:
+                checks.append(("L4 live pacing + A/V residual (drive=timer, not real rAF)", "SKIP",
+                               "--skip-jank：直播节奏这条真实通路的 tick 未测"))
 
             # L6 的分母原本只有 10 s 电池那几条跑，于是**整条时间轴那跑里的黑屏从来没被 judge 过**。
             # P-85 就是这么一条：flag=2 叠层 `C7817`（窗口 10.733–12.467 s）在整条跑里连续 ≥5 帧没出图，
             # 同跑 L6 仍报 0/1。判"有没有静默黑屏"却不看用户实际会走完整条的那一遍，等于只在一小段
             # 采样里有牙齿。现在把整条跑（jank）与直播节奏跑（livepacing）一起纳入，并按路径标注，
-            # 免得两个分母混成一个数。
-            extra_runs = [("整条时间轴", jd), ("直播节奏", ld)]
+            # 免得两个分母混成一个数。整条跑现在每 repeat 一个点，所以逐点列出（`整条时间轴#i`）。
+            extra_runs = [(f"整条时间轴#{i}", d) for i, d in enumerate(jd)]
+            if ld:
+                extra_runs.append(("直播节奏", ld))
+            # --skip-jank 时 jd/ld 是空。空 dict 的 black_streaks 是 falsy，原来会被当成
+            # "0 条黑屏"计进 2 的分母 ⇒ 用没跑过的跑充数。只计真取到读数的跑，缺几条写进 detail。
+            # 期望点数 = repeat 条整条 + 1 条直播（改前这个 2 是写死的）。
+            expected_x = args.repeat + 1
+            missing_x = expected_x - len(extra_runs)
             bad = [d for d in runs if d.get("black_streaks") or d.get("errors")]
             bad_x = [(name, d) for name, d in extra_runs
                      if isinstance(d, dict) and (d.get("black_streaks") or d.get("errors"))]
             verdict("L6 no silent black frame", not bad and not bad_x,
                     f"{len(bad)}/{len(runs)} 电池跑 + {len(bad_x)}/{len(extra_runs)} 整条/直播跑"
                     f" 有 black_streaks 或 errors"
+                    + (f"；整条/直播跑缺 {missing_x} 条"
+                       f"（{'--skip-jank' if args.skip_jank else '这些点没取到读数'}），"
+                       f"期望 {expected_x} 条、分母随之缩小" if missing_x else "")
                     + (f"; e.g. {bad[0].get('black_streaks')} {bad[0].get('errors')[:1]}" if bad else "")
                     + "".join(f" | {n}: {d.get('black_streaks')} {(d.get('errors') or [''])[0][:70]}"
                               f" (max帧时 {(d.get('play') or {}).get('frame_cost_ms', {}).get('max')} ms"
@@ -566,6 +657,7 @@ def main() -> int:
             url = (f"http://127.0.0.1:{port}/playback-test/{args.player}"
                    f"?model={Path(media_model).name}&seek=1.0&shots={times}"
                    f"&fps=30&qmax=4&pool=4")
+            settle_before("L10 浏览器截图")
             run([PY, "scripts/browser_soak.py", "--url", url,
                  "--seconds", str(args.shot_seconds), "--report", str(report.relative_to(ROOT)),
                  "--tag", "shot", "--timeout", str(args.shot_seconds + 25)])
@@ -652,6 +744,9 @@ def main() -> int:
         # 浏览器那条腿单独一层：本草稿 0 个 mix_mode 段，L1~L10 在真实模型上永远不会
         # 走到浏览器混合路径；这层拿注入件跑真浏览器，判"载体取到切片、滤镜建出来、
         # 挂在活节点上"，并且带**反 fixture**（未知包 md5 必须降级且不挂任何节点）。
+        # 这两条浏览器腿也在 settle 交界里：上一段 Chrome（负样本跑）刚 terminate，
+        # gpu/renderer 还在收尾时再起一个浏览器，测的就不是脚本而是"两个窗口叠加"的机器。
+        settle_before("L7 mixmode 浏览器腿")
         bw = run([PY, "scripts/mixmode_browser_check.py",
                   "--carrier", args.media_model or args.model], timeout=300)
         btail = [ln for ln in bw.stdout.splitlines() if "MIXMODE_BROWSER_WIRING" in ln]
@@ -659,6 +754,7 @@ def main() -> int:
                 bw.returncode == 0 and any("MIXMODE_BROWSER_WIRING ok" in ln for ln in btail),
                 (btail[-1][:150] if btail else (bw.stdout or bw.stderr)[-150:]))
         if args.mixmode_gpu:
+            settle_before("L7 mixmode GPU 三方")
             eq = run([PY, "scripts/mixmode_equivalence.py"], timeout=args.mixmode_seconds)
             tp = ROOT / "docs" / "evidence" / "tables" / "mixmode_equivalence.csv"
             bad: list[str] = []
@@ -676,6 +772,14 @@ def main() -> int:
             verdict("L7 mixmode GPU three-way (vendor GLSL = oracle)",
                     eq.returncode == 0 and n_rows == 10 and not bad,
                     f"{n_rows} modes read from the table, {len(bad)} out of tolerance"
+                    # 判据不看 stdout，只看 rc + 表。所以子进程一旦非零，**表可能是上一跑的**
+                    # （本轮就撞上一次：门里这层红、行里却写"10 modes / 0 out of tolerance"，
+                    # 读起来像"全对却 FAIL"）。把 rc 与尾巴、表的 mtime 一起打出来，下次能归因。
+                    + (f" | rc={eq.returncode} 表 mtime="
+                       f"{time.strftime('%m-%d %H:%M:%S', time.localtime(tp.stat().st_mtime)) if tp.exists() else '无表'}"
+                       f" 本次没重导表"
+                       + " tail=" + ((eq.stdout or "") + (eq.stderr or ""))[-260:].replace("\n", " / ")
+                       if eq.returncode else "")
                     + (": " + "; ".join(bad[:3]) if bad else ""))
 
     # ---- 8. L8: 入场动画的载体与接线（曲线值来自包内 lua，不手抄）--------------------------

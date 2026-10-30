@@ -23,6 +23,7 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -49,6 +50,41 @@ TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime", ".m4v": "video/mp4",
 
 def media_id(path: str) -> str:
     return hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
+
+
+# ---- S2 仪表：日志按 epoch 毫秒记时，并按大小滚动（改名归档，不删历史）----------------------
+# 为什么必须换尺子：`_note()` 过去只写 `HH:MM:SS`，所以 P-95 那句"这批请求里没有一次接近 350 ms"
+# 其实是**覆盖率缺口**而不是结论——秒级戳既对不上页内的 await 窗，也分不出日期。
+# 现在每行以 `epoch=<毫秒.毫秒>` 开头，页面在 /report 里回送 `epoch_base = Date.now() -
+# performance.now()`，于是"这条慢腿的窗口里到底有没有请求、那个请求服务端花了多少 ms"能逐窗相交。
+# 每轮建议给一个独立 `--log`（配 `--run-id` 在行里留可筛的标记），别让 630 MB 的历史文件当分母。
+LOG_LOCK = threading.Lock()
+_log = {"path": LOG, "bytes": 0, "max": 0, "run": ""}
+
+
+def _roll(cur: Path) -> Path:
+    """把当前日志**改名**成带时间戳的归档，然后由下一次写入自然新建当前文件。历史不抹掉。"""
+    arch = cur.with_name(f"{cur.stem}.{time.strftime('%Y%m%d-%H%M%S')}.{int(time.time() * 1000) % 1000}.log")
+    cur.rename(arch)
+    _log["bytes"] = 0
+    return arch
+
+
+def configure_log(path: Path, max_mb: float, run_id: str) -> list[str]:
+    """设日志路径/滚动上限/运行标记；返回启动时要说出来的事（比如"历史已归档成 X"）。"""
+    _log["path"] = path
+    _log["max"] = int(max_mb * 1024 * 1024) if max_mb > 0 else 0
+    _log["run"] = f"run={run_id} " if run_id else ""
+    notes = []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    size = path.stat().st_size if path.exists() else 0
+    if _log["max"] and size > _log["max"]:
+        arch = _roll(path)
+        notes.append(f"既有日志 {size / 2**20:.0f} MB 超过上限 {max_mb:.0f} MB"
+                     f" ⇒ 已改名归档 {arch.name}，新写 {path.name}")
+    else:
+        _log["bytes"] = size
+    return notes
 
 
 def build_manifest(model: dict) -> dict[str, dict]:
@@ -82,9 +118,28 @@ class Handler(BaseHTTPRequestHandler):
         return f"{(time.monotonic() - start) * 1000.0:.2f}" if start else "-1"
 
     def _note(self, row: str) -> None:
+        """一行网关账：`epoch=<毫秒> <HH:MM:SS> [run=<id>] <正文>`。
+
+        epoch 是 S2 的接口：请求的**服务端窗**就是 `[epoch - ms, epoch]`（`ms=` 记到发送循环
+        结束、紧接着写这一行），页内换算 `epoch_base + performance.now` 落在同一个时间轴上，
+        所以两者能逐窗相交。`HH:MM:SS` 留着不删，是因为已有的统计工具（py_leg_probe）按它读；
+        加前缀不改 `ms=` 的解析。超限滚动只在写完之后判，改名在锁内做 ⇒ 没有别的写者开着它。
+        """
         try:
-            with LOG.open("a", encoding="utf-8") as fh:
-                fh.write(f"{time.strftime('%H:%M:%S')} {row}\n")
+            t = time.time()
+            line = (f"epoch={t * 1000.0:.3f} {time.strftime('%H:%M:%S', time.localtime(t))} "
+                    f"{_log['run']}{row}\r\n")   # CRLF：与既有 gateway.log（文本模式写的）同一换行约定
+            data = line.encode("utf-8")
+            with LOG_LOCK:
+                with _log["path"].open("ab") as fh:     # 二进制：字节数与滚动阈值算的是同一件东西
+                    fh.write(data)
+                _log["bytes"] += len(data)
+                if _log["max"] and _log["bytes"] > _log["max"]:
+                    try:
+                        _roll(_log["path"])
+                    except OSError:
+                        # 改名失败（多半是另一个进程还开着它）：不逐行重试，等到再涨一个上限的量再看。
+                        _log["max"] += _log["bytes"]
         except OSError:
             pass
 
@@ -178,10 +233,18 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         name = "gateway-report.jsonl"
+        epoch_note = ""
         try:
-            tag = json.loads(raw.decode("utf-8", "replace")).get("tag")
+            obj = json.loads(raw.decode("utf-8", "replace"))
+            tag = obj.get("tag")
             if tag:
                 name = f"report-{tag}.jsonl"
+            # 把页内的时钟基准随这一行一起留下：`epoch_sent - 本行的 epoch` 就是两条墙钟的错位量
+            # （同机应当只有几毫秒），S2 相交之前先看它，不然窗对不上时说不清是谁的锅。
+            if obj.get("epoch_base") is not None:
+                epoch_note = (f" epoch_base={obj['epoch_base']}"
+                              f" epoch_sent={obj.get('epoch_sent')}"
+                              f" split={obj.get('play', {}).get('switches', {}).get('split')}")
         except Exception:  # noqa: BLE001
             pass
         with (OUT / name).open("a", encoding="utf-8") as fh:
@@ -189,7 +252,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Content-Length", "0")
         self.end_headers()
-        self._note(f"POST {urlparse(self.path).path} bytes={n} -> {name}")
+        self._note(f"POST {urlparse(self.path).path} bytes={n} -> {name}{epoch_note}")
 
     def _range_or_head(self, mid: str, head_only: bool) -> None:
         entry = self.table.get(mid) or self.table.get(media_id(urlparse(mid).path))
@@ -342,6 +405,11 @@ def main() -> int:
     ap.add_argument("--measure", action="store_true")
     ap.add_argument("--serve-dir", default=str(OUT))
     ap.add_argument("--extra", action="append", default=[], help="extra media file to serve by id, repeatable (A/B proxies)")
+    ap.add_argument("--log", default=str(LOG),
+                    help="per-request log path; give one per run so a run's window is separable (S2)")
+    ap.add_argument("--log-max-mb", type=float, default=64.0,
+                    help="roll the log to a timestamped sibling past this size (改名归档，不删历史; 0=不滚)")
+    ap.add_argument("--run-id", default="", help="stamped into every log line so a run is filterable")
     args = ap.parse_args()
 
     if not (OUT / "media-manifest.json").exists() or not args.measure:
@@ -371,6 +439,9 @@ def main() -> int:
     missing = [e["path"] for e in table.values() if not e["exists"]]
     print(f"preview gateway on http://127.0.0.1:{args.port}  media={len(table)} missing={len(missing)}",
           flush=True)
+    for notice in configure_log(Path(args.log), args.log_max_mb, args.run_id):
+        print("  log:", notice, flush=True)
+    print(f"  log={args.log} max_mb={args.log_max_mb or '∞'} run={args.run_id or '-'}", flush=True)
     for p in missing[:5]:
         print("  missing:", p, flush=True)
     try:
