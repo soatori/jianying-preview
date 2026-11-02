@@ -1,0 +1,211 @@
+# 动画预设清单（按语料频次排序，决定 phase-1 实现优先级）
+# 数据来源：2050 份去重内容聚合（快照 2026-10-16，r3；r1 按文件计且被翻倍、r2 是首次去重口径），
+# temp/corpus-scan/csv/animations.csv + temp/corpus-detail/animation_timing.csv；表见 ../evidence/tables/animations_top60.csv
+# 已验证：预设曲线在预设包内为明文 Lua + GLSL，可读，不需从成片反推（findings F-012）
+
+reference_shape:
+  bucket: materials.material_animations[]
+  item_fields: [id, type, name, resource_id, path, category_name, extra_material_refs(可选)]
+  container_type: >-
+    `material_animations[].type` **恒为 `sticker_animation`**（34,821 / 34,821，r3），
+    视频动画与字幕动画也一样叫这个名字。绝不要按容器 type 筛元素类别 —— 用
+    `animations[].material_type`（`sticker` / `video` / `""` / 缺席）和 `animations[].panel`。
+  animation_entry: >-
+    animations[]{id, type, resource_id, path, material_type, duration, name, category_name, category_id,
+    source_platform, third_resource_id, request_id, panel, start, platform, anim_adjust_params}
+    （r3 出现次数：id/type/resource_id 10,563、path 10,553、material_type 10,514、duration 10,354、
+    name 9,393、category_name 8,877、category_id 8,846、source_platform 8,707、third_resource_id 8,253、
+    request_id 5,004、panel 4,006、start 3,577、platform 3,529、anim_adjust_params 3,523）
+  types: [in, out, loop, caption, group]        # r3 实测 5 类；r1/r2 规格只记了前三类
+  types_count: {in: 8388, loop: 1587, out: 303, caption: 158, group: 129}
+  type_reading: >-
+    `caption` = 文本面板的「字幕动画」子 tab（向下弹出 / 放大弹动 / 文字裂开 / 渐显II，
+    `category_name` 常为 字幕动画）；`group` = 视频动画面板的「组合」类（缩放 / 荡秋千 / 波动放大 / 分身，
+    `panel` 恒为 `video`）。此前把「组合」解释成 loop 与 in+out 并存、把「字幕」解释成
+    lyrics_template + ktv_color，两条都不成立（见 ../evidence/findings.md F-020 批次、panel-map 对应行）。
+  categories_observed: >-
+    `category_name` 混了五种写法：中文名（收藏 3,626 / 入场 1,978 / 循环 246 / 出场 145 / 组合 26 /
+    字幕动画 52）、空串 2,411、拼音（ruchang 128 / chuchang 3 / xunhuan 2）、英文（in 126 / group 88 /
+    out 41 / loop 3）、繁体（進場 4）。命名与匹配都不能假设单一语言，`""` 与缺席要当「未分类」。
+  adjust_params_status: anim_adjust_params 存在 3,523 条，**全部是空数组** —— 语料里没有预设参数的用户覆盖值。
+  name_is_not_identity: >-
+    **同名不是同一预设**：`animations[].name` 只是显示文案，唯一身份是 `resource_id`（配合 `path` 尾段 md5）。
+    r3 里 `渐显` 这一个名字对应三个不同 id（69 / 66 / 51 条），包内实现并不相同；一条 2026-10-28 的成片
+    同时用了两族 —— 字幕族 `6724916044072227332`（包内 `Appear.lua`）、视频族 `6798320778182922760`
+    （包内 `Transform.lua` + `filter.material` + `xshader`），`material_type` / `panel` 也不同。
+    ⇒ 读侧 match 必须落在 `resource_id`；写侧不得把「名字对得上」当能力证明；
+    按名近似仍是常规路径（U-21 覆盖率 36.6%），但必须标注「近似」（见 `approx_by_name`）。
+  implementation_tiers: >-
+    本机实测的三档成本（`docs/evidence/unresolved.md` U-91）：已实现的三个预设恰好都是
+    「4 文件 + 1 lua + 无 shader」的纯 `fromTo` 预设（向下滑动/缩小/渐显）；其余 9 个要么带自定义
+    shader（T1/T2）、要么走 AE 导出脚本（T3，需要脚本语义而不只是数学）。
+    判据同一条：区域 MAD 的「开动画更近 / 更远」计数（F-080/P-33），T3 还需先与包内脚本逐帧对数。
+  curve_source: >-
+    **曲线值不在草稿字段里，在预设包内的明文 lua 里**（F-078）。形如
+    `tween:fromTo(target, {["localPosition"]=Amaz.Vector3f(0.0, 2.66 * textureH / screenH, 0.0)}, {…},
+    0.1, Amaz.Ease.quadOut, …)`，位置在 `Cache/effect/<resource_id>/<md5>`（本机 33/33 全在）。
+    读取与求值实现见 `scripts/animation_curve.py`；`Amaz.Ease.quadOut` 的函数式是**假设**（引擎 Ease 表
+    不在包内），由成片判。覆盖度要写清楚：`<草稿A>` 的 14 个预设里只有 3 个
+    （向下滑动/缩小/渐显）用 `fromTo` 声明，其余走 AE 导出脚本或 `onUpdate` 显式数学。
+
+timing:                                         # 渲染必需，此前规格完全没记
+  unit: 微秒；`duration` 是预设时长，`start` 是该动画在片段内的起始偏移
+  duration_is_not_the_curve: >-
+    **`duration` 不等于曲线跑完的时间**：本时间线 `duration` 是 0.5 s 的预设槽长，而包内 lua 的
+    tween 参数是 **0.1 s**（= 3 帧 @30fps）。按 `duration` 取测量窗会把 3 帧的真实差摊到 15 帧上，
+    整帧相关的中位数因此几乎不动（P-30 第一版犯的错，就地更正）。判可见差要用 tween 时长。
+  source: temp/corpus-detail/animation_timing.csv（r3，按类型聚合，可重跑）
+  duration_ranges:
+    in: {min_us: 33333, max_us: 4200000, distinct: 135}
+    loop: {min_us: 0, max_us: 5000000, distinct: 64}
+    out: {min_us: 0, max_us: 3100000, distinct: 32}
+    group: {min_us: 100000, max_us: 4700000, distinct: 55}
+    caption: {min_us: 533333, max_us: 3000000, distinct: 51}
+  start_rule: >-
+    **非零 `start` 只出现在 out（108 条）与 group（10 条）上**；in / loop / caption 的 `start`
+    要么缺席要么为 0（`start_nonzero=0`）。缺 `duration` 键的条目也存在（r2 口径：in 51 条、out 56 条、
+    loop 47 条、caption 55 条，`temp/check-1016/probe.txt`），此时才需要回落到预设包
+    `extra.json.setting.animation_duration`（单位秒）。
+  live_sample: >-
+    10月16日 草稿的视频片段同时挂了三个动画：入场「渐显」duration 500000、出场「渐隐」start 600000
+    duration 500000、组合「形变缩小」start 500000 duration 100000 —— 一次实测三种时序形态。
+    单样本，仅供理解字段，不作为分布依据。
+
+frequency_note:                            # verified，且是重要提醒
+  nameless_in: 1418                        # name 为空串
+  nameless_loop: 867
+  nameless_out: 25
+  name_literal_null: {caption: 56, out: 53, loop: 2, in: 1}   # name 真的是 JSON null
+  total_animation_entries: 10563
+  meaning: >-
+    大量动画条目没有 name（或 name 为 null）。这类多半是默认淡入淡出/循环，而非具名预设。
+    渲染器不得假设 name 一定存在，也不得把「无 name」当错误。
+  r1_caveat: >-
+    r1 把「空串 name」与「null name」记成两套数（nameless_in 2836 与 missing_name_value_None {in:1228}），
+    既有翻倍问题又混淆了两种取值，故本表整体重测；具名预设的相对次序也变了（弹簧现在高于「弹入」）。
+
+top_presets_by_count:                      # (type, name, resource_id) → 出现次数（去重内容口径）
+  - {type: in,  name: 向上弹入,   resource_id: "7123116334677758501", count: 717,  phase1: yes}
+  - {type: in,  name: 日出,       resource_id: "6779084126457696776", count: 443,  phase1: yes}
+  - {type: in,  name: 左移弹动,   resource_id: "7313890082040058406", count: 246,  phase1: yes}
+  - {type: in,  name: 弹簧,       resource_id: "6884154692398486023", count: 229,  phase1: yes}
+  - {type: in,  name: 弹入,       resource_id: "6887482184844710413", count: 227,  phase1: yes}
+  - {type: in,  name: 收拢,       resource_id: "6779879712261935619", count: 225,  phase1: yes}
+  - {type: in,  name: 波浪弹入,   resource_id: "6917178744775905806", count: 220,  phase1: yes}
+  - {type: in,  name: 缩小 II,    resource_id: "7041836555903701540", count: 182,  phase1: yes}
+  - {type: loop, name: 颤抖 III,  resource_id: "7070036604429013535", count: 148,  phase1: partial}
+  - {type: in,  name: 左上弹入,   resource_id: "7078586233030447629", count: 141,  phase1: yes}
+  - {type: in,  name: 向上翻转,   resource_id: "7194703971498332727", count: 140,  phase1: yes}
+  - {type: in,  name: 打字光标,   resource_id: "7237411357514011192", count: 少量, phase1: yes, note: 已实测其包内 TextAnim.lua 为明文}
+  - {type: in,  name: 呐喊声波,   resource_id: "7199943069385364005", count: 少量, phase1: no, note: 含贴图粒子，属特效类}
+distinct_presets_total: 417                # 键 =(type,name,id)；把 category_name 也计入则是 606（r3；r2 是 416/605，见 F-019/F-020）
+
+preset_package_layout:                     # verified（实测一个入场包）
+  files:
+    - config.json
+    - content.json
+    - extra.json
+    - anim.prefab
+    - "<ClassName>.lua"
+    - Sprite2D.xshader
+    - Sprite2D.material
+    - "gles2_*.vert"
+    - "gles2_*.frag"
+    - "*.png"
+    - "*.png.meta"
+  config_json: '{"effect": {"Link":[{"type":"InfoSticker"}]},"version":"6.6.0"}'
+  content_json: '{"filemap": {"prefab":"anim.prefab"}}'
+  extra_json: '{"setting": {"animation_duration":2.0}}'      # 单位：秒
+  prefab: >-
+    YAML（%YAML 1.1 / !Prefab）：entities[].components[] 里 __class: ScriptComponent，
+    path 指向 Lua 脚本（如 TextAnim.lua），className 指明入口（TextAnim），
+    properties.spriteMaterial 指向 .material。
+  lua_header_protocol: >-
+    脚本首行用注释声明可调参数：`--@input float duration = 1.5{"widget":"slider","min":0.1,"max":6.0}`，
+    随后是常量（如 spriteScaleConst=0.7、spriteRotateSpeed=-250、charScale=0.6、charOffset=-0.6）。
+    参数区间直接写在声明的 JSON 里，可用于 UI 与自动复现。
+  shader: gles2_*.frag 明文，例如打字光标用 `c*curalpha` 与边缘 smoothstep 羽化
+
+resolution_chain:
+  - "先展开路径宏：`path` 可能是 `##_draftpath_placeholder_<uuid>_##/…`（全语料 1,311 / 2,050 份内容在用，共 58,108 次），它指向**草稿自己的目录**，既不是绝对路径也不是安装目录（F-024）。不展开就会「包不存在」。"
+  - 用 animations[].path 直接定位包目录（若存在）
+  - 否则用 resource_id 在 Cache/effect/<resource_id>/<md5>/ 下查找
+  - 缺 md5 时可用第三方目录表补：`(resource_id, md5)` 就是包目录名，实测有效（../evidence/cross-reference.md 第 3 节）
+  - 路径可能指向历史安装位置（实测见 <DRIVE_D>/设计软件\JianyingPro\9.4.0.13603\... 之类的旧路径）→ 必须按 basename/resource_id 重查
+  - 包不存在时按 name 关键词近似（渐显/渐隐/弹入/缩放/打字/翻转/抖动…），并在渲染层标注「近似」
+  - 本机缓存只覆盖 36.6% 的可定位预设（U-21）→「按名近似」是常规路径而非异常路径
+
+approx_by_name:                            # 无包时的兜底映射（phase-1 只保证语义方向正确，不保证曲线一致）
+  渐显: opacity 0→1
+  渐隐: opacity 1→0
+  弹入: scale 0.5→1 + 弹性缓动
+  缩小: scale >1→1
+  放大: scale <1→1
+  打字机: 按 characters 逐字可见（与 words[] 联动，未定）
+  向上弹入: transform.y 由下向上归位 + 弹动
+  抖动: transform 小幅随机位移（loop）
+
+t2a_laws:                                 # verified（F-086，2026-10-24）：包内三个文件逐行读到，非推测
+  # 分层口径见 `evidence/tables/animation_tiers.csv`（脚本 scripts/animation_tiers.py）：
+  # T0 曲线可求值 3 预设/8 段；**T1 0 段**（放宽 fromTo 读取器这条路已空）；
+  # T2a 2 预设/15 段（frag 单采样、无循环 ⇒ **不需要执行 GLSL**）；T2b 1/2；T3 6/8。
+  向上露出:
+    package: Cache/effect/7163514358935327268/3786ff3f…   # TextAnim.lua + rt.vert + rt.frag
+    kind: in
+    duration_ms: 500
+    animated_uniform: eraseUV        # vec2，**唯一的动画量**
+    law: |
+      TextAnim:seek(time):
+        height_cut = rectH / texH1                     # 静态：文字 rect 高 ÷ 扩展 rect 高
+        eraseUV    = (0,1) * (1 - ease(time/duration)) # 1 → 0
+        ease = 闭式三次贝塞尔 controls {0,0,0.5,1}：
+               getBezierTfromX 用二分反解 x→t（until te-ts < 0.0001），再取 value[2] 插值
+      rt.vert:  uv0.y = (1.0 - uv0.y) + eraseUV.y      # ⇒ **动画在顶点阶段**：贴图垂直滚动 + y 翻转
+                uv0.x = uv0.x + eraseUV.x
+      rt.frag:  texture2D(_MainTex, uv0)
+                * step(uv0.y, 1.)
+                * step(uv.y, 1. - (1.-height_cut)*0.5*0.8)   # 裁剪用**未滚动**的 uv ⇒ 窗口固定
+    semantics: 文字在一个不动的窗口里向上滑出（遮罩 + 平移），不是透明度、不是缩放
+    needs_glsl: false
+    implement:
+      offline_channel: 把文字画进「扩展框」后按 eraseUV.y·texH 做 y 偏移采样，
+                       再按 thr = 1-(1-height_cut)*0.4 裁行（PIL 侧等价于 crop + paste）
+      browser_channel: Container + 固定 Graphics mask + 文字 y 偏移（不需要 Filter）
+      renderToRT: 引擎实现细节（time ≤ duration 时把文字画进 RT），**效果层不需要跟着做**
+    caution: |
+      分层只看 frag 的采样次数会「结论对、理由错」：本例 frag 只是固定裁剪，动画量在 .vert。
+      已给 animation_tiers.py 加 `vert_scroll`（uniform 是否进顶点着色器的 uv 赋值）；
+      实测 向上露出 / 侧滑 / 向上闪入 = 1。
+  打字光标:
+    package: Cache/effect/…/12196518b89652860631d196d19b6f45   # TextAnim.lua 14098B + kiss.png(+meta)
+    #   + gles2_yvsong.frag / gles2_bvcwvg.vert + Sprite2D.material/.xshader（**那是光标的 shader，不是文字的**）
+    #   + anim.prefab / config.json / content.json / extra.json / effect_platform_children.tag
+    kind: in
+    segments: 14                       # 全时间线 33 段里的 42%，是最大的单块欠口
+    structure_verified: |
+      函数表（实测全文）：constructor / reset / CheckChinese / isDigital / isAlphabet /
+      getCharPt(char_index,time) / checkDirty(time) / onStart / refreshrandomTime /
+      onUpdate(comp,deltaTime) / getavePosy / getavePosX / getaveWidth / getcuralpha /
+      seek(time) / setDuration / resetData / clear / onEnter / onLeave。
+      表字段：FirstCharOfRow、action_time、random_tween_time(+1)、sprites、tweens、imageSize、editor。
+      材质写入只有三处：`setFloat('alpha',1.0)`、`setFloat('curalpha',1.0)`、
+      `setFloat('curalpha', self.curpt or 1.0)`，外加 `setTextWrapper(text)`。
+    semantics: |
+      **不是 shader 阻塞**（F-085 的 frag 语义判据也把它列在 T2a）：`curalpha` 是文字材质上的
+      **一个逐字阈值**——等价于「前 N 个字可见，第 N+1 个字按小数部分渐显」。
+      所以两通道都能**不跑 GLSL** 实现：通道 2 = 按可见前缀子串绘制 + 边界字按小数 alpha；
+      浏览器 = 同一套（子串或按字边界放 mask），不需要 Filter。
+      光标是**另一个 sprite**（kiss.png + 自带 frag/vert，−250°/s 旋转），属于叠加层，不是文字通道。
+    hard_parts:                        # 这些才是真成本，逐条列清楚免得下一轮重新发现
+      - refreshrandomTime ⇒ 逐字出现时刻带**随机表**（random_tween_time / +1），
+        没找到种子 ⇒ **逐帧精确匹配成片可能不可达**，只能匹配「整体节奏 + 单调性」
+      - CheckChinese / isDigital / isAlphabet + getaveWidth/getavePosX/getavePosy
+        ⇒ 光标位置按**字符类别宽度启发式**算，需要与我们的字体度量对齐
+      - FirstCharOfRow ⇒ 换行处首字特殊处理（行边界判定）
+      - checkDirty(time) + seek(time) ⇒ 有**状态**，不是纯函数：跳播/回头要可重入
+    status: 未实现；**按独立特性排产**（自带验证），不是「补一条曲线」的量级
+    verified: structure-only
+
+verification:
+  method: 用 <DRIVE_E>/输出 成片逐帧比对位移/缩放/透明度曲线（M2）
+  note: 曲线本身可从 Lua 读出，成片用于确认我们对该 Lua 的理解是否正确

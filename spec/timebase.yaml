@@ -1,0 +1,67 @@
+# 时间基准、单位与标识符
+# 证据等级标注：verified=≥2 路独立证据；single=单源待验证；open=未解决
+# 实测出处：temp/corpus-detail/{root_flags.csv,...}、temp/corpus-scan/csv/*，见 docs/evidence/findings.md F-005/F-010
+
+timebase:
+  unit: microseconds                     # verified
+  note: >-
+    顶层 duration 与所有 timerange 均为微秒整数字符串值。语料实测 duration 数字位数集中在
+    7–9 位（如 3813333），与「秒 × 1e6」一致。
+    第二方见证（F-047）：安装包内置 agent 的草稿协议 `xmldraft/v1` 明文写「所有时间属性只接受不带单位后缀的
+    裸数字，统一按毫秒解释，`us/ms/s/min/m` 后缀均非法」——**XML 层用毫秒、JSON 层用微秒，两层相差 1000 倍**。
+    本项目直接读写 draft JSON，不涉及该换算；若将来要对接 agent 的 selection_expression，必须按 ×1000 转换。
+  digit_histogram: {7: 246, 8: 1419, 9: 157, 10: 18, "1": 73, "5": 3, "6": 2}   # 快照 2026-10-16；1/5/6 位是极短或占位 duration
+
+timerange:
+  shape:
+    start: integer|absent                # 缺省含义为 0
+    duration: integer
+  start_absent_rate:                     # 判据：segment.target_timerange 是否含 start 键（按去重内容）
+    segments_total: 51718
+    start_present: 47422
+    start_absent: 4284                   # 8.3%
+  rule_read: 缺失的 start 在归一化模型中补 0
+  rule_write: 序列化时不得新增 start 键，不得把补出来的 0 写回   # verified（与参考文档一致）
+  fields_seen:
+    target_timerange: 51718               # 时间线占位（每个 segment 都有）
+    source_timerange: 37242              # 素材取材区间（部分类型为 null 占位，键仍存在）
+    render_timerange: 40934              # 渲染区间，独立于 target；**其中 6,009 条真有两键内容**、34,925 是 `{}`、缺席 10,784 → 不能当占位忽略（语义待 M2）
+
+speed:
+  location: segment.speed                # verified；materials.speeds 多为无值 stub
+  relation: target_timerange.duration == source_timerange.duration / speed
+  measured:                              # speed → 实测 ratio，与 1/speed 吻合
+    - {speed: 1.3,          src_us: 3813333, tgt_us: 2933333, ratio: 0.769231}
+    - {speed: 0.8749998,    src_us: 3033333, tgt_us: 3466667, ratio: 1.142857}
+    - {speed: 1.0808824,    src_us: 4900000, tgt_us: 4533333, ratio: 0.92517}
+    - {speed: 0.4625851,    src_us: 2266666, tgt_us: 4900000, ratio: 2.161765}
+    - {speed: 1.4444445,    src_us: 4766667, tgt_us: 3300000, ratio: 0.692308}
+  common_values: [1.1, 2.0, 1.15, 1.2, 1.5, 1.35, 5.0, 0.9, 3.0, 0.5, 0.99]
+  curve_speed: 变速曲线（curve_speed）在 phase-1 之外        # open：字段形状未清点
+
+frame_quantization:
+  status: single
+  note: >-
+    边界值呈 1e6/fps 的近似整数倍（观测到大量以 333/667/000 结尾的微秒值，与 30fps 的
+    33333.33µs 一致）。定位/比对需留容差，参考文档给 ±40ms；本项目在 M2 用成片实测收紧。
+  tolerance_us: 40000
+
+fps:
+  present_rate: {absent: 1365, "30.0": 646, "50.0": 25, "60.0": 11, "30": 2, "24.0": 1}   # 按 r3 的 2050 份去重内容
+  rule: 缺省时不得假设 30fps；渲染需显式回落策略并记录来源   # open：回落取值待标定
+
+identifiers:
+  format: str(uuid.uuid4()).upper()      # verified（观测：08EE1046-C761-4910-982F-E592A688AEBF 等）
+  stability: 常规保存不改变已有 ID
+  clone_rule: 克隆时间线时只生成一个新 ID，并做「整值精确匹配」递归替换；禁止全局文本替换
+  opaque: ID 无语义，不得从 ID 推断类型
+  id_fields:
+    segment: [id, material_id]
+    segment_refs: extra_material_refs    # 指向各 material bucket 的辅助 stub
+    material: [id, material_id, constant_material_id, origin_material_id, local_material_id, local_id]
+
+counts:                                  # 快照 2026-10-16（r2）
+  drafts_dirs: 1475
+  content_files: 2215                    # draft_content.json 实例（按文件；另有 .bak / template*.tmp 未计入，见 layout.yaml 副本普查）
+  distinct_contents: 2050                # 按内容 sha256 去重——本文件所有 segment/内容计数都用这个口径（r3）
+  parse_failed: 0

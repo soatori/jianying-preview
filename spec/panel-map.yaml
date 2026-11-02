@@ -1,0 +1,255 @@
+# 剪映属性面板 ↔ 草稿字段映射
+# 来源：用户提供的 20 张面板截图（画面/音频/变速/动画/调整 四个 tab 逐控件）对照 2,215 份内容文件（2,050 份去重内容，r3 快照 2026-10-16）的实测键名
+# **本文件里的 count 一律标口径**：写「（r3）」的是去重内容口径；没标的多为当时的 700 份抽样或 r1 翻倍口径，正由 `temp/check_counts.py` 逐行清理（见 findings F-020）
+# **文本 tab 的控件映射见下方 `文本.基础` / `文本.位置` / `文本.背景发光阴影` / `文本.动画`**（按用户 2026-10-16 的 6 张面板截图逐控件录入）；
+# 文本字段的语义、取值域与换算细节仍在 spec/text.yaml -> ui_panel_mapping，两处冲突时以本文件的控件归属为准、以 text.yaml 的字段细节为准
+# 置信：verified=字段与控件语义双向对上（键名+取值枚举互证）；likely=按 bucket 用途与键名推断，需确认；open=未定位
+# 确认方法（按便宜程度排序）：① 拿面板截图上的 UI 数值去语料反查（见 evidence/findings.md 的位置单位标定）
+#                          ② 同一草稿改一个控件 → 保存 → 对比全部副本解码后的 diff
+
+panel_tabs: [字幕, 文本, 动画, 跟踪, 朗读, 数字人]      # 顶层 tab 实测顺序（截图）；本文件按 画面 / 文本 / 音频 / 变速 / 动画 / 调整 分节
+panel_tabs_covered: [画面, 文本, 音频, 变速, 动画, 调整, AI 编辑]
+
+画面.基础:                       # 视频/图片片段
+  位置大小.缩放:      {path: segment.clip.scale.x/.y, conf: verified}
+  位置大小.等比缩放:  {path: segment.uniform_scale, conf: verified, note: "segment 级，不在 clip 内（C-001）；`on` 缺席=勾选、`value==x/y` 为比例缓存，结案 U-42；四种形态与语义见下方 文本.位置.等比缩放、F-023 与 F-027"}
+  位置大小.位置X/Y:   {path: segment.clip.transform.x/.y, conf: verified, note: "只有 x,y 无 z；**渲染律（F-035 导出实测）：位移px = 值 × 该轴边长 / 2**；面板算术（F-032/F-033）：显示值 = 值 × 该轴边长，**除数是各轴自己的边长，不是固定 1920**（1920x3414 画布上 y 按 3414 有 64.59% 整数、按 1920 只 8.99%）；原点=画布中心、**y 轴向上为正（负值向下）**、锚点=字框中心；**面板单位 = 2× 真实像素**（U-51）；double 精确，不经 float32。**改画幅不重写浮点**（成对观测：9:16 键入的 `100/1080` 到 16:9 仍是它，面板显示 178 = round(177.78)）→ **面板整数是 round 出来的显示值，不是存值**，且 `canvas_config` 是 per-timeline 的（F-033，结案 U-49）。锚点 -0.4427083333 × 1920 = -850 与 UI 精确吻合，见 text.yaml ui_panel_mapping"}
+  位置大小.旋转:      {path: segment.clip.rotation, conf: verified}
+  位置大小.圆角:      {path: "materials.video_radius[].radius", conf: verified, count: 70, note: "另有 resource_id/resource_name → 圆角样式资源"}
+  混合.混合模式:      {path: 'materials.effects[] where type=="mix_mode"', conf: verified, count: 166, note: '"正常" = 不存在该 effect 条目（去重内容口径，82 份内容；r1 记 332 属翻倍口径）；10 个内置模式见 tables/mixmode_glsl.csv'}
+  混合.不透明度:      {path: segment.clip.alpha, conf: verified, count: "12,586（r3 clip_fields.alpha；旧值 25,276 属 r1 翻倍口径）"}
+  变形.拖拽变形四角:  {path: "materials.manual_deformations[].{vertex_list_path, manual_deformation_paths, intensity, hardness, size, protection}", conf: likely, count: 10}
+  抠像 tab:           {path: 'materials.chromas[].{color, intensity_value, shadow_value, spill_value, edge_smooth_value, should_transfer_color} + videos.matting.{has_use_quick_brush, has_use_quick_eraser, expansion, feather, reverse, strokes[], custom_matting_id, enable_matting_stroke, flag, path, interactiveTime, mask_video_path}', conf: verified, count: "58 / 15097", note: "色度抠像走 chromas（type 枚举 chroma，关键帧 KFTypeChromaIntensity）；智能抠像/画笔擦除走 videos.matting，笔迹在 strokes[]（内含 resource_id/color/adjust_params/path）"}
+  蒙版 tab:           {path: "materials.common_mask[]（内置形状）/ materials.masks[]（资源蒙版）", conf: verified, note: "判别字段是 common_mask.category：video=画面蒙版(321) / adjust=调色范围蒙版(70)；type=mask(321)/none(68)/**空串(2)** —— 空串那 2 条来自 10月16日 草稿的 adjust 蒙版，渲染层要把 `\"\"` 也当「无」处理（F-018 更新）；自定义轮廓走 contour_path(9)，文字蒙版走 text_config(388 全带)，跟踪走 track_segment(3)+video_trackings"}
+  蒙版参数单位:        {conf: verified, note: "config 为归一化值：centerX/centerY ∈ [-1,1]（面板 0 ↔ 0）、rotation 为度（[-360,325]）、feather 0–1、roundCorner 0–0.88、width/height 中位数 0.500/0.498 → **两轴均按画布宽度归一**，面板「宽540 高538」在 1080×1920 下即 0.5/0.498，故 px = value × canvas_config.width（与位置单位 px = transform × 对应轴尺寸 不同除数，见 U-08）；完整键集含 expansion（面板未Shown 的「扩展」，对应 KFTypeCommonMaskExpansion）"}
+  美颜美体 tab:       {path: "videos.{beauty_face_auto_preset, is_unified_beauty_mode, is_set_beauty_mode} + effects.type∈{figure,makeup_root}", conf: likely, count: "12870 / 36599 / 2567"}   # 去重内容口径；r1 的 28252/73046/5162 属翻倍口径
+  描边（画面侧）:     {path: "materials.video_strokes[]：{id, type, enable_video_stroke, resource_id, path, resource_name, source_platform, color, adjust_params[]}", conf: verified, count: "r3 语料 2 条带开关（均为占位形）；2026-10-18 差分补 1 条完整形", note: "**结案 U-39（F-027）：画面描边是资源包效果，不是标量字段**。类型选「无」时只有 `{id,type,enable_video_stroke,resource_id:\"\",path:\"\"}`——语料里「只有开关」的真相就是类型还停在「无」。选「单层描边」后补出 `resource_id`/`path`/`resource_name`/`source_platform:1`/`color`/`adjust_params[]`，形状与 `effects[]` 同类。换算：`color == [1.0, R, G, B]`（`#12AB34`→`[1.0,0.0705882,0.6705882,0.2039216]`，**首位不是 alpha**）；`adjust_params.effects_adjust_size == UI 大小 ÷100`（27→0.27）、`effects_adjust_alpha == UI 不透明度 ÷100`（60→0.6）、`min_scale` UI 不暴露（默认 320.0）；每项带 `default_value` 恰等于 UI 默认，可当校准锚点。描边「类型」（无/单层/发光/虚线/手绘）= 不同 `resource_id`，**不是枚举字段** → 复现必须解析 `Cache/effect/<rid>/<md5>` 资源包。此前本行写的 `videos.video_mask_stroke{...}` 是**蒙版描边**（`segment.enable_mask_stroke` 门控），单层/发光/虚线/手绘 = 它的 `type` 分支（实测 `mask-stroke-single`）那条结论仍归蒙版侧用"}
+  阴影（画面侧）:     {path: "materials.video_shadows[].{color, alpha, ambiguity, distance, angle, enable_video_shadow, resource_id, resource_name, path, source_platform, id, type}", conf: verified, count: "2 条带参数（两份不同草稿，逐项同值）", note: "**已定案（F-021，结案两会话之争）**：画面侧「阴影」面板 = `materials.video_shadows[]`。面板读数 不透明度30% / 模糊度10% / 距离5 / 角度-30° ↔ `alpha:0.3 / ambiguity:0.1 / distance:0.05 / angle:-30` → **距离 = UI/100**、模糊度键名是 **`ambiguity`**（全语料仅 2 条带参，都在 11.6 草稿且取值相同，很可能是面板默认值被写两次，故换算系数仍是单点）。`videos.video_mask_shadow{color,alpha,blur,distance,angle}` 是**蒙版阴影**（16,634 个视频 material 里 8,498 只是 `{path,resource_id}` 占位、仅 7 条带参数，且带参数与 `segment.enable_mask_shadow` 单向配对，见 U-38），两者键名差异 blur vs ambiguity 就是分工证据。渲染器：画面阴影读 `video_shadows`；两者写回都不得删"}
+  视频防抖:           {path: "videos.stable.{stable_level, time_range{start,duration}, matrix_path}", conf: verified, count: 2005, note: "防抖等级=stable_level；matrix_path 是分析矩阵缓存（绝对路径，可能失效）"}
+  一键画质提升:        {path: "videos.video_algorithm.quality_enhance.{level, from}", conf: verified, count: 1971, note: "from 记录触发入口"}
+  超清画质:           {path: "videos.video_algorithm.super_resolution", conf: verified, count: 433, note: "等级子键在本轮 700 份抽样里未展开到"}
+  画面降噪:           {path: "videos.video_algorithm.noise_reduction.level", conf: verified, count: 1920, note: "强度 弱/中/强 = level；「模型 本地」对应 algorithms[]{type, algorithm_id, req_key, node_output} 的本地/云选择，待确认"}
+  视频去频闪:         {path: "videos.video_algorithm.deflicker.{mode, level}", conf: verified, count: 1906, note: "类型 荧光灯 = mode；等级 推荐 = level"}
+  运动模糊:           {path: "videos.video_algorithm.motion_blur_config.{blur, blend, multiple_blur}", conf: verified, note: "模糊程度=blur、融合程度=blend(实测 0.01–1.0)、模糊次数=multiple_blur；**「模糊方向(双向)」未在此子对象内找到键** → open"}
+  智能补帧:           {path: "videos.video_algorithm.complement_frame_config.mode + smart_complement_frame", conf: verified, count: "1559 / 419", note: "下拉「光流法」= mode 取值；根级 complement_frame_config（6 份）是另一处"}
+  智能运镜:           {path: "videos.video_algorithm.{ai_motion_driven, gameplay_configs[]}", conf: likely, count: "419 / 1537", note: "原 effects type==video_animation(22) 数量太少，改判为玩法族"}
+  玩法/卡点预设:       {path: "videos.video_algorithm.gameplay_configs[].{algorithm, algorithm_id, algorithm_type, gameplay_metatype, gameplay_name, resource_id, path, adjustable_config}", conf: likely, count: 1537, note: "adjustable_config 实测键 {speed, beat_gear, beat_source, outpainting_ratio, is_flatten_reference, strength, prompt, stopmotion_first_render_time, stopmotion_gap_duration, lightwave_repeat_duration} → 变速卡点(闪光/摇晃模糊/闪黑变焦/复古运镜/彩虹) 与 智能裁剪比例 都走这里"}
+  AI 其它:            {path: "videos.video_algorithm.{ai_background_configs, ai_expression_driven, mouth_shape_driver, aigc_generate, story_video_modify_video_config, ai_in_painting_config}", conf: likely, note: "眼神修正 最可能是 ai_expression_driven / mouth_shape_driver（各 419）；背景填充 AI 变体=ai_background_configs(433)"}
+  智能打光:           {path: "materials.smart_relights[].{light_mode, albedo_color, albedo_intensity, albedo_rate, albedo_alpha, glow_intensity, light_sources, preset_id}", conf: verified, count: 100, note: "面板四个子页 基础面光/氛围彩光/创意光效/预设 ↔ light_mode + preset_id"}
+  镜头追踪:           {path: "materials.video_trackings[].{tracker_type, trackers, enable_video_tracking, enable_scale, enable_relative_distance, tracking_time_range, map_path, result_path}", conf: verified, count: 182, note: "面板四个图标 = tracker_type 分支"}
+  智能裁剪:           {path: "materials.smart_crops[].{apply_source, cache_path} + gameplay_configs[].adjustable_config.outpainting_ratio", conf: likely, count: 4, note: "目标比例 疑为 outpainting_ratio（实测该键存在于 adjustable_config）；画面稳定/位移速度 仍未定位"}
+  背景填充（模糊/颜色/图片）: {path: "materials.canvases[].{type, blur, color, image, image_id, image_name, album_image}", conf: verified, count: "条目 16,541 个 / 1,839 份内容（r3）；blur 带值 5,823、color 4,880、image/image_id/album_image/image_name 各 4,856", note: "type 枚举（r3）canvas_color 14,837 / canvas_blur 1,613 / canvas_image 33 / none 9；**面板四张缩略图 = blur 的四档实测取值 {0.0625, 0.375, 0.75, 1.0}**（另有 0.0=关；canvas_blur 里 0.375 占 1,491）；画布底色另有根级 canvas_config.background"}
+
+画面.转场:                        {path: "materials.transitions[]，挂在**前一个** segment 的 extra_material_refs", conf: verified, count: "703 份去重内容 / 2184 具名"}
+画面.AI 特效与场景特效:            {path: 'materials.effects[]（type 谱系 22 类）+ materials.video_effects[]', conf: verified, count: "70718 组合 / 752 份"}
+
+# ============================ 文本 tab（用户 2026-10-16 六张面板截图，逐控件） ============================
+# 顶层 tab 顺序实测为：字幕 / 文本 / 动画 / 跟踪 / 朗读 / 数字人；文本 tab 内子 tab：基础 / 模板 / 气泡 / 花字
+文本.tab结构:
+  文本.基础:  {path: "materials.texts[] + content.styles[]", conf: verified}
+  文本.模板:  {path: "materials.text_templates[]（450 份）+ texts.caption_template_info{resource_id,path,effect_id,resource_name,category_id,category_name,is_new,source_platform,third_resource_id}", conf: verified}
+  文本.气泡:  {path: "texts.combo_info{text_templates[]} + materials.text_templates[]", conf: verified}
+  文本.花字:  {path: "styles.effectStyle{id,path} → Cache/artistEffect/<rid>/<md5>/effectStyle.json", conf: verified, count: 3596}
+  应用到全部字幕复选框: {path: "texts.is_batch_replace", conf: likely, count: 26, note: "计数极低，需一次差分确认；也可能是纯 UI 行为不落盘"}
+  文案推荐与AI写旁白: {path: "根 function_assistant_info（2950 份）/ smart_ads_info（2954 份）", conf: likely}
+
+文本.基础:                                   # 第一张截图
+  文本内容:       {path: "materials.texts[].content（JSON 字符串）→ .text", conf: verified}
+  字体:           {path: "styles.font{id,path}；扁平 texts.font_path/font_resource_id/font_title/font_id/font_name/font_category_id/font_team_id/font_url", conf: verified, note: "path 直指 Cache/effect/<rid>/<md>/*.ttf 或安装内 Resources/Font/{SystemFont,Effect}"}
+  字号:           {path: "styles.size（int 6333 / float 1547 两型并存）+ 扁平 font_size", conf: verified, note: "**结案 U-26（2026-10-18 同段配对）**：1:1 无换算，UI 13 → `font_size:13.0` + `styles[].size:13`。**但权威是 `styles[].size`，`font_size` 只是镜像**：语料 4.8% 整键缺席、两键都在时 97.2% 等于 `styles[0]`、317 条与所有段都不等、11.3% 是多段样式（F-034）"}
+  样式B/U/I:      {path: "styles.bold / styles.underline / styles.italic；扁平 bold_width / italic_degree / underline / underline_width / underline_offset", conf: verified}
+  颜色:           {path: "styles.fill.content.solid.color [r,g,b] 0..1", conf: verified, keyframe: KFTypeTextColor, note: "fill.alpha(1265) 与 solid.alpha 并存，优先级 U-02"}
+  字间距:         {path: "texts.letter_spacing", conf: verified, count: "7,867（r3 内容口径；旧记 1968 属抽样）"}
+  行间距:         {path: "texts.line_spacing", conf: verified, count: 7034, note: "UI 显示 0 时 draft 为 0.02 → 0.02 疑为内部基准值"}
+  对齐方式:       {path: "texts.alignment（单字段互斥枚举：左 0 / 中-水平 1 或删键 / 右 2 / 上 3 / 下 4。r3：21,086 个字幕 material 里 7,729 条带该键，取值 1:7,158 / 0:460 / 2:61 / 3:42 / 4:8）", conf: verified, note: "**逐枚已钉死**（2026-10-19 差分 E5，6 条字幕各点一枚按钮）：左/右/上/下 写 `0/2/3/4`，**两枚居中都不写值 —— 结果是整键消失**；`clip.transform` 恒 `{0,0}`，版面位置由 alignment 单字段承载，渲染器要自己算且不能拆成 x/y 两轴。语料里 `1` 占九成是**版本差异不是第三种状态**：带键材料中 `1` 的占比 ≤8.0 = 96.99%、≥8.7 = 3.06%、11.6.0 = 0（`../evidence/tables/alignment_by_version.csv`，F-031）→ `absent` 与 `1` 同一个居中态。10月16日 草稿整键缺席即默认"}
+  预设样式:       {path: "texts.preset_id/preset_name/preset_category/preset_category_id/preset_index/preset_has_set_alignment + text_preset_resource_id", conf: verified, count: "preset_id / preset_name / preset_category / preset_category_id / preset_index / preset_has_set_alignment / text_preset_resource_id 各 7,364（r3，七键同现）"}
+
+文本.位置:                                   # 第二张截图「位置大小」+「混合」+「描边」
+  缩放:           {path: "segment.clip.scale.x/.y（1.0 = 100%）", conf: verified}
+  等比缩放:       {path: "segment.uniform_scale", conf: verified, note: "segment 级，不在 clip 内（C-001）。四种写入形态并存（r3）：`{}` 18,010 / `{on:true,value:1.0}` 12,467 / null 4,325 / 缺席 16,875 / `{on:false}` 35。**结案 U-42（2026-10-18 三段差分，F-027）**：`on` 用**缺席**表示 true（等比关才写 `on:false`）；`value` 是 **clip.scale.x / clip.scale.y 的比例缓存**（12,465 命中、8 过期），只在等比开着时维护——关掉等比后 `{on:false}` 连 `value` 键都不写，再开回来写 `{value: x/y}`（实测 1.3/0.7 → 1.8571428571428574）且**不改写 `clip.scale`**：UI 单滑杆读写 x、y 留旧值，`value` 即恢复比例 y·value=x。渲染时用 x 覆盖两轴还是 (x, y·value) 判不了 → U-44。详见 F-023 与 F-027"}
+  位置X/Y:        {path: "segment.clip.transform.x/.y", conf: verified, note: "**渲染律（F-035）：位移 = 值 × 该轴边长 / 2，y 向上为正（负值向下）**；面板算术（F-032）显示值 = 值 × 边长（各轴自己的边长，非固定 1920），实测 -0.4427083333 × 1920 = -850 与截图吻合、而导出里它落在中心**下方 425 px**；整数率 y 52.09%、x 12.84% @1080x1920（水平位置主要由 `alignment` 承载，F-031）。改画幅只改显示不改存值，面板是 round 后的显示值（F-033）"}
+  平面旋转:       {path: "segment.clip.rotation（度，实测域 -215..360）", conf: verified, keyframe: KFTypeRotation}
+  旋转行右侧圆形控件: {path: open, conf: open, note: "截图里 0.00° 右边还有一个小圆形控件，未定位（U-31）"}
+  画布对齐按钮组:  {path: open, conf: open, note: "U-32。**responsive_layout 已排除**：r3 实测只有三种形态 —— `{}` 34,926（不带任何键）、五键 16,689（五键全为默认）、缺席 103，全语料没有第四种取值，所以两种写入形态都不承载按钮状态。旧表述「16,689 条全部为默认」是以偏概全（F-020 更正）；也**不要用版本号划界**：五键只见于 ≤8.0，但 8.0.0/5.9.0 两种并存、≥8.7 只见 `{}`"}
+  混合.不透明度:   {path: "segment.clip.alpha（0..1，0.5 = 50%，从不 >1）", conf: verified, count: "12,586（r3）", keyframe: [KFTypeGlobalAlpha, KFTypeAlpha], note: "文本面板的「混合」组只有不透明度一项，无混合模式下拉；混合模式是画面侧的 effect(type=mix_mode)。另有 `texts.global_alpha`(7,788) 与 `texts.text_alpha` 两个扁平侧键，与 clip.alpha 的优先级未定（并入 U-02 同类问题）"}
+  描边.颜色:       {path: "styles.strokes[].content.solid.color", conf: verified, note: "**只有数组侧是载体**；扁平 `border_color` 在 5 条开关组合不同的字幕里恒为 `#000000`，是遗留镜像，不能用来判开关（F-029）"}
+  描边.不透明度:   {path: "styles.strokes[].alpha；扁平 border_alpha", conf: verified, note: "仅 278/1183 显式给出 → 缺省即 1（UI 100%），keyframe KFTypeBorderAlpha"}
+  描边.粗细:       {path: "styles.strokes[].width", conf: verified, note: "UI 40 ↔ draft 0.08 → 系数 500，**三个独立样本复现**（2026-10-19 成对差分是第三个）。扁平 `border_width` 同样恒 0.08、不随开关变化 → 遗留镜像（F-029）"}
+  描边.模式:       {path: "styles.strokes[].mode（666 次带键，**全部是 0**；其余 5,532 条整键缺席）", conf: open, note: "面板无对应控件（U-24）。2026-10-19 的成对差分**仍未产生第二值**（新开的描边还是 mode 0）→ 判不了，需要两种描边外观各存一份（F-026、F-029）"}
+
+文本.背景发光阴影:                            # 第三、四、五张截图
+  背景.样式:       {path: "texts.background_style（int，两枚预设缩略图）", conf: verified, count: "7,483（r3；实测取值 0:7,313 / 1:148 / 2:21 → 0 是默认，非「未设置」）"}
+  背景.颜色:       {path: "texts.background_color", conf: verified, count: "8,967（r3）"}
+  背景.不透明度:   {path: "texts.background_alpha", conf: verified, count: "7,496（r3）"}
+  背景.圆角:       {path: "texts.background_round_radius", conf: verified, count: "7,436（r3）"}
+  背景.高度:       {path: "texts.background_height", conf: verified, count: "7,607（r3）"}
+  背景.宽度:       {path: "texts.background_width", conf: verified, count: "7,611（r3）"}
+  背景.上下偏移:   {path: "texts.background_vertical_offset", conf: verified, count: "7,381（r3）"}
+  背景.左右偏移:   {path: "texts.background_horizontal_offset", conf: verified, count: "7,371（r3）"}
+  背景.默认值:     {conf: verified, note: "上述字段为 null 时面板显示 100%/0%/14%/14%/50%/50% → 14%、50% 是**由文字度量推导**的默认，渲染器必须内置，否则未设背景的字幕会多出一块背景"}
+  背景.内边距:     {path: "texts.inner_padding（5,529 次，r3；面板未单列）", conf: likely}
+  发光.开关:       {path: "materials.effects[] 中 type==\"bloom\" 条目被片段 extra_material_refs 引用", conf: verified, note: "F-017 差分定案，2026-10-19 成对差分补因果：关发光时 `check_flag` bit64(64) 同步清零，且**不写任何 texts 字段**（F-029，结案 U-28）。`styles.bloom` 恒 null 只是 schema 占位"}
+  发光.样式两枚:   {path: "effects[].resource_id / effect_id + name", conf: verified, note: "两枚样式现在各有一个 id：**外发光 = 7202576698775179837**（F-017 差分样本，已不在当前快照里，只在 `temp/bloom-probe/`）、**轮廓光 = 7202575978646737469**（10月16日 草稿，是 r3 快照内唯一一条 `type==bloom`）"}
+  发光.颜色:       {path: "effects[].bloom_params.color（\"#RRGGBB\"）", conf: verified}
+  发光.强度:       {path: "effects[].bloom_params.strength", conf: verified, note: "UI 30 ↔ 0.3、**UI 50 ↔ 0.5**（2026-10-19 同一份草稿的第二个同样本）→ ×100"}
+  发光.范围:       {path: "effects[].bloom_params.range", conf: verified, note: "UI 20 ↔ 0.2、**UI 40 ↔ 0.4**（第二个同样本）→ ×100"}
+  发光.垂直角度:   {path: "effects[].bloom_params.dir_y", conf: open, note: "**11.6 没有这个控件**（面板只有 颜色/强度/范围 + 两枚预设瓦片），恒 0.5 无输入口；F-016 截图读的是四格版本 → 需带角度控件的版本才能判（U-27 已改判）"}
+  发光.水平角度:   {path: "effects[].bloom_params.dir_x", conf: open, note: "同 dir_y，11.6 无控件（U-27）"}
+  发光.面板身份:   {path: 'effects[].panel_id（本例 "tool_text_glow"）', conf: verified, note: "**面板身份字段**：r3 实测它在 **19,492** 个 effect 条目上存在，其中 **19,491 条是空串**，唯一非空就是这条发光（旧记的「21433 个」是 r1 翻倍口径）。同一批条目上 `bloom_params` 也是 19,492 条存在、19,491 条为 null（挂在 figure 8,984 / brightness 1,577 / makeup_root 1,251 等**与发光无关**的类型上）→ **绝不能用「bloom_params 键存在」判发光**，只能看 `type==\"bloom\"` 或 `panel_id` 非空（F-022）"}
+  阴影.开关:       {path: "styles.shadows[] 非空", conf: verified, note: "**唯一权威判据**。`check_flag` bit32(32) 与之因果同步（F-029 抓到双向翻转），但反向不充分 —— 语料里 bit32 置位者 1,279 条没有 shadows[]。`texts.has_shadow` 是粘性近指标（728 条 true 却无数组），别当开关（U-48）"}
+  阴影.颜色:       {path: "styles.shadows[].content.solid.color；扁平 shadow_color", conf: verified}
+  阴影.不透明度:   {path: "styles.shadows[].alpha；扁平 shadow_alpha", conf: verified, note: "UI 90% ↔ 0.9；keyframe KFTypeShadowAlpha"}
+  阴影.模糊度:     {path: "styles.shadows[].diffuse；扁平 shadow_smoothing", conf: likely, note: "UI 15% ↔ 0.025 → 候选 ×6（单样本）"}
+  阴影.距离:       {path: "styles.shadows[].distance；扁平 shadow_distance", conf: verified, note: "UI 5 ↔ 5.0 **1:1**，推翻参考文档「em 相对且 /100」。**精度两条路径不同**：数组侧实测 `4.999999523162842`（float32 往返）、扁平侧精确 `5.0` → 跨路径相等判定必须带容差（F-029）"}
+  阴影.角度:       {path: "styles.shadows[].angle；扁平 shadow_angle", conf: verified, note: "UI -45° ↔ -45 1:1。扁平另有 shadow_point{x,y}，它是 **(cos,sin)(shadow_angle) × 0.18 × shadow_distance 的预计算缓存**（r3 实测幅度 19,847 命中 / 963 过期 / 266 无可用距离，方向 20,834 命中 / 21 不符）；旧注「0.6364,-0.6364 = 角度×距离」不准，那是 alpha=0.9 与 0.18×5 撞值。渲染只读 distance/angle/alpha，写回必须重算 shadow_point（F-023）"}
+  阴影.厚度投影:   {path: "styles.shadows[].thickness_projection_{enable,angle,distance}（1992 次）", conf: likely, note: "面板未见对应控件"}
+  弯曲.开关:       {path: "texts.text_curve.enable", conf: verified}
+  弯曲.弯曲程度:   {path: "texts.text_curve.angle", conf: verified, note: "直接给度数（样本 83.265 ↔ UI 72° 同型）"}
+
+文本.动画:                                   # 第六张截图（动画 tab：入场/出场/循环/字幕）
+  子tab.入场:      {path: 'material_animations[].animations[] where type=="in"', conf: verified, note: "415 种预设，按频次见 tables/animations_top60.csv"}
+  子tab.出场:      {path: 'animations[] where type=="out"', conf: verified}
+  子tab.循环:      {path: 'animations[] where type=="loop"', conf: verified}
+  子tab.字幕:      {path: 'material_animations[].animations[] where type=="caption"（r3 实测 158 条，category_name 常为「字幕动画」，如 向下弹出 / 放大弹动 / 文字裂开 / 渐显II）', conf: verified, note: "**归属改判（F-020 批次）**：字幕动画子 tab 的落点就是动画条目的第 5 个 type，不是 lyrics_template/ktv_color。`texts.lyrics_template{resource_id,path,...}`、`texts.ktv_color`（7,568 条带，`\"\"` 7,262 / `#FF0000FF` 234 / `#0022FFFF` 71 / 1 条 `#BC00FFFF`）、`segment.lyric_keyframes`、`materials.text_templates` 属于**歌词/逐字配色**那一族（U-05），跟这个子 tab 不是一回事。注意 10月16日 草稿里**字幕片段**引用的动画条目，`material_type` 写的也是 `sticker`（渐显/颤抖 II/渐隐三条全是） —— 所以 material_type 不能当元素类型判据"}
+  条目「无」:      {path: "该 type 下 animations[] 无条目 / name 为空", conf: verified, note: "实测 name 缺失的条目很多（去重内容口径：in 1418 / loop 867 / out 25，另有 name 真为 null 的 caption 56 / out 53）→ 不得假设 name 存在"}
+  预设名示例:      {conf: verified, note: "截图可见 字影渐显 / 打字光标 / 向上弹入 / 放大 / 打字机V / 圆柱体滚动 / 呐喊声波 / 向右模糊II / 缩小II，均与语料 animations[].name 同型；向上弹入 717 次为最高频具名入场（r1 记 1454 属翻倍口径）"}
+  下载角标:        {path: "animations[].path 指向的 Cache/effect/<rid>/<md5> 在本机不存在", conf: verified, note: "预设包本机覆盖率 36.6%（U-21）；缺包时按 name 近似并标注（spec/animations.yaml approx_by_name）"}
+  曲线与时长:      {path: "预设包内 anim.prefab(YAML) → ScriptComponent path=<X>.lua（明文源码，首行 --@input 声明参数区间）+ gles2_*.frag；时长在 extra.json.setting.animation_duration（秒）", conf: verified}
+
+音频.基础:
+  音量:            {path: "segment.volume（+ last_nonzero_volume）", conf: verified, count: "volume 22,702 / last_nonzero_volume 18,719（r3）"}
+  淡入时长/淡出时长: {path: "materials.audio_fades[].{fade_in_duration, fade_out_duration}", conf: verified, count: "3104 / 1832", note: "**只有这两个键载值**；`fade_type` / `in_type` / `out_type` 是**整键缺席**而不是 null —— 2026-10-28 单例里全 materials 搜不到这三个键（条目形态只有 `{id,type,fade_in_duration,fade_out_duration}`，两段配乐淡入 1.0 s / 淡出 3.0 s，引用挂在**片段**的 `extra_material_refs` 上）。按 `fade_type` 找「有没有淡入」会一律判否，写回也不该为了补齐生成这三个键"}
+  响度统一:        {path: "materials.loudnesses[].{target_loudness, loudness_param, enable, time_range}", conf: verified, count: 3828, note: "面板「已统一至目标响度 -12 LUFS」= target_loudness"}
+  音频降噪:        {path: "materials.realtime_denoises[].{denoise_rate, sami_type, is_denoise, denoise_mode}", conf: verified, count: 7024}
+  人声美化:        {path: "materials.vocal_beautifys[].{ambient_sound_level, voice_change_mode, enable}", conf: verified, count: 3046}
+  声音分离（人声/乐器，仅保留人声）: {path: "materials.vocal_separations[].{choice, removed_sounds, production_path, final_algorithm}", conf: verified, count: "19224 / 7162"}
+  变调（半音/音分）: {path: "materials.audio_pitch_shifts[].semitones", conf: verified, count: 2, note: "语料稀少；音分可能是同一字段的小数部分，需差分确认"}
+  立体声平衡（左右声道）: {path: "materials.sound_channel_mappings[].audio_channel_mapping", conf: verified, count: "条目 29,283 个 / 1,846 份内容；audio_channel_mapping 带键 8,813、is_config_open 8,814（r3）"}
+  声道配置:        {path: "materials.sound_channel_mappings[].{audio_channel_mapping, is_config_open}", conf: verified, count: "条目 29,283 个 / 1,846 份内容；audio_channel_mapping 带键 8,813、is_config_open 8,814（r3）"}
+音频.换音色:       {path: 'materials.audio_effects[].{vc_type, speaker_id, is_vc_clone_tone, audio_adjust_params}', conf: verified, count: "112 / 200 / 6"}
+音频.声音效果:     {path: "materials.audio_effects[]（category_id/category_name/name/resource_id）", conf: verified, count: 230}
+音频.节拍/卡点:    {path: "materials.beats[].{ai_beats, user_beats, gear, gear_count, mode, enable_ai_beats}", conf: verified, count: "26334 / 8360"}
+
+变速.常规变速:
+  倍数:       {path: "segment.speed（权威）+ materials.speeds[].speed", conf: verified, note: "target = source / speed 实测成立"}
+  时长:       {path: "segment.target_timerange.duration（派生，不得手改）", conf: verified}
+  声音变调:   {path: open, conf: open, note: "候选 speeds.mode / audio_pitch_shifts；实测 mode 只有 {0,1} 两个值且与曲线变速模式强相关（见下），故更可能在别处 → 一次差分可定"}
+  智能补帧:   {path: "videos.video_algorithm.complement_frame_config.mode（+ smart_complement_frame）", conf: verified, note: "下拉「光流法」= mode 取值；根级 complement_frame_config（6 份）是另一处入口"}
+变速.模式判别: {path: "materials.speeds[].mode", conf: verified, note: "r3 全量实测枚举 **0: 8,810 / 1: 298**（旧记的 {0: 2132, 1: 33} 是 700 份抽样口径）→ 0=常规变速、1=曲线变速。但 `mode` 与 `curve_speed` 都只存在 **9,109** 个条目上，而 speeds 条目总数 29,376，其余是整组缺席的 stub；`speeds.speed` 存在 11,680 条、其中 8,293 为 1.0、3,387 为非 1 真值，且**凡出现必然等于 segment.speed**（11,680/11,680，relations.csv）→ 倍速仍以 segment.speed 为权威，speeds 是它的镜像（C-011）"}
+变速.曲线变速: {path: "materials.speeds[].curve_speed.{id, name, speed_points[]{x, y}, source_platform}", conf: verified, count: "9,109 条带 curve_speed（r3）", note: "**预设名直接落在 curve_speed.name**（无/自定义/蒙太奇/英雄时刻/子弹时间/跳跃/闪进/闪出）；曲线即 speed_points 点列，x=片段内相对时间、y=倍速（面板纵轴 0.1x–10x 即 y 域）。**旧注「曲线条目 33 个 = mode==1 的 33 份，两者互证」作废**：全量是 9,109 条 curve_speed 对 298 条 mode==1，两个数根本不相等，模式判别与曲线不能互相当证据（U-31 旧口径来源见 F-020 批次）"}
+变速.变速卡点: {path: "videos.video_algorithm.gameplay_configs[].adjustable_config.{beat_gear, beat_source, speed} + materials.beats[]", conf: likely, note: "闪光/摇晃模糊/闪黑变焦/复古运镜/彩虹 属玩法族资源（resource_id + gameplay_name）；beats.gear/gear_count 承载卡点档位"}
+
+动画.入场/出场: {path: 'materials.material_animations[].animations[] where type∈{in,out}', conf: verified, count: "417 种预设（键 type,name,id；含 category 则 606）；曲线在预设包明文 Lua + GLSL", note: "条目 type 全集是 **in 8,388 / loop 1,587 / out 303 / caption 158 / group 129**（r3）；容器 `material_animations[].type` 恒为 `sticker_animation`，别拿它筛元素。渲染必需但规格此前没记的两个键：`duration`（10,354 条，微秒）与 `start`（3,577 条，**非零只出现在 out 108 / group 10**）—— 值域见 `spec/animations.yaml` 的 timing 节与 `temp/corpus-detail/animation_timing.csv`"}
+动画.组合:      {path: 'material_animations[].animations[] where type=="group"（r3 实测 129 条，`panel` 恒为 `video`，category_name 为「组合」或 `group`，具名如 缩放 / 荡秋千 / 荡秋千 II / 波动放大 / 分身 / 旋出渐隐 / 形变缩小）', conf: verified, note: "**改判**：旧表述「loop 与 in+out 并存的条目」不成立 —— 组合是动画条目的第 5 个独立 type，且 `start` 可以非零（129 条里 10 条带非零 start，`animation_timing.csv`）。循环保留 `type==\"loop\"`（1,587 条）"}
+动画.收藏/全部:  {path: "资源侧（rp.db 表在本机为空，收藏状态不落草稿）", conf: verified}
+
+调整.基础（色温/色调/饱和度/自然饱和度/亮度/对比度/高光/阴影/白色/黑色/光感/锐化/清晰/颗粒/褪色/暗角）:
+  path: 'materials.effects[] 逐滑块一条，type ∈ {temperature, tone, saturation, natural_saturation, brightness, contrast, highlight, shadow, white, black, light_sensation, sharpen, clear, fade, vignetting}'
+  conf: verified
+  note: >-
+    与 effects.type 实测枚举逐项吻合（计数见 tables/effects_type_values.csv）。material_colors 只有 id
+    （r3：**11,307 个条目里只有 1 个**带 `solid_color/gradient_*/width/height/is_gradient/is_color_clip`），所以调色滑杆不在 material_colors 里 —— 修正常见假设。
+    唯一未匹配上的控件是「颗粒」，疑为 particle(86) 或某 adjust 子键。
+  keyframes: "effects_adjust_{size,intensity,vertical_shift,horizontal_shift,color,blur,speed,texture,filter,range,background_animation}"
+调整.HSL:      {path: "materials.hsl[].{hsl_color_type, custom_color, hue, saturation, lightness, interacting, constant_material_id, version, path, resource_id, lumi_hub_path}", conf: verified, count: "条目 10,910 个 / 939 份内容（r3）；hue 2,501、saturation 5,018、lightness 2,866、interacting 7,770", note: "三个通道值是**整数**（可到 ±100，如 saturation=-100 有 229 条）；`constant_material_id` 是 HSL 关键帧的绑定钥匙（F-024/U-43）"}
+调整.曲线.RGB: {path: "materials.color_curves[].{red, green, blue, luma, link_status, select_channel}", conf: verified, count: 688}
+调整.曲线.色相饱和度/色相与色相/亮度饱和度…: {path: "materials.hsl_curves[].{hue_hue, hue_lum, hue_sat}", conf: likely, count: "3 个条目 / 2 份内容（r3）", note: "每个通道是 `{anchor{x,y}, left_control{x,y}, right_control{x,y}}` 的控制点数组（实测 6 点，x 步长 1/6、y=0.5 为基线）。`hue_lum`/`hue_sat` **只由 10月16日 草稿带入**，是单样本；其余二维曲线（如 sat_lum 之类）在语料里仍未见"}
+调整.色轮:     {path: "materials.log_color_wheels[].{shadow, midtone, highlight, offset, intensity}", conf: verified, count: 64, note: "面板下拉「log色轮」即此 bucket；四盘 阴影/中间调/高光/偏移 + 强度(intensity，截图 100) 逐项对应；每盘 R/G/B 三值 0.00 为盘内三元组"}
+调整.色轮（二级）: {path: "materials.primary_color_wheels[].{lift, gamma, gain, offset, intensity}", conf: verified, count: 6}
+调整.蒙版（调色范围）: {path: 'materials.common_mask[] where category=="adjust"', conf: verified, count: 69, note: "与画面蒙版同一 bucket，靠 category 区分；形状枚举 线性/镜面/圆形/矩形/文字 + 两个画笔(自定义轮廓，contour_path)；category_name 实测 基础 208 / 全部(对应Loki All分类) 66；**enable_adjust_mask / enable_video_mask 不是蒙版开关**（引用蒙版的片段里 enable_adjust_mask=False 114 次、None 98 次，组合无规律），不要用它们判生效"}
+
+关键帧通则:
+  ui: "面板每个控件右侧的 <◇> 按钮"
+  path: "segment.common_keyframes[]，每个可打帧的控件对应一个 property_type"
+  conf: verified
+  measured: 70                                 # r3 `stats.json -> keyframe_property_types`（旧值 51 与 spec/keyframes.yaml 曾写的 51 同源，均已改）
+  examples:
+    位置: [KFTypePositionX, KFTypePositionY]
+    缩放: [KFTypeScaleX, KFTypeScaleY]
+    旋转: [KFTypeRotation]
+    不透明度: [KFTypeGlobalAlpha, KFTypeAlpha]
+    蒙版: [KFTypeCommonMaskPositionX, KFTypeCommonMaskPositionY, KFTypeCommonMaskFeather, KFTypeCommonMaskSizeWidth, KFTypeCommonMaskSizeHeight, KFTypeCommonMaskRotation, KFTypeCommonMaskExpansion, KFTypeCommonMaskRoundCorner, KFTypeContourPath]
+    音量: [KFTypeVolume, KFTypeLastVolume]
+    文字样式: [KFTypeTextColor, KFTypeBorderAlpha, KFTypeBackgroundAlpha, KFTypeShadowAlpha]
+    调色: [KFTypeBrightness, KFTypeContrast, KFTypeHue, KFTypeFilter, KFTypeColorMatch, KFTypeSmartColorAdjust, KFTypeChromaIntensity, KFTypeVignetting, KFTypeLightSensatione, KFTypeSharpen]
+    特效参数: "effects_adjust_* 共 11 种"
+
+# ===================== 编辑器状态（面板之外，根级 config）=====================
+根级config状态:
+  path: "draft_content.config{}"
+  conf: verified
+  measured_keys:
+    - maintrack_adsorb
+    - "zoom_info_params{zoom_ratio, offset_x, offset_y}"
+    - "export_range{start, duration}"
+    - subtitle_sync
+    - "subtitle_taskinfo[]{id, type, language, is_local_asr, ai_accurate_recognize_enable, remove_invalid_task_id}"
+    - subtitle_recognition_id
+    - lyrics_sync
+    - lyrics_taskinfo
+    - lyrics_recognition_id
+    - "subtitle_keywords_config{styles, is_change_font_size, subtitle_template_original_font_size, subtitle_template_font_size, subtitle_template_keywords_original_font_size, font_size_ratio}"
+    - combination_max_index
+    - adjust_max_index
+    - sticker_max_index
+    - original_sound_last_index
+    - record_audio_last_index
+    - extract_audio_last_index
+    - video_mute
+    - material_save_mode
+    - "attachment_info[]{class_name, file_name}"
+  note: >-
+    这些是**编辑器会话状态与识别任务缓存**（时间线缩放、导出范围、各类最大序号、ASR/歌词任务表、字幕模板字号比），
+    不是片段视觉参数：不参与渲染，写回时原样保留。`*_max_index` 在新增条目后可能需要同步递增（M3 待验证）。
+    注意 `config.subtitle_keywords_config` 与 `materials.texts[].subtitle_keywords_config` 同名不同层，别混。
+
+未定位（open）:
+  - 画面侧「阴影」归属**已结案**（F-021）：载体是 `materials.video_shadows[]`，`videos.video_mask_shadow/stroke` 是蒙版侧。残留：画面**描边**的参数体仍无落点（U-39）
+  - 画面侧「描边」**已结案**（F-027/U-39）：`video_strokes[]` 是资源包效果，参数在 `color` + `adjust_params[]`，UI÷100，类型=不同 `resource_id`。残留：`audio_pannings[]` 的左右平衡值仍未定位
+  - 文本侧**新发现的写回不变式**（U-45）：片段可带「单帧关键帧骨架」轨道（每属性一条、`keyframe_list` 长度 1），改标量字段时骨架帧值同步变化，轨道还会随等比开关被新建/删除 → 只改标量即为静默不一致
+  - 文本发光/阴影/描边的**参数面板在 11.6 里没找到**（U-27/U-28 阻塞）：`基础` 无这些控件，`气泡`/`花字` 是在线预设画廊；发光载体 `effects[] type=bloom` 带 `panel_id="tool_text_glow"`，参数面板需特效资源就位
+  - 运动模糊的「模糊方向（双向）」键名
+  - 变速「声音变调」开关落点
+  - 调整→基础 的「颗粒」与「肤色保护」；超清画质的等级子键；智能裁剪的 画面稳定/位移速度
+  - "`##_draftpath_placeholder_<uuid>_##/` 宏里的 uuid 身份（U-41）—— 宏本身已确认 = 草稿自身目录，1,311/2,050 份内容在用"
+  - 对齐按钮组落点（U-32）—— 候选 `responsive_layout` 已被 U-06 定案排除（16,689 条全默认、`enable:false`）
+  - 面板单位换算剩余项：圆角 `video_radius.radius` 范围、`clip.alpha` 与 UI 百分比的对应（文本侧已实测 0.5=50%，画面侧待同样确认）
+  - 文本侧遗留：`strokes[].mode` 语义（U-24）、「位置大小」旋转行右侧第二个圆形控件（U-31）。
+    已结案：字号↔`styles.size`（U-26，1:1 无换算，F-027；`font_size` 只是镜像，F-034）、对齐方式 6 按钮↔`alignment`（U-30，左 0/右 2/上 3/下 4、居中删键，F-031）
+  - 已解决（2026-10-16 差分实验，F-017）：发光 = `materials.effects[]` 中 `type=="bloom"`（name 外发光），
+    参数在 `bloom_params{color,strength,range,dir_x,dir_y}`，并带**面板身份字段** `panel_id`（本例 `tool_text_glow`）；
+    `styles.bloom` 恒 null 只是 schema 占位，不是承载者。残留：角度↔dir 映射（U-27）、`check_flag` bit64（U-28）
+  - 方法提醒：`effects[].panel_id` 一旦非空就是控件↔字段的直连线索，后续映射优先查它
+
+agent_declared_units:      # 2026-10-21 新增（F-049）：剪映自带 agent 的展示 schema 里成批写明的「面板值 ↔ 引擎值」量纲
+  evidence_level: single（**一路**证据：`skills/jianying.hub.studio_lyra_xml_timeline_builder_v2/references/*`
+    与 `skills/skill-creator/references/editing/*` 是同一份 schema 的两份生成物，后者只是中文显示名，
+    两者不能互相当第二路；和语料/成片实测合起来才算 verified）
+  caveat: >-
+    这些是 **xmldraft/v1 的写作面量纲**，不是草稿 JSON 的存储量纲。XML 别名与 draft 键的映射在
+    `videoeditor.dll` 里、本机读不到（F-047），所以下面凡标「对应草稿键」的都是按名称+值域+单位推的，
+    实现时要按被测对象复核（U-65）
+  conversions:
+    - 原声音量 volume：面板 0..1000、默认 100，「100 保持原始音量、200 为两倍幅度、30% 写裸数 30」（segment-visual.md:253）
+      → 草稿侧 segment.volume 官方模型层默认 **1** ⇒ 面板值 = 草稿值 × 100
+    - 片段不透明度 alpha：0..1 裸数，「50% 写 value="0.5"，不写 50」（segment-visual.md:33）→ 与 `clip.alpha` 同量纲
+    - 文字不透明度 text_alpha：0..1、默认 1（segment-text-sticker.md:79）；**阴影 alpha 却是百分制滑杆**「30% 写 30」（:131/:163）
+      → 同一个「不透明度」词在三个位置三种量纲，别类推
+    - 滤镜强度 filter.intensity：0..100 面板百分值，「70% 写 70，不写 0.7 或 70%」（segment-visual.md:131）；
+      特效**没有**通用整体强度，只能写 `slider_params` 里资源声明的 key（segment-effects.md:22）
+    - 画布背景模糊 canvas.blur：0..1 裸数，四档 0.0625 / 0.375 / 0.75 / 1，未指定时运行时默认 **0.75**（segment-visual.md:76）
+      → 对应 `canvases[].type=canvas_blur`（1,620 条，F-048）；这是 4 档离散值，不是连续滑杆
+    - 描边（抠像描边）：size/alpha/distance/shadow/texture 全 0..100 面板滑杆，size 缺省 **35**（segment-visual.md:167/:190）
+      → 映射 `effects_adjust_{size,distance,texture}`；与 F-027 的「视频描边 UI ÷ 100」同族但量纲不同（那边是 0..1）
+    - 抠像 feather / expand：**双量纲**，普通视频图片 feather 0..100、expand -20..20；模板媒体槽两者都 0..1000（segment-visual.md:168）
+    - 蒙版 feather：0..1，官方分档 0..0.05 近硬边 / 0.06..0.12 常规 / 0.13..0.2 明显 / 0.21..0.3 强融合，
+      并明确「禁止套用 matting 的 0..100 或 0..1000 量纲」（segment-visual.md:143/:152）
+    - 阴影模糊：面板 → 引擎 **÷ 600**（0..100 → 0..1/6），实测印证见 U-03 结案（F-049）
+    - 字间距 / 行间距：面板滑杆裸数，「用户说 10 就写 10，不折算成 0.1 或像素」（segment-text-sticker.md:122/:123）
+      → 注意官方模型层的 flat 默认是 `letter_spacing=0`、`line_spacing=0.2`，**0.2 是引擎侧不是面板侧**，两层不同量纲
+    - 字号 size：**剪映字号数值**，明说「不是像素或画布百分比」「size=160 不能当 160 像素」（segment-text-sticker.md:66/:77）
+      → 与 U-07 的 `em_px = size × width × 0.00574` 不冲突：size 是无单位面板数，em 才是像素
+    - 倍速 speed：「写 1.25 表示 1.25 倍，不写 125」（timeline.md:108）；text/subtitle/sticker **禁止**写 time.speed
+    - 旋转 rotation：**顺时针为正、逆时针为负**，角度裸数（transform.md:89）；蒙版 rotation 同向（segment-visual.md:156）
+    - 时间：协议一律裸毫秒，`us/ms/s/min/m` 后缀非法（timeline.md:92）→ 草稿 JSON 是微秒，两层 **×1000**
+    - 位置归一化的**第三条**见证是代码不是文档（F-052）：贴纸/文字模板读回包围盒后执行 `x/2 + 0.5`（left/right/top/bottom 四个都这样）⇒ 归一化盒 `[-1,1]` 线性映射到 `[0,1]`，1 个单位 = 半画幅。与 F-035 导出实测、F-049 协议声明三处一致，`/2` 现在是源码级事实

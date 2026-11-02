@@ -1,0 +1,78 @@
+# materials bucket 总览（实测 42 个；r3 起按去重内容口径，n=2050，快照 2026-10-16）
+# 计数单位：出现在多少份**去重内容**中；r1 的数值按文件计且被根别名翻倍（见 ../evidence/findings.md F-019），r2→r3 的真实漂移见 F-020
+# 42 不是封闭集合：bucket 名只多不少，新增项一律先登记再解释
+# 完整键表见 ../evidence/tables/bucket_keys_top80.csv；render=是否影响画面；phase=实现阶段（1 字幕+画面 / 2 音频 / 3 特效贴纸 / skip 调色或暂不做）
+
+buckets:
+  speeds:                {drafts: 1848, render: indirect, phase: 1, note: "可整键缺席（17,696 条无 speed 键），但带值时必然等于 segment.speed（11,680/11,680，relations.csv）；不是无值 stub，见 C-011"}
+  sound_channel_mappings: {drafts: 1846, render: no,       phase: 2, note: "`type` 只有 {none 26,011 / 空串 3,272}；剪映内置 agent 造草稿时把所有 mapping 直接写成 none（安装包源码实测，F-047/F-048 同向）"}
+  vocal_separations: {drafts: 1846, render: no,       phase: 2}
+  videos: {drafts: 1841, render: yes,      phase: 1, note: "素材主记录：path/width/height/crop/matting/stable/freeze/reverse_path/check_flag/local_material_id。`type` 实测 {video 15,402 / photo 1,230 / image 2}（顶层口径；含嵌套口径另见 gif 1）⇒ **图片不另设 bucket，就在 videos 里以 photo 存在**（F-048）"}
+  canvases: {drafts: 1839, render: yes,      phase: 1, note: "画布背景：type/blur/color/image/image_id。`type` 实测 {canvas_color 14,879 / canvas_blur 1,620 / canvas_image 33 / none 9}（F-048 补枚举）"}
+  material_animations: {drafts: 1623, render: yes,      phase: 1, note: "入场/出场/循环动画，见 animations.yaml。条目 `type` **恒为 `sticker_animation`（34,828 条无一例外）**，真正的分类在 `animations[].type` = {in 8,388 / loop 1,587 / out 303 / caption 158 / group 129}（F-048）"}
+  placeholder_infos: {drafts: 1401, render: no,       phase: skip, note: "占位信息，可能与草稿替换/模板相关（未定，U-36）"}
+  texts: {drafts: 1330, render: yes,      phase: 1, note: "字幕主记录，见 text.yaml。`type` 实测 {subtitle 17,718 / text 3,307 / lyrics 60 / none 1} —— 这是「字幕 / 普通文字 / 歌词」的判别字段，此前规格漏记（F-048）"}
+  audios: {drafts: 1306, render: no,       phase: 2, note: "`type` 实测五种：{sound 7,069 / video_original_sound 3,062 / music 1,302 / text_to_audio 1,143 / extract_music 166}。**旧行写「material type 值为 music 而非 audio（single）」是错的**：music 只占 1,302 条，最多的是 sound（音效）与 video_original_sound（原声）；`audio` 是轨道类型名，不是 material type 值（F-048 更正，根因见 findings）"}
+  beats: {drafts: 1298, render: no,       phase: 2}
+  drafts: {drafts: 1262, render: yes,      phase: 1, note: "复合片段：内嵌一整个草稿结构，需递归展开（verified）。`type` 实测 {combination 4,657 / composition 439}（条目口径，此前规格未记）⇒ 复合片段有两种，展开与写回前要先看这一位（F-048）"}
+  material_colors: {drafts: 1213, render: yes,      phase: skip, note: "调色，按用户要求跳过（只记录不渲染）"}
+  effects: {drafts: 997,  render: yes,      phase: 1, note: "含 type=mix_mode（混合模式，166 次 / 82 份内容）；其余 type 多为调色/美颜 → skip"}
+  hsl: {drafts: 939,  render: yes,      phase: skip}
+  audio_fades: {drafts: 927,  render: no,       phase: 2}
+  loudnesses: {drafts: 803,  render: no,       phase: 2}
+  transitions: {drafts: 705,  render: yes,      phase: 1, note: "2184 种具名转场，见 ../evidence/tables/transitions_top60.csv"}
+  time_marks: {drafts: 459,  render: no,       phase: skip, note: "时间标记/打点"}
+  video_effects: {drafts: 366,  render: yes,      phase: 3, note: "`type` = {video_effect 687 / face_effect 84}；被 effect 轨（466/79）与 mixed 轨（21/5）引用（F-048）"}
+  realtime_denoises: {drafts: 357,  render: no,       phase: 2}
+  text_templates: {drafts: 222,  render: yes,      phase: 3, note: "文字模板（花字模板成套），与 Resources/aigc_text_template 相关。`type` = {text_template 805 / text_template_subtitle 30 / text_template_lyrics 1}（F-048）"}
+  common_mask: {drafts: 197,  render: yes,      phase: 1, note: "内置形状蒙版，390 个条目；config{width,height,centerX,centerY,feather,rotation,invert,roundCorner,aspectRatio,expansion} + contour_path + text_config（不止 align_type，还带 font_name/font_path/font_resource_id/bold_width/char_spacing/content/font_size/has_underline/italic_degree/line_gap/scale）"}
+  stickers:              {drafts: 187,  render: yes,      phase: 3}
+  placeholders: {drafts: 154,  render: no,       phase: skip, note: "与 placeholder_infos 是两个不同 bucket。`type` 恒为 `adjust`（483 条），被 adjust 轨引用 473、mixed 轨 10 ⇒ 它就是「调色/调节轨」的片段主记录（F-048）"}
+  vocal_beautifys: {drafts: 143,  render: no,       phase: 2}
+  color_curves: {drafts: 115,  render: yes,      phase: skip}
+  audio_effects:         {drafts: 26,   render: no,       phase: 2}
+  video_trackings:       {drafts: 21,   render: yes,      phase: 3}
+  masks:                 {drafts: 21,   render: yes,      phase: 1, note: "资源蒙版，46 个条目；config 实测带全 centerX,centerY,feather,aspectRatio,width,height,invert,rotation,roundCorner + resource_id + position_info"}
+  chromas:               {drafts: 14,   render: yes,      phase: 3, note: "色度抠像"}
+  log_color_wheels:      {drafts: 11,   render: yes,      phase: skip}
+  shapes:                {drafts: 9,    render: yes,      phase: 3}
+  smart_relights:        {drafts: 7,    render: yes,      phase: 3}
+  manual_deformations:   {drafts: 5,    render: yes,      phase: 3}
+  primary_color_wheels:  {drafts: 4,    render: yes,      phase: skip}
+  video_radius:          {drafts: 3,    render: yes,      phase: skip, note: "圆角（可能归画面而非调色，待定）"}
+  smart_crops:           {drafts: 3,    render: yes,      phase: 3}
+  audio_pitch_shifts: {drafts: 4,    render: no,       phase: 2}
+  audio_pannings: {drafts: 3,    render: no,       phase: 2, note: "r2 新见（快照 2026-10-16），此前 39/42 之差即由它等三项暴露；r3 实测条目键集只有 `{id, type:audio_panning, enable_panning}` —— **左右平移的量没有落盘**（10月16日 草稿打开了开关但无值）。画面描边那类「开关落盘、参数缺位」已在 2026-10-18 差分结案（真相是类型没选，U-39→F-027），声道侧**未做**同类验证，所以这里仍按「参数体未定位」处理"}
+  hsl_curves:            {drafts: 2,    render: yes,      phase: skip}
+  video_shadows:         {drafts: 2,    render: yes,      phase: 1,
+                          note: "**画面侧「阴影」面板的载体（已定案，F-021/U-29 关闭）**：12 键 `{id, type:video_shadow, enable_video_shadow, resource_id, resource_name:\"阴影\", path, source_platform, color, alpha, distance, angle, ambiguity}`。语料里只有 2 条带参数、分属两份互不相关草稿且逐项同值（color #000000 / alpha 0.3 / ambiguity 0.1 / distance 0.05 / angle -30 / resource_id 7564727861634944292），与面板读数 30%/10%/距离5/-30° 逐位对上 → **distance = UI/100，模糊度键名是 `ambiguity`（不是 blur）**。此前记的 `cache_time_range`/`source_name` 是误记（前者属 smart_relights）。与 `videos.video_mask_shadow`（蒙版阴影，键名用 `blur`）不是同一处，勿混"}
+  video_strokes:         {drafts: 2,    render: yes,      phase: 1,
+                          note: "**结案 U-39（2026-10-18 差分，F-027）：画面描边是资源包效果**。语料里那两条只有 5 键 `{id, type:video_stroke, enable_video_stroke, path:\"\", resource_id:\"\"}`，真相是**类型还停在「无」**——不是「参数在别处」。选「单层描边」后条目补出 `{resource_id, path, resource_name, source_platform:1, color, adjust_params[]}`，形状与 `effects[]` 同类。`color == [1.0, R, G, B]`（首位不是 alpha），`adjust_params` 的 `effects_adjust_size`/`effects_adjust_alpha` = **UI ÷100**，另有 UI 不暴露的 `min_scale`（默认 320.0），每项带 `default_value` 恰等于 UI 默认。描边「类型」（无/单层/发光/虚线/手绘）= 不同 `resource_id`，**不是枚举字段** → 复现必须解析 `Cache/effect/<rid>/<md5>` 资源包。`videos.video_mask_stroke` 仍是蒙版描边，别混（F-021 caveat）"}
+
+phase1_buckets: [videos, texts, canvases, material_animations, drafts, "effects(mix_mode)", transitions, common_mask, masks, "speeds(mirror)", "video_shadows(已定案)", "video_strokes(资源包效果，已定案)"]
+
+referential_integrity:                     # 写回前必须校验（见 write-rules.md）
+  rules:
+    - 每个 segment 的 material_id 必须在对应 bucket 中存在
+    - segment.extra_material_refs 的每个 ID 都必须能在某个 bucket 中解析
+    - 同一 bucket 内 id 唯一
+    - 复合片段（materials.drafts[].draft）内部自成一体，其引用不得指到外层
+    - local_material_id 为空时 5.9+ 会报「素材丢失」，写前需回填（single）
+
+stub_requirements:                         # verified：由 extra_material_refs 实测组成反推（2051 份去重内容，scripts/spec_audit.py）
+  video: [effects, speeds, canvases, sound_channel_mappings, vocal_separations, placeholder_infos,
+          material_animations, material_colors, hsl, loudnesses, drafts, transitions]
+  audio: [speeds, sound_channel_mappings, vocal_separations, beats, placeholder_infos, realtime_denoises,
+          vocal_beautifys, audio_fades, loudnesses, time_marks, drafts, audio_effects]
+  text: [material_animations, effects, video_trackings]
+  adjust: [effects, hsl, color_curves, common_mask, primary_color_wheels, log_color_wheels]
+  sticker: [material_animations, video_trackings]
+  mixed: [material_animations, speeds, placeholder_infos, canvases, sound_channel_mappings, material_colors,
+          vocal_separations, effects, hsl, drafts, transitions, audio_fades]
+  counts_reference: ../evidence/tables/spec_coverage.csv 与 docs/spec/coverage.md 的「引用组成」表
+  dangling_refs: >-
+    text 轨道有 10 个 extra_material_refs 在所有 bucket 中都解析不到 id。因此引用完整性
+    不能写成硬错误：解析器必须容忍悬挂引用（记 warning），写回时不得丢弃未知的 id。
+  note: >-
+    缺失辅助 material 的表现是剪映静默不渲染或打开时自行补全，属最难查的故障类型；
+    M3 写入实验仍以「剪映能正常打开且无修复提示」为验收，但上面的组成表把猜测换成了实测基线。

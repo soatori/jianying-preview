@@ -1,0 +1,297 @@
+# 字幕（text）属性 → 渲染效果对照
+# 实测范围：2050 份去重内容（r3，快照 2026-10-16；r2 是 2052，差一次草稿删除）；计数来自 temp/corpus-scan/stats.json 与 temp/corpus-detail/*.csv（口径见 ../evidence/findings.md F-019/F-020）
+# 等级：verified=≥2 路；single=单源待验证；open=未解决（见 ../evidence/unresolved.md）
+
+location:
+  track_type: text                        # verified；r3 有 2,439 条 text 轨道
+  segment_to_material: segment.material_id -> materials.texts[]
+  note: segment 本身无 type 字段（实测恒缺），类型由所属 track.type 决定   # verified
+  material_type_field: >-
+    **`materials.texts[].type` 才是「字幕 / 普通文字 / 歌词」的真正判别字段**（此前规格完全没记，F-048 全量实测）：
+    `subtitle` 17,718 / `text` 3,307 / `lyrics` 60 / `none` 1。
+    同一条 text 轨道里可以混着三种，所以渲染与写回都不能按轨道类型假定语义类型。
+    引用侧分布（按 `material_id` 指向统计）：text 轨道 → subtitle 17,016 / text 2,077 / lyrics 50；
+    **mixed 轨道也指** → subtitle 564 / text 233（⇒ 字幕不一定在 text 轨上）。
+    另有一层模板类型 `materials.text_templates[].type`：`text_template` 805 / `text_template_subtitle` 30 / `text_template_lyrics` 1
+    （被 text 轨引用 804/30/1，mixed 引 1）
+
+segment_fields:                           # segment 上的字段实测计数（所有轨道合计，按去重内容，r3）
+  id: 51718
+  target_timerange: 51718
+  material_id: 51718
+  responsive_layout: 51615                # 三种形态：{} 34,926 / 五键默认 16,689 / 缺席 103（U-06 已按此更正）
+  extra_material_refs: 51053
+  clip: 42135                             # 文字也可带 clip（位移/缩放/透明度）；另有 4,325 条 clip 整值 null
+  uniform_scale: 34843                    # segment 级，不在 clip 内；{} 18,010 / {on:true,value:1.0} 12,467 / null 4,325 / {on:false} 35 / 仅 value 若干
+  render_index: 33561
+  track_render_index: 42407
+  text_segment_band: {render_index: "14000-14999 为主"}   # verified：19,467 次（r3 render_index_bands.csv；r2 记 19,596、r1 记 19,703）。2026-10-20 全量补测：text 另有 15000-15999 254 / 16000-18999 29 / 19000+ 207 / 1000-9999 1 段 → 次带语义归 U-63，逐带表见 picture.yaml -> compositing_order.bands_measured
+
+content_envelope:
+  field: materials.texts[].content
+  type: string                            # 是一个 JSON 字符串，不是对象
+  shape: '{"text": "...", "styles": [ {...} ]}'
+  rules:
+    - 必须二次 json.loads；直接当对象会失败                       # verified
+    - styles[].range 决定该样式覆盖的字符区间
+    - 修改文本后必须重新同步 styles[].range，否则样式静默截断        # single（参考文档 + batch-kit 一致）
+    - 不得把 content.text 与过期的 recognize_text 字段拼接          # single
+    - 语料中 content 与 recognize_text 并存是常态，后者是识别缓存    # single
+
+style_keys:                               # styles[] 内实测键与出现次数（r3 去重内容；完整表见 ../evidence/tables/text_style_keys.csv）
+  fill: 24085
+  range: 24085
+  size: 24075
+  font: 23875
+  shadows: 14510
+  useLetterColor: 10637                   # 逐字配色（既往资料未提及）；verified：**带该键时 10,637 条全部为 true**，缺席即 false（probe8.txt）
+  strokes: 6222
+  effectStyle: 1784                       # 花字（另有 52 条键在值为 null）
+  bold: 484
+  italic: 453
+  underline: 209
+  bloom: 68                               # 68 条**全部为 null** → 纯 schema 占位，与发光无关（发光见 ui_panel_mapping 与 F-022）
+  inner_shadows: 28
+  line_spacing: 9
+  select: 3
+
+range_semantics:
+  forms_observed: "数组形 [start,end] 24,075 条 + **空格分隔字符串形 `\"0 10\"` 10 条**；旧文档写的「字典形 {start,end} 并存」在语料里一条都没有（probe8.txt，F-024）"
+  parser_rule: 解析要同时吃两种形；字符串形按 split() 转成区间
+  unit: >-
+    **UTF-16 code unit**（2026-10-18 构造样本结案 U-01）：字幕 `测试A😀B中🎉C` = 8 码点 / 10 code unit，
+    整段样式的 `range == [0, 10]`。emoji 在 `content.text` 里**原样存**，不做 `\ud83d\ude00` 式代理对转义，
+    所以任何按「字符数」算下标的语言（Python str、JS Array.from）都会把样式切错位——必须按 UTF-16 索引。
+    残留：只有「整段」一个见证，「起点落在非 BMP 字符之后」的局部样式未采到（自动化下选区总退化成全选）；
+    range 是同一坐标系的一对下标，起点必然同单位，按规矩记为单见证。
+  why_it_matters: 含 emoji / 代理对的字幕会把样式切错位置
+  test_plan_status: >-
+    「在语料中筛含非 BMP 字符的字幕」已确认**做不了**：20,606 份含字幕的内容里没有一个非 BMP 字符
+    （probe8.txt）。已改为构造样本并结案，见 U-01、F-026 与 F-027。
+
+fill:
+  shape: 'fill.content{render_type, solid{color,alpha}, gradient{angle,...}, texture{range,path}}'
+  measured: {content: 24085, solid.color: 23682, render_type: 19113, solid.alpha: 4291, texture: 343, gradient: 198}   # r3（temp/corpus-detail/text_fill_shapes.csv）；r2 是 24306/23903/19344/4283/336/191，r1 的 13175/12932/10427/1413/202/132 是「每 bucket 只采样前 20 条」的下界
+  render_type_values: [solid, gradient, texture]        # verified；另有 4,972 条 `render_type` 缺席（fill 存在但不写渲染类型，须按 solid 兜底）
+  color_encoding: "[r, g, b] 浮点 0..1"                  # single（与参考文档一致，M2 用成片确认）
+  fill_alpha: >-
+    fill.alpha 3,240 次。U-02 已结案（F-049）：**两个 alpha 在同时出现的 3,214 例里逐位相等，0 例外**
+    （容差 1e-9），所以「谁优先」在语料里不可观测；能定的是**载体** —— `solid.alpha` 可单独存在 1,077 例，
+    `fill.alpha` 单独存在只有 26 例 ⇒ 读侧 `solid.alpha` 优先、缺则回退 `fill.alpha`，写侧两处同步。
+    表 `../evidence/tables/fill_alpha_pairing.csv`。（旧 `unresolved.md` 的 3,222/4,283 没跟上本文件的 3,240/4,291，已就地更正）
+
+strokes:                                                # 复数：可多描边
+  shape: 'strokes[]{content{solid{color,alpha}, render_type, texture}, width, alpha, mode}'
+  measured: {count: 6198, content.solid.color: 6176, content.solid.alpha: 1744, content.render_type: 2548, width: 6198, alpha: 1595, mode: 666}   # r3（stroke_shapes.csv）；r1 的 3554/3543/3554/914 为采样下界
+  width_unit: em 相对值（非像素）                        # single，M2 标定系数
+  mode_note: 带 mode 的 666 条**全部是 0**，无第二种取值 → 语料判不了（U-24 / F-026）
+  default_if_absent: 无 strokes 即不描边
+
+shadows:
+  shape: 'shadows[]{content{solid{color,alpha}, render_type, texture, gradient}, distance, angle, alpha, diffuse, feather, thickness_projection_{enable,angle,distance}}'
+  blur_law: >-
+    **`diffuse = 面板模糊 ÷ 600`**（U-03 结案，F-049，两路一致）：语料侧 `diffuse` 13,032 次里
+    **12,874（98.8%）在 ×600 后落在整数面板值上**，众数 0.025 = 面板 15；官方声明侧
+    `…/references/segment-text-sticker.md:135/:167` 写「不使用底层 **0 至约 0.1667** 的引擎数值」，
+    而 100 ÷ 600 = 精确 1/6。`distance` 面板 1:1（0..25.96，众数 5.0）、`angle` 度 −180..180（实测 −180..134.5，众数 −45）、
+    `alpha` 0..1 对应面板百分制（众数 0.9）。协议给的缺现值参考是 **distance 8 / angle −45**
+    （`references/segment-text-sticker.md:116/:148`；注意官方模型层 flat 默认是 `shadow_angle=-45`、`shadow_alpha=0.8`、`shadow_smoothing=0`）
+  residual_keys: >-
+    同一对象里还有 `feather`（1,518 次 / 86 份，值域 0..0.16667 = 1/6，但只有 247/1,518 符合 ÷600 ⇒ 不是面板滑杆的直接载体）
+    与 `strokes`（22 次 / 15 份，阴影里再套描边）。官方模型层的 shadow 类带一个 `feather_use_diffuse` 布尔开关，
+    但**该键在 r3 语料的 `shadows[]` 里从未出现** ⇒ 三族键归属转 U-64
+  measured: {count: 14552, distance: 14552, angle: 14552, alpha: 14443, diffuse: 13032, thickness_projection_angle: 5368, feather: 1518, content.solid.color: 14524, content.render_type: 12141, content.solid.alpha: 55}   # r3（shadow_shapes.csv）；r1 的 8018/7954/7505/2591 是采样下界
+  count_basis: >-
+    14,552 是**条目数**；带非空 `shadows[]` 的 **style 是 14,501 个**（23 个 style 有 >1 条），
+    而 `stats.json -> text_style_keys.shadows = 14,510` 计的是**键存在的 style**（含 9 个空数组）。
+    三个数口径不同、不可互换（`tables/shadow_style_keys.csv`，脚本 `scripts/field_census.py`）
+  distance_unit: 与 UI 1:1（见 ui_panel_mapping），不是 em 相对 —— 参考实现的说法已被推翻
+  thickness_projection_status: >-
+    `thickness_projection_enable` 带键的 5,368 条**全部是 false**、其余整键缺席 → 语料里从未启用过「厚度投影」，
+    渲染层可以只做恒等处理，但要保留字段（F-026）。`feather` 带值时众数是 0.055556（1,193 条），疑为内部默认。
+
+effect_style:
+  field: styles[].effectStyle{id, path}                  # 花字
+  measured: 1774 次（按去重内容；r1 的 3596 属翻倍口径）
+  resource: Cache/artistEffect/<resource_id>/<md5>/effectStyle.json
+  note: 与内联样式同构的说法来自参考文档；本项目 M2 逐包核对   # single
+
+flat_fallback_fields:                   # texts material 上的扁平字段（旧样式路径，仍需吃）
+  identity: [content, alignment, add_type, check_flag, combo_info, caption_template_info, has_shadow]   # has_shadow 见 style_carriers（U-48）
+  font: [font_size, font_name, font_path, font_id, font_resource_id, font_title,
+         font_category_id, font_category_name, font_team_id, font_source_platform]
+  color_border: [text_color, bold_width, border_alpha, border_color, border_width]
+  shadow: [has_shadow, shadow_color, shadow_alpha, shadow_angle, shadow_distance, shadow_smoothing, shadow_point]
+  background: [background_alpha, background_color, background_style, background_width, background_height,
+               background_horizontal_offset, background_vertical_offset, background_round_radius]
+  layout: [fixed_width, fixed_height, line_max_width, line_spacing, words]
+  measured_source: temp/corpus-scan/stats.json -> text_flat_keys（r3 全量键表在 ../evidence/tables/text_flat_keys.csv）
+  not_listed_above: >-
+    r3 还有一批字幕 material 键规格未逐条解释，解析器要**原样保留**而不是丢弃：`add_type`(19,006，取值 1/0/2)、
+    `sub_type`(9,541，0/3/4/5)、`global_alpha`(7,788)、`text_alpha`、`operation_type`、`typesetting`(7,407，0/1)、
+    `recognize_task_id`(18,000 上下)、`recognize_text`(13,197)、`base_content`(13,940)、`subtitle_keywords`(16,690)、
+    `group_id`(16,726)、`is_rich_text`、`ktv_color`(7,568)、`name`（值常是一个 uuid 串）。全集与记录状态见 coverage 台账。
+
+check_flag:
+  meaning: 位标志，标记哪些样式子系统被写过
+  low_bits: "bit0/bit1/bit2 在 17,454 个带 check_flag 的字幕 material 上几乎恒置（17,454/17,454/17,453）—— 参考文档把它们写成「7 = 基础」是把常量当位，不是位表"
+  implications:                       # r3 逐位交叉表（temp/check-1016/probe6.txt）。共同形态：**置位 ⇒ 特征存在，反之不成立**，所以渲染不能靠位判断、写回不能只改位
+    "bit3(8) 描边": "置位 5,433 条里 4,432 条确实有非空 strokes（1,001 条置位却无描边）；而 5,041 条有描边的材料里 609 条不置位"
+    "bit5(32) 阴影": "置位 13,514 条里 12,314 条确实有非空 shadows；有 shadows 的 12,426 条里 112 条不置位"
+    "bit4(16) 背景": "置位的 129 条**全部**确实设了 background_*（0 反例）；但 background 已设的 8,964 条里 8,835 条不置位"
+    "bit6(64) 发光": "全语料恰好 1 次，且就是快照内唯一那条 `effects[type==\"bloom\"]` → 强相关但 n=1，U-28 只收窄不结案"
+    "bit7(128)": "36 次，未解释"
+  grading: 由 single 升为 verified（位↔特征交叉表可重跑；结论形态是单向蕴含）
+  measured_distribution_source: stats.json -> text_check_flags / check_flags.text.bit
+  open_question: +4（混合）到底混合什么                                             # open（U-04）；视频侧另有 31 个高位在用（bit24/23/25/22 各约 1.29 万，bit17/21/27/29 是 10月16日 草稿独有的），仍无法解释
+
+karaoke_words:
+  field: texts[].words
+  shape: >-
+    不是条目数组，而是三个**等长平行数组**：`{start_time: [...], end_time: [...], text: [...]}`，
+    `text[]` 是分词片段（如「设备/还/配备/了/单机/自动/上下/料/系统」），时间同为微秒，前几项常为 0（缓存未填）。
+    r3：21,076 个字幕 material 带 `words`；另有 `texts.ktv_color`（7,568 条带，`""` 7,262 / `#FF0000FF` 234 /
+    `#0022FFFF` 71 / 1 条 `#BC00FFFF`）与 `segment.lyric_keyframes`（6,178 次）同族。
+  status: 形状已知，逐字高亮如何与 styles 联动的渲染语义仍未定              # open（U-05）
+
+size_metrics:
+  em_px_formula_status: >-
+    律已定（F-035，黑底导出实测两个画幅）：**`em_px = size × canvas_config.width × 0.00574`**。
+    9:16（W=1080）上 size 15 → 墨迹盒 86×363 → em ≈ 92~94 px（用草稿记录的 `SystemFont/zh-hans.ttf` 逐 em 比对）；
+    同一条时间线原地切到 16:9（W=1920）后墨迹高 86 → 153 px，比值 1.779 = 1920/1080 → em/size = 6.20 @1080、11.02 @1920，
+    两点过原点线性（U-52 结案）。fixture 1012-1626（size 10、W=1080）边缘拟合独立给 62 px → 同系数。
+    参考文档 `W/100`(10.8) 与 `W×0.00625`(6.75) 都不对，后者方向对（随宽缩放）但系数偏 9%。
+    系数带宽（F-036，用 PIL 拿同一份 ttf 逐 em 复测）：9:16 最优 em 93.0 → k=0.005741，16:9 最优 em 166.5 → k=0.005781，两画幅一致到 0.7%；墨迹高对 em 的量化是 1 px ≈ 1.5 px em，故 92~95 都能对上导出那 86 px 高 → 按 0.00574~0.00578 带用
+  inputs:
+    - styles[].size
+    - canvas_config.width
+    - canvas_config.height
+    - ratio
+  method: 用 <DRIVE_E>/输出 成片在同一帧上的字幕字高反解系数（M2）
+  line_height: 参考说法 em*(1+line_spacing)，待标定                                # single
+
+animation:
+  bucket: materials.material_animations[]（容器 `type` 恒为 `sticker_animation`，字幕动画也一样，别按它筛）
+  animation_entry: animations[]{type, name, id, resource_id, path, category_name, material_type, duration, start, panel, category_id, third_resource_id, request_id, source_platform, platform, anim_adjust_params}
+  types: [in, out, loop, caption, group]   # r3 实测 5 类；`caption` 才是「字幕动画」子 tab（旧规格只写前三类，见 F-020/panel-map 动画节）
+  categories_observed: [入场, 出场, 循环, 组合, 字幕动画, 收藏, "空串", ruchang, in, group]   # 中英拼音繁简混用，匹配要容错
+  timing: duration 10,356 条 / start 3,578 条（微秒；非零 start 只在 out 与 group）→ 细节见 spec/animations.yaml `timing:`
+  distinct_presets_measured: 417                     # verified（2050 份去重内容，键 =(type,name,id)；把 category_name 也计入则是 606）
+  top_by_count: 见 ../evidence/tables/animations.csv 与 temp/corpus-scan/csv/animations.csv
+  preset_definition: >-
+    预设包为随资源下载的包：config.json / content.json / extra.json / anim.prefab(YAML) /
+    <Name>.lua（明文 UTF-8 源码）/ gles2_*.vert|frag / Sprite2D.xshader / *.material。
+    曲线由 Lua+GLSL 描述，extra.json.setting.animation_duration 给时长（秒）。
+    因此曲线可从资源包读取，无需从成片反推；成片仅用于校验。           # verified
+  availability_risk: 包路径可能是历史安装位置（观测到指向另一台机器旧路径的 path 字段），本机未缓存时需降级 # verified
+  degradation: 无包时按 name 关键词近似（渐显=淡入、渐隐=淡出、打字机=逐字出现…）并标注「近似」
+
+fonts:
+  resolution_chain: [styles.font / texts.font_path, font_resource_id, Cache 字体目录, 系统字体, 兜底默认字体]
+  shipped_fonts: "%LOCALAPPDATA%/JianyingPro/User Data/Resources/Font/{Effect,SystemFont,*.otf|*.ttf}"
+  # 实测（2026-10-24，本机 11.6.0.14552）：该目录**存在**，含 arial*、后现代体/悠然体/新青年体、
+  # Effect/seguiemj.ttf、SystemFont/NotoSans*。而安装目录下的 "<install>/Resources/Font" **没有**
+  # ——原写法把两处混成一条，按它去找会永远找不到（F-084 排查时逐目录翻过）。
+  note: font_path 为绝对路径且可能失效；解析必须多级回退                          # verified
+  # 这条原来只是 single（一条推测），现在是**事故级 verified**：草稿记的
+  # Cache/effect/<rid>/<md>/HelloFont_ID_JianSong_95.ttf 会在**剪辑不动的情况下**被剪映自己清掉
+  # （本次会话中途就清了这一条），于是两条渲染通道各自落到完全不同的字面：
+  # 通道 2 掉到 PIL 10 px 点阵（中文=豆腐块、字号 1/4），浏览器掉到 CSS 'sans-serif'（雅黑常规）。
+  # ⇒ 「多级回退」不是防御性写法，是**必须实现的功能**；此前两边都没实现。
+  fallback_law:
+    must_be_cjk_capable: true          # 兜底默认字体（点阵/无中文字形）只能算最后一步，且必须计数上报
+    must_keep_requested_px: true       # 回退只换字面，不换字号
+    weight_matters: true               # 见下面标定：常规体把墨量差到 1/5
+    calibration: "字幕带内 >200 墨 / 对成片 corr / MAD（t=1.0，成片=3476）：雅黑粗体 3961·0.777·20.5 ← 采用；黑体 1962·0.765·20.3；雅黑常规 2295·0.715·22.6；思源 VF 721·0.605·27.0"
+    both_channels_same_face: true      # 两条通道必须落同一条标定，否则跨通道判据量的是「两个回退之差」
+    browser_side: "fontFamily 'Microsoft YaHei' + fontWeight 700（Chromium 取 msyhbd 面）"
+    offline_side: "render_frame.FALLBACK_FONTS = [msyhbd.ttc, simhei.ttf, msyh.ttc, NotoSansSC-VF.ttf]"
+  known_ceiling: >
+    缺面（草稿字体已不在机器上）时，字幕的**笔画级**保真不可达：重宋只能拿粗黑体近似，
+    实测两条通道都比成片**多墨 14–19%**（4145/3961 vs 3476），跨通道之间反而只差 6 个像素。
+    这不是 bug 而是环境依赖——预览的字幕保真度受「剪映 effect 缓存里那个 ttf 还在不在」约束，
+    所以任何字幕像素判据都必须先报 `FONT_FALLBACKS` / `fonts[].exists` 的状态再解读。
+
+scope_phase1:
+  render:
+    - content.text
+    - "styles[]: range, size, font, fill, strokes, shadows, effectStyle, bold, italic, underline, useLetterColor"
+    - flat_fallback_fields
+    - material_animations
+    - segment.clip
+    - "track/text 层级"
+  skip: [material_colors, hsl, lut, color_curves, 色彩轮（调色类）]
+
+# ---- UI 面板 ↔ 字段对照（用剪映「文本-基础」面板实测反解，见 ../evidence/findings.md F-016）----
+ui_panel_mapping:
+  evidence: 截图面板值（位置 Y -850、缩放 100%、等比缩放开、不透明度 50%、阴影 90%/15%/5/-45°、
+    描边 100%/40、字号 10、字间距 0、行间距 0、背景 100%/0%/14%/14%/50%/50%、发光 30/20/0°/0°、弯曲 72°）
+    与语料解密值逐项比对；canvas_config = {width:1080, height:1920, ratio:null}
+  controls:
+    字体: styles.font{id, path}                      # verified：path 直指 Cache/effect/<rid>/<md>/<字体>.ttf
+    字号: styles[i].size 为权威（配 range，可多段不同）   # 结案 U-26：**1:1 无换算**（2026-10-18 同段配对 13→13.0/13、24→24.0/24）。**顶层 `texts.font_size` 只是镜像，不是权威**：4.8% 整键缺席（新建 11.6 字幕即此类）、两键都在时 97.2% 等于 `styles[0].size`、232 条等于其它段、317 条与所有段都不等、471 条反过来只有 font_size（F-034，表 `../evidence/tables/font_size_mirror.csv`）
+    样式B/U/I: styles.bold / underline / italic      # verified；扁平侧 bold_width / italic_degree / underline_width / underline_offset
+    颜色: styles.fill.content.solid.color [r,g,b] 0..1   # verified（例 [1, 0.87058824300766, 0]）
+    字间距: texts.letter_spacing (float)             # verified 存在，UI 0 ↔ 值未定
+    行间距: texts.line_spacing (float)               # verified；UI 显示 0 而 draft 为 0.02 → 0.02 疑为内部基准值
+    对齐方式: texts.alignment (int)                      # verified 取值域 {0,1,2,3,4} 的**单字段互斥枚举**（不可拆 x/y 两轴）；r3：21,086 条字幕里 7,729 条带该键（1:7,158 / 0:460 / 2:61 / 3:42 / 4:8）。**2026-10-19 差分 E5 钉死**：左 `0`、右 `2`、上 `3`、下 `4`，**两枚居中按钮都不写值（整键消失）**，六次点击 `clip.transform` 恒 `{x:0,y:0}` → 版面位置只由 alignment 承载，渲染器必须自己算。`1` = 老写入器（≤8.0）的水平居中显式编码：带键材料中 `1` 占比 ≤8.0 = 96.99%、≥8.7 = 3.06%（残留全在 10.5.0）、11.6.0 = 0/3,513 → **`absent` 与 `1` 同一个居中态**（U-30 结案，F-031，表 `../evidence/tables/alignment_by_version.csv`）
+    预设样式: texts.preset_* / text_preset_resource_id / caption_template_info   # verified 存在
+    缩放: clip.scale{x,y}（1.0 = 100%）              # verified
+    等比缩放: segment.uniform_scale（四种写入形态并存：`{}` 18,010 / `{on:true,value:1.0}` 12,467 / null 4,325 / `{on:false}` 35，另有只带 `value` 的若干）  # verified；`value` = clip.scale.x/y 的比例缓存（12,465 命中/8 过期），`on` 才是等比锁；勾选态↔形态仍未定（U-42）
+    位置X/Y: clip.transform.x / y                    # verified（F-035 导出实测）：**渲染位移 = 值 × 该轴边长 / 2**，原点在画布中心、**y 轴向上为正（负值向下）**、锚点=字框中心；面板显示值 = 值 × 边长，即**面板单位是真实像素的 2 倍**。整数率 y 52.09% / x 12.84% @1080x1920 → 水平位置多走 `alignment`（F-031）。**改画幅不重写浮点**，面板整数是 round 过的（U-49）
+    平面旋转: clip.rotation（度，实测域 -215..360）    # verified
+    混合-不透明度: clip.alpha（0..1，0.5 = 50%，域内从不 >1）  # verified
+    描边-颜色: styles.strokes[].content.solid.color  # verified
+    描边-不透明度: styles.strokes[].alpha            # verified；缺省即 1（仅 278/1183 显式给出）
+    描边-粗细: styles.strokes[].width                # verified 存在；UI 40 ↔ draft 0.08（单样本，系数 500 未定论）
+    描边-模式: styles.strokes[].mode（r3：带键 666 条**全部是 0**，其余 5,532 条整键缺席）  # open（U-24 改标「语料判不了，需构造样本」；旧记 222/670 分别是抽样与 r1 口径）
+    背景-样式: texts.background_style (int)          # verified
+    背景-颜色/不透明度: background_color / background_alpha   # verified
+    背景-圆角/高度/宽度/上下偏移/左右偏移: background_round_radius / _height / _width / _vertical_offset / _horizontal_offset  # verified 八控件八字段
+    背景-默认值: 上述字段为 null 时 UI 显示 不透明度100% 圆角0% 高14% 宽14% 偏移50%/50% → 14%/50% 是**由文字度量推导**而非存储值   # verified（null 与 UI 数值共存）
+    弯曲-弯曲程度: texts.text_curve{enable, angle}   # verified（angle 直接给度数，例 83.265）
+    阴影-颜色/不透明度/距离/角度: styles.shadows[].content.solid.color / alpha / distance / angle  # verified 1:1（0.9↔90%、5↔5、-45↔-45°）
+    阴影-模糊度: styles.shadows[].diffuse            # verified（U-03 结案，F-049）：diffuse = 面板模糊 ÷ 600
+    阴影-厚度: styles.shadows[].thickness_projection_{enable, angle, distance}  # verified 存在（各 5360 次），UI 面板未见（r1 记 1992 为采样下界）
+    逐字配色: styles.useLetterColor (bool)           # verified
+    内阴影: styles.inner_shadows[]{distance, angle, feather, content}  # verified；content 可为 gradient{angle,color[],alpha[],percent[],mode:"character"}
+    花字: styles.effectStyle{id, path}               # verified；path → Cache/artistEffect/<rid>/<md5>
+    气泡: texts.combo_info{text_templates[]}         # verified；对应 materials.text_templates bucket
+    动画-入场/出场/循环/字幕: materials.material_animations[].animations[].type ∈ {in,out,loop,caption,group}  # verified（r3 五类；「字幕」子 tab 就是 caption，「组合」是 group —— 旧规格只列三类。容器 type 恒为 sticker_animation，别拿它筛。时长/偏移见 spec/animations.yaml）
+    动画-下载角标: 预设包未缓存（animations[].path 指向缺失目录）  # verified 机制
+    文案推荐 / AI写旁白: 根级 function_assistant_info / smart_ads_info  # single（未逐字段核对）
+  unmatched: {}
+  resolved_by_differential_experiment:
+    发光: >-
+      承载者是 **effect**，不是文本样式：materials.effects[] 中 type=="bloom"、
+      name=="外发光"，参数在 bloom_params{color:"#RRGGBB", strength, range, dir_x, dir_y}，
+      并带 panel_id=="tool_text_glow"（面板身份）、resource_id/effect_id、path→Cache/effect/<rid>/<md5>。
+      UI↔draft：强度 30 ↔ strength 0.3、范围 20 ↔ range 0.2（×100）；垂直/水平角度 0° ↔ dir_y/dir_x 0.5（中点，
+      非零映射见 U-27）。styles.bloom 恒为 null 是 **schema 占位**，与发光无关——先前据此判为「无承载字段」是错的（U-25 已关闭）。
+      证据：用户 2026-10-16 在同一草稿新建时间线加发光后实测（findings F-017）。
+    发光_r3_复核: >-
+      两枚样式现已各自有 id：F-017 的「外发光」7202576698775179837 **已不在当前快照**（resource_id/effect_id/
+      third_resource_id 三处 0 命中，其时间线也不在盘上，只剩 temp/bloom-probe/），r3 内唯一一条 bloom 是
+      10月16日 草稿的「轮廓光」7202575978646737469，bloom_params 为 strength 0.5 / range 0.4 / color "#000000"
+      / dir_x 0.5 / dir_y 0.5 → ×100 换算在第二个样本上复现，dir 仍是中点（U-27 未进）。
+      **方法警告**：bloom_params 与 panel_id 是 effects 条目的固定外壳（各 19,492 条存在，其中 19,491 条是
+      null / 空串，挂在 figure、brightness 等与发光无关的类型上），所以**绝不能用「bloom_params 键在」判发光**，
+      只能看 type=="bloom" 或 panel_id 非空（F-022）。
+
+style_carriers:                                   # 2026-10-19 成对差分 + 语料复核（../evidence/findings.md F-029）
+  rule: >-
+    判「描边/阴影/发光开没开」**只能看数组载体**：`styles[].strokes[]` 非空 = 描边、
+    `styles[].shadows[]` 非空 = 阴影、片段 `extra_material_refs` 引用到 `effects[type=="bloom"]` = 发光。
+    material 上那批扁平字段（`shadow_alpha/angle/color/distance/point/smoothing`、`border_color/width`、
+    `background_*`、`text_color`）在 5 条「开关组合各不相同」的字幕之间**逐项完全相同**，
+    是恒写的遗留镜像 —— **读它们判开关会一律得到「开」**。
+  font_size_mirror: "字号权威是 styles[i].size（配 range，可多段不同）；顶层 font_size 只是镜像：4.8% 整键缺席（新建的 11.6 字幕就是）、两键都在时 97.2% 等于 styles[0]、232 条等于其它段、317 条与所有段都不等（表 tables/font_size_mirror.csv，F-034）"
+  check_flag_bits: "bit3(8)=描边、bit5(32)=阴影、bit6(64)=发光（因果，各有翻转观测）；bit0/1/2(1+2+4) 在 17,454 条里恒置位（值 4 仅 1 条例外）；bit4(16) 与样式无关且会单独翻转（U-47）→ check_flag 不是样式指纹"
+  has_shadow: "texts.has_shadow 是粘性近指标：语料 728 条 true 却无 shadows[]、160 条 false 却有权、973 条整键缺席（U-48）；权威判据仍是 styles[].shadows[]"
+  alignment_two_encodings: "居中这个状态有两种落盘编码：老写入器（≤8.0）写 `alignment:1`，新写入器（≥8.7，11.6 实测）删键。渲染时 `absent` 与 `1` 必须都按居中处理；写回时不要把 `1` 规范化成删键（会改变老版本读到的值）。分版本分布见 `../evidence/tables/alignment_by_version.csv`（F-031）"
+  precision: "同一个 UI 距离 5，在 styles[].shadows[0].distance 里是 4.999999523162842（float32 往返），在扁平 shadow_distance 里是精确 5.0 → 跨路径比较必须带容差"
+  glow_no_angle_ui: "11.6 的发光面板只有 颜色/强度/范围 + 两枚预设瓦片；dir_x/dir_y 恒 0.5 无输入口（U-27 改判，需带角度控件的版本）"
+  calibration_leads:
+    - "面板值 = transform × 该轴边长（-0.4427083333333333 × 1920 = -850 精确成立，F-032/F-033）；**但渲染位移 = 面板值 / 2 且 y 向上**（导出实测：y=-0.4427 → 中心下方 424.5px，预测 425.0；x=0.0926 → 右移 50.0px，F-035）"
+    - "阴影 distance/angle/alpha 与 UI 1:1 或 ×100，非 em 相对 → 推翻参考文档「em 且 /100」的说法"
+    - "diffuse×6≈UI%、stroke.width×500≈UI% 为单样本候选系数，需更多配对样本回归"

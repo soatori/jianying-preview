@@ -1,0 +1,9 @@
+measure,state,detail,count
+font_size,与所有段都不等,,317
+font_size,有键,styles.size 无,471
+font_size,等于 styles[0],,19048
+font_size,等于其它段,,232
+font_size,键缺席,styles.size 无,9
+font_size,键缺席,styles.size 有,1009
+styles 段数,单段/无,,18705
+styles 段数,多段,,2381

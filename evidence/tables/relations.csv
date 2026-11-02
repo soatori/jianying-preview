@@ -1,0 +1,15 @@
+relation,case,count
+speeds_mirror,equal,11680
+speeds_mirror,no speeds[] ref (speed=1),7923
+uniform_value,value == clip.scale.x/y,12465
+uniform_value,on=False -> clip.x==clip.y: False,35
+uniform_value,stale value,8
+kf_material_id,resolves to a material id/constant_material_id,228
+kf_material_id,unresolved material_id,161
+shadow_point_magnitude,|point| == 0.18 * distance,19847
+shadow_point_magnitude,stale/other,963
+shadow_point_magnitude,no usable distance,266
+shadow_point_alpha_fit,|point| == shadow_alpha,15621
+shadow_point_alpha_fit,not alpha,5455
+shadow_point_direction,"direction == (cos, sin)(shadow_angle)",20834
+shadow_point_direction,direction differs,21

@@ -1,0 +1,13 @@
+﻿id,area,spec_claim,observed_in_case,verdict,level,note
+C-01,轨道,主轨 = tracks[0] 且 flag ∈ {0\, 缺席},"tracks[0] type=video、flag 整键缺席、104 段",match,single,"首条 video 轨不写 2，与 F-050 全量交叉表一致"
+C-02,轨道,"非首条 video 轨必然 flag==2","第 2 条 video 轨 flag=2、20 段（画中画）",match,single,"该例全片只有这一条非首条 video 轨"
+C-03,轨道,"flag==1 = 字幕轨","4 条 text 轨 flag=1（73 / 25 / 18 / 2 段）；另 1 条 text 轨 flag 缺席（7 段）",partial,single,"缺席的 text 轨语义规格未立（写回规则只禁补齐为 0）"
+C-04,转场,转场挂在前一个片段的 extra_material_refs,"挂在轨0 段8（8.860-10.400 s）",match,single,"materials.transitions[] 只 1 条"
+C-05,转场,转场不改变片段时长,"下一段起点减本段终点 = 0.000 s",match,single,"把 window_hypothesis 的一半从 pure 假设升为有成片支持；半窗方向仍未验"
+C-06,转场,"fields = name/id/category_name/effect_id/duration","实际另有 resource_id、path、is_overlap 三键",spec_gap,single,"resource_id 与 effect_id 同值；path 指向 Cache/effect/<rid>/<md5>；已补进 picture.yaml"
+C-07,音频,"淡入淡出控件 = fade_type","有值的是 fade_in_duration / fade_out_duration；fade_type / in_type / out_type 全 materials 里整键缺席",spec_gap,single,"两条配乐各 1 条，淡入 1.0 s、淡出 3.0 s；条目形态只有 {id,type,fade_in_duration,fade_out_duration}；已补进 panel-map.yaml"
+C-08,动画,"name 可作匹配键","同名渐显分属两族：sticker 6724916044072227332（Appear.lua）与 video 6798320778182922760（Transform.lua + shader）",spec_gap,single,"top60 里同名渐显也有 3 个 id（69 / 66 / 51）；已补 name_is_not_identity"
+C-09,动画,"material_animations 容器即条目","242 个容器里 188 个空壳、只有 54 条 animations[] 条目",new_observation,single,"空壳比例规格未记，读侧不得按容器数计动画数"
+C-10,特效,"混合模式是 phase-1 重点（166 次 / 82 份内容）","该成片 mix_mode 0 条",counter_example,single,"不等于 phase 排序错，但说明实战用片可能一次不碰混合模式"
+C-11,特效,figure 归 phase-3,"effects 56 条里 figure 15 条、smart_color_adjust 22 条",counter_example,single,"语料最高频 type（figure 36,599）在实际成片里是第二大类，phase 排序值得重议"
+C-12,版本,"version=360000、platform{windows\,3704\,lv}、new_version 随 app_version","version=360000、new_version=189.0.0、platform{os:windows\, app_id:3704\, app_source:lv}",match,single,"fps 顶层有值 50.0，不受 F-019 的缺席率影响"
