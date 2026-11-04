@@ -98,7 +98,7 @@ def run_oracle(src: Path, dst: Path) -> dict:
     }
 
 
-def probe_sample(sample: dict, work: Path, use_oracle: bool) -> dict:
+def probe_sample(sample: dict, work: Path, use_oracle: bool, dll: str | None = None) -> dict:
     src = Path(sample["path"])
     before = sha256(src)
     key = before[:16]
@@ -110,8 +110,18 @@ def probe_sample(sample: dict, work: Path, use_oracle: bool) -> dict:
     replain = assert_scratch_target(work / f"{key}.replain")
     oracle_out = assert_scratch_target(work / f"{key}.oracle.json")
 
+    # 产物名按源文件 sha 前 16 位取，于是**上一轮的同名明文会留着**：这轮全失败时
+    # `plain_mem.read_bytes()` 读到的还是上次那份，G1/G2 会被判定通过——PASS 来自陈货。
+    # 每次开工先把这一轮的产物清空，并记下清掉了什么（非空 = 这一轮本就没有可信明文）。
+    cleared = []
+    for stale in (plain_mem, recipher, replain, oracle_out):
+        if stale.exists():
+            stale.unlink()
+            cleared.append(stale.name)
+
     batch = call(
         [{"op": "decrypt_bytes", "src": str(cipher_copy), "dst": str(plain_mem)}],
+        dll=dll,
         tag=f"probe-{key}",
     )
 
@@ -120,6 +130,8 @@ def probe_sample(sample: dict, work: Path, use_oracle: bool) -> dict:
         "layout": sample["layout"],
         "src": str(src),
         "src_sha256": before,
+        "cleared_stale": cleared,
+        "dll": dll or "auto(discover_dll)",
         "worker_errors": batch.get("errors", []),
     }
     mem_plain = plain_mem.read_bytes() if plain_mem.exists() else b""
@@ -128,6 +140,8 @@ def probe_sample(sample: dict, work: Path, use_oracle: bool) -> dict:
     plain = mem_plain
     if not plain:
         record["verdict"] = "FAIL: no plaintext produced"
+        record["src_sha256_after"] = sha256(src)
+        record["source_untouched"] = record["src_sha256_after"] == before
         return record
     try:
         parsed = json.loads(plain.decode("utf-8-sig"))
@@ -142,6 +156,7 @@ def probe_sample(sample: dict, work: Path, use_oracle: bool) -> dict:
     # G1 + G2: re-encrypt the plaintext we produced, then decrypt it again
     rt = call(
         [{"op": "encrypt_bytes", "src": str(plain_mem), "dst": str(recipher)}],
+        dll=dll,
         tag=f"enc-{key}",
     )
     record["encrypt_errors"] = rt.get("errors", [])
@@ -157,6 +172,7 @@ def probe_sample(sample: dict, work: Path, use_oracle: bool) -> dict:
         record["recipher_sha256"] = hashlib.sha256(new_cipher).hexdigest()
         back = call(
             [{"op": "decrypt_bytes", "src": str(recipher), "dst": str(replain)}],
+            dll=dll,
             tag=f"redec-{key}",
         )
         record["redecrypt_errors"] = back.get("errors", [])
@@ -200,7 +216,7 @@ def main() -> int:
         return 1
 
     identity = call([{"op": "report", "dll": args.dll}], tag="report")
-    records = [probe_sample(s, work, args.oracle) for s in samples]
+    records = [probe_sample(s, work, args.oracle, dll=args.dll) for s in samples]
 
     summary = {
         "ok": all(r["verdict"] == "PASS" for r in records),

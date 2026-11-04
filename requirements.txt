@@ -1,0 +1,41 @@
+# jianying-preview 的 Python 依赖
+#
+# 本机配方（2026-11-02 实测，Python 3.15.2 win-amd64）：
+#   python -m venv --system-site-packages temp/venv
+#   temp/venv/Scripts/python.exe -m pip install -r requirements.txt
+#
+# venv 建在 temp/ 下（.gitignore 第 1 行已忽略），不进代码历史，也不碰全局解释器。
+# 用 --system-site-packages 是为了继承全局已有的 numpy/av——这台机器到 pypi 的链路
+# 不稳（15 s 读超时、connection reset 都出现过），能少下 30 MB 就少下 30 MB。
+# 脚本之间一律用 sys.executable 传解释器（见 playback_check.py 的 PY = sys.executable），
+# 所以门派生的子进程会跟着走同一个 venv；裸 `python` 调用在仓库里不存在。
+#
+# ⚠ 必须用 temp/venv/Scripts/python.exe 跑脚本，不要用 PATH 上的 `python`：
+#   后者没有 pillow，render_frame.py 与 playback_check.py 会直接 ImportError。
+
+# ---- 必须装进 venv（本机就是 pip 装的）----
+pillow==13.0.0     # 离线通道与像素比对的地基：render_frame.py 的画布/字体/叠序，
+                   # playback_check.py 每张 PNG 进 numpy 前的解码。缺它则门无法启动。
+                   # 有 cp315 win wheel。
+psutil==7.2.2      # 仅 browser_soak.py：采 Chrome 进程树 RSS 峰值并按 --type= 归因到角色。
+                   # 不用 performance.memory 是因为它只报 JS heap，看不到 GPU/Skia/解码器。
+                   # 发的是 cp37-abi3 wheel，3.15 可直接用。
+
+# ---- 本机由全局 site-packages 继承（venv 带 --system-site-packages）----
+# 全新机器上这三行也要装；它们在 Python 3.15 上的 wheel 覆盖情况差别很大，已逐个查证：
+numpy==2.5.4       # 20 个脚本的像素运算与相关性计算。PyPI 上 2.5.4 **有 cp315 win wheel**。
+pyyaml==6.0.3      # 仅 check_spec_yaml.py（校验 docs/spec/*.yaml 的文档门，不属 28 条播放判据）。
+                   # wheel 只发到 cp314；3.15 上 pip 会转源码构建，需 setuptools 与 C 工具链。
+                   # 本机这份是纯 Python 构建（hasattr(yaml,'CSafeLoader') == False），
+                   # 只影响文档门速度，不影响任何结论。
+av==19.0.2         # 仅 media_probe.py（GOP/moov/elst 结构清点）。
+                   # ⚠ PyPI 上 av 19.0.2 的 win wheel 只有 cp312 与 cp314，**没有 cp315**。
+                   # 全新 3.15 机器要么源码构建（需 FFmpeg 开发库），要么改用 3.12/3.14，
+                   # 否则 media_probe 这一环装不上。
+
+# ---- 非 Python 依赖（记在这里以免被当成可选说明）----
+# ffmpeg      : 系统侧另有 9.0.2；但脚本优先用剪映自带的
+#               <install_dir>\ffmpeg.exe，由 scripts/jy_paths.py 探测并写进 config.local.json。
+# Chrome      : 门经 CDP（--remote-debugging-port）驱动，不需要 playwright，仓库里无此依赖。
+# node 依赖   : pixi.js 8.22.0 + mediabunny 1.65.0，装在 temp/px-probe/node_modules。
+#               版本记录与"为何必须精确"见 SKILL.md 与 README.md——temp/ 不进代码历史。

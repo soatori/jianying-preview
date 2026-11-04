@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCAN = ROOT / "temp" / "corpus-scan"
 DETAIL = ROOT / "temp" / "corpus-detail"
 AUDIT = ROOT / "temp" / "spec-audit"
-OUT = ROOT / "docs" / "evidence" / "tables"
+OUT = ROOT / "evidence" / "tables"
 
 # tables copied verbatim from a generated CSV: committed name -> source path
 COPIES = {
@@ -86,6 +86,15 @@ def frozen_contents() -> list[tuple[str, dict]]:
 
 
 def main() -> int:
+    # Guard, not courtesy: this script **overwrites committed** tables in
+    # evidence/tables/. Reaching the first write with an empty temp/ (rebuilt
+    # scratch dir) would silently shrink a measured table to zero rows. Check
+    # for the inputs before opening any output.
+    if not (SCAN / "stats.json").exists():
+        print(f"!! {SCAN / 'stats.json'} 不存在——不写任何表（已提交的 {OUT} 保持原样）。\n"
+              f"   先跑：python scripts/corpus_scan.py --limit 0 --batch 40 && "
+              f"python scripts/corpus_detail.py && python scripts/spec_audit.py")
+        return 2
     stats = json.loads((SCAN / "stats.json").read_text(encoding="utf-8"))
 
     write("buckets.csv", ["bucket", "drafts"], counter_pairs(stats["buckets"]))

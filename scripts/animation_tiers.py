@@ -20,7 +20,7 @@
 用法:
     python scripts/animation_tiers.py [--model temp/playback-test/model-check.json]
         [--table temp/playback-test/animation-curves.json]
-        [--csv docs/evidence/tables/animation_tiers.csv]
+        [--csv evidence/tables/animation_tiers.csv]
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", default="temp/playback-test/model-check.json")
     ap.add_argument("--table", default="temp/playback-test/animation-curves.json")
-    ap.add_argument("--csv", default="docs/evidence/tables/animation_tiers.csv")
+    ap.add_argument("--csv", default="evidence/tables/animation_tiers.csv")
     args = ap.parse_args()
 
     model = json.loads(pathlib.Path(args.model).read_text(encoding="utf-8-sig"))

@@ -168,7 +168,7 @@ def main() -> int:
         m[key]["worst_case"] = (f"fa={r['fa']} ba={r['ba']} _alpha={r['fg_alpha']}")
     order = [p["nameId"] for p in manifest["packages"]]
 
-    tbl = ROOT / "docs" / "evidence" / "tables" / "mixmode_equivalence.csv"
+    tbl = ROOT / "evidence" / "tables" / "mixmode_equivalence.csv"
     with tbl.open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["name_id", "glsl_op", "w3c_op", "passes", "channel_comparisons",

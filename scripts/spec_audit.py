@@ -25,7 +25,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCAN = ROOT / "temp" / "corpus-scan"
-SPEC_TEXT = ROOT / "docs" / "spec"
+SPEC_TEXT = ROOT / "spec"
 OUT = ROOT / "temp" / "spec-audit"
 
 MEASURED_FIELDS = {
@@ -162,7 +162,29 @@ def measure_structures() -> dict:
     }
 
 
+def missing_scan_inputs() -> list[str]:
+    """Name the absent upstream artifacts instead of letting a traceback do it.
+
+    Same discipline as the L7 mixmode layer (`no output` is not a failure
+    detail, it is a collection failure): an empty temp/ is indistinguishable
+    from a real regression unless the tool says which file it wanted and which
+    command writes it.
+    """
+    want = [SCAN / "stats.json", SCAN / "csv" / "bucket_keys.csv", SCAN / "manifest.json"]
+    return [str(p.relative_to(ROOT)) for p in want if not p.exists()]
+
+
 def main() -> int:
+    gaps = missing_scan_inputs()
+    if gaps:
+        print(json.dumps({"status": "SKIP", "reason": "上游语料扫描件缺失",
+                          "missing": gaps,
+                          "rebuild": "python scripts/corpus_scan.py --limit 0 --batch 40"
+                                     " && python scripts/corpus_detail.py"},
+                         ensure_ascii=False, indent=1))
+        print("本工具不重跑扫描：它需要解密 worker 与整个草稿根，属于有代价的上游步骤，"
+              "不该被一次覆盖台账悄悄触发。")
+        return 2
     OUT.mkdir(parents=True, exist_ok=True)
     blob = spec_tokens()
     inv = load_inventory()

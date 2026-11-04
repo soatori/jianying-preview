@@ -212,8 +212,10 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--repeat", type=int, default=3,
                     help="battery runs per criterion; verdicts are medians. "
-                         "自 2026-10-29 起也覆盖 `L4 frame budget`：整条时间轴那层会跑 "
-                         "repeat 个点（每点约 +1~2 分钟墙钟，含交界 settle）")
+                         "自 2026-10-29 起也覆盖 `L4 frame budget`，自 2026-11-02 起再覆盖 "
+                         "`L4 live pacing`：这两层各跑 repeat 个点，**每个点自己吃线、全部过才绿**"
+                         "（不取中位——取中位会被一个离群点平均掉）。代价：整条约 +1~2 分钟/点，"
+                         "直播节奏约 +50 s/点（含交界 settle）")
     ap.add_argument("--settle-seconds", type=float, default=12.0,
                     help="相邻**起浏览器的阶段**之间的空机等待，语义同 "
                          "temp/playback-test/s1_split_ab.py 的 S1_SETTLE（等上一轮 Chrome 连同 "
@@ -470,11 +472,19 @@ def main() -> int:
             # Every criterion is judged on the median across runs and printed with its tail. A
             # single reading is what let one 351 ms first frame and one zero-clip run each look
             # like "the answer" (Q-8, Q-9).
+            fresh = series(lambda d: play(d).get("fresh_track_frames_per_second"))
+            # `composited_fps` 是 rAF 均值，**零解码也照样满格**：代理片那一跑 28.4/28.9/28.4 fps
+            # 全绿，而 `decoded=0`、`opens` 里只有 7 个 mp3——画面全黑，只是没有解码可等。
+            # 所以这一条判据必须同时要求「有新帧到达」，否则它测的是空闲而不是流畅。
             verdict("L4 continuous playback",
-                    (med(fps) or 0) >= CRITERIA["composited_fps_min"],
-                    f"median {med(fps)} fps (>=24), min {fps[0] if fps else '-'}, n={len(runs)}")
+                    (med(fps) or 0) >= CRITERIA["composited_fps_min"] and (med(fresh) or 0) > 0,
+                    f"median {med(fps)} fps (>=24) with {med(fresh)} fresh track frames/s (>0), "
+                    f"min {fps[0] if fps else '-'}, n={len(runs)}"
+                    + ("" if (med(fresh) or 0) > 0 else "  ← 合成帧数达标但没有任何新视频帧：黑屏空转"))
+            nod = sum(len((d.get("seek") or {}).get("no_decode_positions") or []) for d in runs)
             verdict("L4 seek", (med(seek) or 1e9) <= CRITERIA["seek_median_ms_max"],
-                    f"median of per-run medians {med(seek)} ms (<=150), worst {max(seek) if seek else '-'}")
+                    f"median of per-run medians {med(seek)} ms (<=150), worst {max(seek) if seek else '-'}"
+                    + (f", {nod} seek(s) produced no frame" if nod else ""))
             over = sum(1 for v in first if v > CRITERIA["first_frame_ms_max"])
             verdict("L4 first frame", (med(first) or 1e9) <= CRITERIA["first_frame_ms_max"],
                     f"median {med(first)} ms (<=300), "
@@ -485,7 +495,7 @@ def main() -> int:
 
             # ---- 4b. L4 帧预算：整条时间轴跑 repeat 遍，判尾部而不是均值 -----------------------
             jd: list[dict] = []
-            ld: dict = {}   # --skip-jank 时这两个不进 L6 的分母，但名字必须存在（L6 要引用）
+            ld_runs: list[dict] = []   # --skip-jank 时两摊都是空，不进 L6 的分母
             # 用户报"一顿一顿"而门全绿，有两条理由：①`composited_fps` 是帧数÷墙钟的**均值**，
             # 一帧 1.2 s 的停顿摊进均值只剩 0.03 fps；②电池只跑 10 s 还带 seek，实测最坏那十帧
             # 落在 5.7~16.4 s，从没被覆盖过。这层自己走完整条时间轴，判 p95/max，并把
@@ -563,55 +573,81 @@ def main() -> int:
                 # 不显式带 &tag= 而依赖页面默认值，就会去读一个永远不增长的 `report-playback.jsonl`，
                 # 症状是"页面什么都没回答"。所以 URL 里写死 tag，读的也就是那个文件。
                 lrep = OUT / "report-livepacing.jsonl"
-                before = len(lrep.read_text(encoding="utf-8").splitlines()) if lrep.exists() else 0
-                settle_before("直播节奏 livepacing")
-                run([PY, "scripts/browser_soak.py", "--url",
-                     f"http://127.0.0.1:{port}/playback-test/{args.player}"
-                     f"?liveplay={live_ms}&model={Path(media_model).name}"
-                     f"&drive=timer&fps=30&tag=livepacing",
-                     "--seconds", str(int(live_ms / 1000) + 25),
-                     "--report", str(lrep.relative_to(ROOT)), "--tag", "livepacing"])
-                lines = lrep.read_text(encoding="utf-8").splitlines() if lrep.exists() else []
-                ld = json.loads(lines[-1]) if len(lines) > before else {}
-                lv = ld.get("live") or {}
-                # 音画残差：音频时钟走过的秒数与播放头走过的秒数之差。
-                # 必须**截到播放头还在走的那段**——时间轴走完 pos 就钉在 DUR，
-                # 而 ctx 继续跑到 liveplay 窗口结束，不截就会看到 +4.9 s 的假失步（本轮就差点报出去）。
                 dur = m["duration_us"] / 1e6
-                ctk = [x for x in (lv.get("clock_track") or []) if len(x) > 2 and x[2] is not None]
-                playing_pts = [x for x in ctk if x[1] < dur - 0.05]
-                avres: list[float] = []
-                if len(playing_pts) > 5:
-                    p0, c0 = playing_pts[0][1], playing_pts[0][2]
-                    avres = [(x[2] - c0) / 1000.0 - (x[1] - p0) for x in playing_pts]
-                av_max = max((abs(v) for v in avres), default=None)
-                nfr, p95, mx = lv.get("frames"), lv.get("gap_p95_ms"), lv.get("gap_max_ms")
-                okl = (isinstance(nfr, int) and nfr > 200
-                       and isinstance(p95, (int, float)) and p95 <= 50.0
-                       and isinstance(mx, (int, float)) and mx <= 150.0
-                       and avres and av_max is not None and av_max <= 0.05)
+
+                # ---- 直播节奏现在吃分布（U-102 / #31）----
+                # 改前它是整门里唯一一个"分布型判据只吃 n=1"的层：P-100 那一跑残差 950 ms、
+                # paint max 6272 ms 报红，而我在门内外重跑 12 个点都没再现（P-101 ②）。
+                # 一个不能被复现的数既不该记成缺陷、也不该记成通过 —— 所以给它和帧预算同样的待遇：
+                # 每点各自吃线，全部过才绿，**不取中位**（取中位会让被污染的那点被其余点平均掉）。
+                # 代价（明写）：每多点 ≈ live_ms(本机 ~40 s) + settle(12 s) ⇒ --repeat 3 比改前多约 1.7 分钟。
+                def pace(d: dict) -> dict:
+                    """把一个直播读数压成判据要素。残差必须**截到播放头还在走的那段**——
+                    时间轴走完 pos 就钉在 DUR，而 ctx 继续跑到 liveplay 窗口结束，
+                    不截就会看到 +4.9 s 的假失步（P-100 就差点把这笔报出去）。"""
+                    lv = d.get("live") or {}
+                    ctk = [x for x in (lv.get("clock_track") or []) if len(x) > 2 and x[2] is not None]
+                    playing = [x for x in ctk if x[1] < dur - 0.05]
+                    avres: list[float] = []
+                    if len(playing) > 5:
+                        p0, c0 = playing[0][1], playing[0][2]
+                        avres = [(x[2] - c0) / 1000.0 - (x[1] - p0) for x in playing]
+                    av_max = max((abs(v) for v in avres), default=None)
+                    nfr, p95, mx = lv.get("frames"), lv.get("gap_p95_ms"), lv.get("gap_max_ms")
+                    ok = (isinstance(nfr, int) and nfr > 200
+                          and isinstance(p95, (int, float)) and p95 <= 50.0
+                          and isinstance(mx, (int, float)) and mx <= 150.0
+                          and avres and av_max is not None and av_max <= 0.05)
+                    return {"lv": lv, "n": nfr, "p95": p95, "max": mx,
+                            "av_max": av_max, "ok": ok}
+
+                for i in range(args.repeat):
+                    before = len(lrep.read_text(encoding="utf-8").splitlines()) if lrep.exists() else 0
+                    settle_before(f"直播节奏 livepacing#{i}")
+                    run([PY, "scripts/browser_soak.py", "--url",
+                         f"http://127.0.0.1:{port}/playback-test/{args.player}"
+                         f"?liveplay={live_ms}&model={Path(media_model).name}"
+                         f"&drive=timer&fps=30&tag=livepacing",
+                         "--seconds", str(int(live_ms / 1000) + 25),
+                         "--report", str(lrep.relative_to(ROOT)), "--tag", "livepacing"])
+                    lines = lrep.read_text(encoding="utf-8").splitlines() if lrep.exists() else []
+                    d = json.loads(lines[-1]) if len(lines) > before else {}
+                    if d:
+                        ld_runs.append(d)
+                pts = [pace(d) for d in ld_runs]
+                bad_pts = [p for p in pts if not p["ok"]]
+                okl = bool(pts) and not bad_pts
+                worst = (max(pts, key=lambda p: p["max"] if isinstance(p["max"], (int, float)) else -1)
+                         if pts else None)
                 verdict("L4 live pacing + A/V residual (drive=timer, not real rAF)", okl,
-                        f"n={nfr} 帧 gap p50={lv.get('gap_p50_ms')} p95={p95} max={mx} ms"
-                        f"（p95<=50 / max<=150）；音画残差 max={None if av_max is None else round(1000*av_max)} ms"
-                        f"（<=50，截到播放头走完为止）；paint p50={lv.get('paint_p50_ms')} "
-                        f"p95={lv.get('paint_p95_ms')} "
-                        f"driver={lv.get('driver')} avclk={lv.get('avclk')} 错误={len(ld.get('tick_errors') or [])}")
+                        (f"未取到任何直播读数（{args.repeat} 个点全部空）——不是通过，是采集失败"
+                         if not pts else
+                         f"{len(pts)}/{args.repeat} 个点各自吃线，未过线点 {[i for i, p in enumerate(pts) if not p['ok']]}\n"
+                         + "\n".join(
+                             f"  #{i}: n={p['n']} gap p50={p['lv'].get('gap_p50_ms')} "
+                             f"p95={p['p95']} max={p['max']} ms；"
+                             f"残差 max={None if p['av_max'] is None else round(1000 * p['av_max'])} ms；"
+                             f"paint p50={p['lv'].get('paint_p50_ms')} p95={p['lv'].get('paint_p95_ms')}；"
+                             f"错误={len(d.get('tick_errors') or [])} "
+                             + ("✅" if p["ok"] else "❌")
+                             for i, (p, d) in enumerate(zip(pts, ld_runs)))
+                         + (f"\n  判据：gap p95<=50 / gap max<=150 / 残差<=50 ms / n>200（每点都要过）"
+                            f" | 最坏点 max={worst['max']}" if worst else "")))
             else:
                 checks.append(("L4 live pacing + A/V residual (drive=timer, not real rAF)", "SKIP",
-                               "--skip-jank：直播节奏这条真实通路的 tick 未测"))
+                               f"--skip-jank：直播节奏这条真实通路的 tick 未测（本应有 --repeat={args.repeat} 个点）"))
 
+            extra_runs = [(f"整条时间轴#{i}", d) for i, d in enumerate(jd)]
+            extra_runs += [(f"直播节奏#{i}", d) for i, d in enumerate(ld_runs)]
             # L6 的分母原本只有 10 s 电池那几条跑，于是**整条时间轴那跑里的黑屏从来没被 judge 过**。
             # P-85 就是这么一条：flag=2 叠层 `C7817`（窗口 10.733–12.467 s）在整条跑里连续 ≥5 帧没出图，
             # 同跑 L6 仍报 0/1。判"有没有静默黑屏"却不看用户实际会走完整条的那一遍，等于只在一小段
             # 采样里有牙齿。现在把整条跑（jank）与直播节奏跑（livepacing）一起纳入，并按路径标注，
-            # 免得两个分母混成一个数。整条跑现在每 repeat 一个点，所以逐点列出（`整条时间轴#i`）。
-            extra_runs = [(f"整条时间轴#{i}", d) for i, d in enumerate(jd)]
-            if ld:
-                extra_runs.append(("直播节奏", ld))
-            # --skip-jank 时 jd/ld 是空。空 dict 的 black_streaks 是 falsy，原来会被当成
+            # 免得两个分母混成一个数。两摊现在都是每 repeat 一个点，所以逐点列出。
+            # --skip-jank 时 jd/ld_runs 是空。空 dict 的 black_streaks 是 falsy，原来会被当成
             # "0 条黑屏"计进 2 的分母 ⇒ 用没跑过的跑充数。只计真取到读数的跑，缺几条写进 detail。
-            # 期望点数 = repeat 条整条 + 1 条直播（改前这个 2 是写死的）。
-            expected_x = args.repeat + 1
+            # 期望点数 = repeat 条整条 + repeat 条直播（改前这个 2 是写死的）。
+            expected_x = 2 * args.repeat
             missing_x = expected_x - len(extra_runs)
             bad = [d for d in runs if d.get("black_streaks") or d.get("errors")]
             bad_x = [(name, d) for name, d in extra_runs
@@ -734,9 +770,20 @@ def main() -> int:
     # 也不等于「下次改坏了还有人记得跑」。数学侧的 GPU 三方对照默认不跑（要起浏览器，
     # 且它测的是常量而非常规回归），要跑用 --mixmode-gpu，判据读表不读 stdout。
     if not args.skip_mixmode:
+        # 抽取件是**装机的派生物**，不进 git：temp/ 一旦被重建（换机、清盘、重建 venv 那一族），
+        # 这三层会同时红，而报出来的话是 `no output` 与 "3 of 6"，看起来像播放器坏了。
+        # 所以缺了就当场补建一次（只读安装目录，产物只落 temp/），并把补建本身写成一条读数。
+        mm = OUT / "mixmode" / "manifest.json"
+        note = ""
+        if not mm.exists():
+            mk = run([PY, "scripts/mixmode_extract.py", "--out-dir", str(mm.parent)])
+            note = ("（抽取件缺失，已由本层补建）" if mk.returncode == 0
+                    else "（抽取件缺失且补建失败：" + (mk.stderr.strip().splitlines() or ["?"])[-1][:80] + "）")
         ex = run([PY, "scripts/mixmode_shaders.py"])
-        last = (ex.stdout.strip().splitlines() or ["no output"])[-1]
-        verdict("L7 mixmode shipped GLSL", ex.returncode == 0, last[:150])
+        # 详情取 stdout 末行，但**空 stdout 时必须有东西可看**：这一层曾报 `no output` 而真因是
+        # `temp/playback-test/mixmode/manifest.json` 不存在（抽取件没建），traceback 全在 stderr 里被丢掉。
+        last = (ex.stdout.strip().splitlines() or ex.stderr.strip().splitlines() or ["no output"])[-1]
+        verdict("L7 mixmode shipped GLSL", ex.returncode == 0, last[:150] + note)
         wr = run([PY, "scripts/mixmode_wiring_check.py", "--model", args.model])
         tail = [ln for ln in wr.stdout.splitlines() if "wiring checks" in ln]
         verdict("L7 mixmode wiring (constructed fixture)", wr.returncode == 0,
@@ -756,7 +803,7 @@ def main() -> int:
         if args.mixmode_gpu:
             settle_before("L7 mixmode GPU 三方")
             eq = run([PY, "scripts/mixmode_equivalence.py"], timeout=args.mixmode_seconds)
-            tp = ROOT / "docs" / "evidence" / "tables" / "mixmode_equivalence.csv"
+            tp = ROOT / "evidence" / "tables" / "mixmode_equivalence.csv"
             bad: list[str] = []
             n_rows = 0
             if tp.exists():

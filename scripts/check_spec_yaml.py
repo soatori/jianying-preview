@@ -18,7 +18,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = ROOT / "docs" / "spec"
+SPEC = ROOT / "spec"
 errors: list[str] = []
 advisories: list[str] = []
 

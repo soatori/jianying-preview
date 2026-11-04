@@ -290,16 +290,31 @@ class DllCrypto:
         return out.read()
 
     def decrypt_bytes(self, data: bytes) -> bytes:
-        """In-memory decrypt. Tries the flagged overload first, then the plain one."""
+        """In-memory decrypt. Tries every overload; only real plaintext counts.
+
+        A cold-loaded DLL can report success and hand back an empty buffer
+        (observed with 11.7.0.14652, where the flagged overload returns
+        ok=true / 0 bytes for *any* input, including its own ``encrypt``
+        output). Returning that as "decrypted" both hides the failure from the
+        caller and short-circuits the remaining overloads, so empty output is a
+        failure unless the input was empty.
+        """
         flagged = [s for s in (self.symbols.mem_decrypt or []) if s.endswith("AEA_N@Z")]
         plain = [s for s in (self.symbols.mem_decrypt or []) if s not in flagged]
         errors: list[str] = []
         for symbol, with_flag in [(s, True) for s in flagged] + [(s, False) for s in plain]:
             try:
-                return self._mem_decrypt(symbol, data, with_flag)
+                out = self._mem_decrypt(symbol, data, with_flag)
             except CryptoUnavailable as exc:
                 errors.append(f"{symbol}: {exc}")
-        raise CryptoUnavailable("no decrypt overload succeeded: " + "; ".join(errors))
+                continue
+            if out or not data:
+                return out
+            errors.append(f"{symbol}: {len(data)} B in -> 0 B out (reported ok)")
+        raise CryptoUnavailable(
+            f"no decrypt overload produced plaintext from {len(data)} B in {self.version}: "
+            + "; ".join(errors)
+        )
 
     def encrypt_bytes(self, data: bytes) -> bytes:
         return self._mem_encrypt(data)

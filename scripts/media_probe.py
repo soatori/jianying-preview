@@ -204,6 +204,7 @@ def probe_codec(path: Path):
     except Exception as exc:  # pragma: no cover
         return {"codec_error": f"PyAV unavailable: {exc}"}
     out = {"streams": []}
+    rot: dict = {}          # 按流号缓存首帧读数：旋转是每条视频轨自己的事
     try:
         with av.open(str(path)) as c:
             out["container"] = c.format.name
@@ -216,8 +217,22 @@ def probe_codec(path: Path):
                              w=s.width, h=s.height, coded_w=getattr(cc, "coded_width", None),
                              coded_h=getattr(cc, "coded_height", None),
                              fps=round(float(s.average_rate), 3) if s.average_rate else None,
-                             rotation=getattr(s, "rotation", None), frames=s.frames,
+                             frames=s.frames,
                              bit_rate=getattr(cc, "bit_rate", None))
+                    # 旋转只挂在**解出来的帧**上：PyAV 19 的 Stream 根本没有 .rotation，
+                    # 原先的 getattr(s,"rotation") 恒为 None，于是把 Sony 竖拍（tkhd 矩阵 = 90°）
+                    # 报成"无旋转"——而那正是本播放器 place() 要专门补偿的形态，报错比不报更坏。
+                    rot_key = f"rot{s.index}"
+                    if rot_key not in rot:
+                        try:
+                            frame = next(c.decode(s))
+                            rot[rot_key] = getattr(frame, "rotation", 0) or 0
+                        except Exception as exc:
+                            rot[rot_key] = None
+                            rot[rot_key + "_error"] = f"{type(exc).__name__}: {exc}"
+                    d["rotation"] = rot[rot_key]
+                    quarter = abs((rot[rot_key] or 0) % 180) == 90
+                    d["display_w"], d["display_h"] = (s.height, s.width) if quarter else (s.width, s.height)
                 elif s.type == "audio":
                     cc = s.codec_context
                     d.update(sample_rate=getattr(cc, "sample_rate", None),
@@ -258,10 +273,15 @@ def main():
         if not args.quiet:
             v = [t for t in rec.get("tracks", []) if t.get("handler") == "vide"]
             a = [t for t in rec.get("tracks", []) if t.get("handler") == "soun"]
+            moov = rec.get("moov")
+            # 草稿里的 combination 桩文件根本没有 moov（"moov atom not found"）：
+            # 这是素材自己的状态，不能变成探针的 KeyError。
+            moov_txt = (f"moov@{moov.get('offset')} {moov.get('position')} "
+                        f"size={(moov.get('size') or 0)/1000:.0f}KB "
+                        f"尾读到文件尾={(moov.get('to_eof_bytes') or 0)/1000:.0f}KB"
+                        if moov else "moov=ABSENT")
             print(f"== {rec['file']} {rec['bytes']/1e6:.1f}MB brand={rec.get('brand')} "
-                  f"container={rec['codec'].get('container')} moov@{rec['moov']['offset']} "
-                  f"{rec['moov']['position']} size={rec['moov']['size']/1000:.0f}KB "
-                  f"尾读到文件尾={rec['moov'].get('to_eof_bytes', 0)/1000:.0f}KB")
+                  f"container={rec['codec'].get('container')} {moov_txt}")
             for t in v:
                 g = t.get("gop_frames")
                 print(f"   [V] {t.get('fourcc')} {t.get('coded_w')}x{t.get('coded_h')} ts={t['timescale']} "
@@ -279,8 +299,10 @@ def main():
             for s in st:
                 if s.get("type") == "video":
                     print(f"   [codec] {s.get('codec')} profile={s.get('profile')} pix={s.get('pix_fmt')} "
-                          f"{s.get('w')}x{s.get('h')} coded={s.get('coded_w')}x{s.get('coded_h')} "
-                          f"fps={s.get('fps')} rot={s.get('rotation')} bitrate={s.get('bit_rate')}")
+                          f"coded={s.get('w')}x{s.get('h')} display={s.get('display_w')}x{s.get('display_h')} "
+                          f"rot={s.get('rotation')} fps={s.get('fps')} bitrate={s.get('bit_rate')}"
+                          + ("  ← 竖拍陷阱：显示尺寸与编码尺寸换了轴"
+                             if s.get("display_w") and s.get("w") and s.get("display_w") != s.get("w") else ""))
                 else:
                     print(f"   [acodec] {s.get('codec')} {s.get('sample_rate')}Hz ch={s.get('channels')} "
                           f"layout={s.get('layout')}")

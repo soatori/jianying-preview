@@ -433,3 +433,21 @@ known_limits:                     # 已定位、量级已知、**决定不修**�
   geometry_warning:
     rule: "任何跨腿的码值/亮度比较，必须先核验三腿的**宽高比与中心框比例一致**（浏览器截图是 stage 内容包围盒，540 宽常配 540×953，不是 540×960）"
     why: "本项目已两次把几何失配读成色彩差：F-083 的猜带、P-39 的 256 像素固定中心框（假 +21 码值）"
+  two_rotation_axes:
+    rule: >-
+      画面方向有**两条独立的轴**，不可合并成一个数：草稿侧 `segment.clip.rotation`（作者转的角度，
+      picture.yaml `clip.shape.rotation`）与容器侧旋转（MP4 `tkhd` 矩阵 / 解码帧 `frame.rotation`，
+      草稿 JSON 里**没有**）。只有容器侧那条由 `player.html:place()` 用「四分之一转换轴 +
+      node.rotation=rot」单独补偿（`player.html:1294-1301`，页行号会漂，认函数 `place()`）。
+    measured: "本样本 Sony 竖拍源：coded 1920×1080 + rot=90 → 显示 1080×1920（47 Mbps、GOP 1 s、`twos` 音轨、moov 在文件尾）"
+    proxy_interaction: >-
+      `make_all_proxies.py` 没有传 `-noautorotate`，所以代理把容器旋转**烘进像素**：
+      源 coded 1920×1080/rot 90 → 代理 coded 1080×1920/rot 0。显示几何不变（两条路落同一个框），
+      离线通道（ffmpeg 同样 autorotate）也不变——四条腿都对齐。
+      但**这个等价只在 place() 继续按 rot 换轴时成立**：谁把两轴合并、或去掉那段补偿，
+      代理片会悄悄把竖拍当横拍，而且门不会红。
+    do_not: >-
+      不要因为「代理已经竖了」就把 `frame.rotation` 从 place() 里删掉；也不要给代理配方加
+      `-noautorotate` 来「保持逐字节同形」——那会让代理与源的 rot 语义相同但离线腿的 autorotate
+      仍在，两条腿反而分叉。
+    evidence: "P-98 ④b（evidence/playback-log.md）；探针 scripts/media_probe.py 现直接报 coded= 与 display= 两个尺寸"

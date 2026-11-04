@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DOCS = ROOT / "docs"
+DOCS = ROOT
 # Every corpus snapshot on the machine is tie-able: the r3 baseline lives in
 # corpus-scan/, and the 2026-10-22 legs (drift control, both-roots) sit beside it.
 # A quoted number is only honest if the run it came from is still on disk.

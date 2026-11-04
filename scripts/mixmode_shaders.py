@@ -110,7 +110,7 @@ def main() -> int:
         "  return MIXMODE[pkgMd5] ? { ...MIXMODE[pkgMd5], frag: MIXMODE_FRAGMENTS[pkgMd5] } : null;\n"
         "}\n", encoding="utf-8")
 
-    tbl = ROOT / "docs" / "evidence" / "tables" / "mixmode_shipped.csv"
+    tbl = ROOT / "evidence" / "tables" / "mixmode_shipped.csv"
     with tbl.open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["name_id", "package_md5", "draft_name_zh", "premul_fn", "vendor_sha16",

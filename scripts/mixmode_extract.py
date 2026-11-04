@@ -52,18 +52,22 @@ def main() -> int:
     ap.add_argument("--install", default=None,
                     help="剪映安装目录（版本目录）；缺省由 scripts/jy_paths.py 自动检测")
     ap.add_argument("--out-dir", default=str(ROOT / "temp" / "mixmode"))
-    ap.add_argument("--table", default=str(ROOT / "docs" / "evidence" / "tables" / "mixmode_frag_manifest.csv"))
+    ap.add_argument("--table", default=str(ROOT / "evidence" / "tables" / "mixmode_frag_manifest.csv"))
     args = ap.parse_args()
 
     install = Path(args.install) if args.install else jy_paths.install_dir()
     mixdir = install / "Resources" / "MixMode"
     index = json.loads((mixdir / "MixMode.json").read_text(encoding="utf-8-sig"))
     out = Path(args.out_dir)
+    if not out.is_absolute():
+        # 相对 --out-dir 必须按仓库根算：下面 `dest.relative_to(ROOT)` 拿到相对 dest 会直接炸
+        # （`temp\playback-test\mixmode\... is not in the subpath of 'D:\...'`），而清单已经写了一半。
+        out = ROOT / out
     (out / "frags").mkdir(parents=True, exist_ok=True)
 
     # 草稿侧中文名来自 F-049 的连接表（没有也不致命，只少一列）
     names: dict[str, str] = {}
-    pkg_csv = ROOT / "docs" / "evidence" / "tables" / "mixmode_packages.csv"
+    pkg_csv = ROOT / "evidence" / "tables" / "mixmode_packages.csv"
     if pkg_csv.exists():
         with pkg_csv.open(encoding="utf-8-sig") as fh:
             for row in csv.DictReader(fh):
