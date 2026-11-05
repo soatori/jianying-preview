@@ -284,6 +284,10 @@ def judge(args) -> int:
     ours, our_rate = read_wav(Path(args.capture))
     exp, exp_rate = read_wav(Path(args.export_audio))
     segs = audio_segments(Path(args.media_model), args.min_seg)
+    # 起播点之前的段既没机会播、也谈不上"我方比成片轻"，留在段统计里会造出 101 dB 这种假散布
+    # （6B591400@0.0–0.567 在 start=1.81 之前，被我方读成 −120 ⇒ 整条判定被它一家扛走）。
+    n_pre = sum(1 for s in segs if s[2] <= args.start_s + 1e-6)
+    segs = [s for s in segs if s[2] > args.start_s + 1e-6]
     tol = args.tol if args.tol > 0 else SELF_Spread_DB
     if args.control:
         ctl, ctl_rate = read_wav(Path(args.control))
@@ -306,7 +310,15 @@ def judge(args) -> int:
     duty = (dour / dexp) if dexp else 1.0
     holes = find_holes(ours, our_rate, exp, exp_rate, args.hole_s,
                        args.hole_our_db, args.hole_exp_db)
+    # 洞要分两类算（P-153）：跑从 `firstPlayable` 起播（这几次实测 1.81 s），**起点之前**没声音
+    # 是首播边界、不是交付缺陷；只有起点之后的洞才是"该播而没播"。坐标不说清楚就会把边界算成故障。
+    before = [h for h in holes if h["t1"] <= args.start_s + 1e-6]
+    holes = [h for h in holes if h["t1"] > args.start_s + 1e-6]
+    for h in holes:
+        h["t0"] = round(max(h["t0"], args.start_s), 3)
+        h["seconds"] = round(h["t1"] - h["t0"], 3)
     hole_s = sum(h["seconds"] for h in holes)
+    before_s = sum(h["seconds"] for h in before)
     # 丢窗不许当成"过"：把录音挪出范围会让参与判定的段变少，散布自然变小（P-141 的坑）
     # P-141 的牙齿：拟合/手工挪量不给绿——同一批段上散布在 −2.6 s 与 +1.0/+1.2 s 都能压进线内，
     # 固定对齐却是 10.6 dB ⇒ 这条散布对"对齐"没有分辨力。判定只能按固定对齐做，
@@ -317,13 +329,15 @@ def judge(args) -> int:
     if fitted or args.shift_ms != 0:
         note += "（挪量＝拟合/手工 ⇒ 只作诊断，不判绿）"
     print(f"{'PASS' if ok else 'FAIL'}  L29 audio vs export (delivery + relative level)   {note}   "
+          f"起播点前排除 {n_pre} 段；"
           f"成片有声段 {len(live)}/{len(rows)}，我方缺 {len(missing)} 段；"
           f"相对散布 max|Δ−中位| = {rel:.2f} dB（线 ≤{tol:.2f}，来自同内容自比；"
           f"窗被挪出录音范围的段 {n_drop}——不为 0 就不许判绿）；"
           f"整体偏移 {med:+.2f} dB（只报数，不判——律/增益侧，见 U-88）；"
           f"占空比 {duty:.3f}（我方/成片响窗比）；"
           f"我方静音而成片不静音的洞 {len(holes)} 处 / {hole_s:.2f} s（线 ≤{args.hole_allow:.2f} s，"
-          f"单洞 ≥{args.hole_s:.2f} s 才计）")
+          f"单洞 ≥{args.hole_s:.2f} s 才计；起播点 {args.start_s:.2f} s 之前另有 "
+          f"{len(before)} 处 / {before_s:.2f} s 算首播边界，不计入缺陷）")
     for h in holes[:8]:
         print(f"   洞：{h['t0']:.2f}–{h['t1']:.2f} s（{h['seconds']:.2f} s）")
     if missing:
@@ -434,6 +448,8 @@ def main() -> int:
     ap.add_argument("--tol", type=float, default=0.0, help="0＝用实测自身散布下限 4.41 dB")
     ap.add_argument("--silent-db", type=float, default=-60.0)
     ap.add_argument("--min-seg", type=float, default=0.5, help="短于此的段不参与（避免窗口边噪）")
+    ap.add_argument("--start-s", type=float, default=0.0,
+                    help="起播点（秒，时间线坐标）：这之前的静音算首播边界，不算交付缺陷")
     ap.add_argument("--hole-s", type=float, default=0.2,
                     help="连续这么久才算一个洞（秒）")
     ap.add_argument("--hole-allow", type=float, default=0.5,
