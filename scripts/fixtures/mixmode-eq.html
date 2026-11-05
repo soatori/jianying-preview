@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<!--
+  mixmode-eq.html — 混合模式三方比对台（P-121 重建版；原件随 temp 清理丢失，见 P-119 ③）。
+
+  判据口径（照 `evidence/findings.md` F-077 与 `scripts/mixmode_equivalence.py` 的契约，不自己发明）：
+    · **oracle 不誊写**：A 腿直接编译剪映包内 `.frag` 原文（`mixmode/frags/`，sha256 在 manifest）。
+    · B 腿是**独立写的 W3C Compositing-and-Blending 可分离式**（下面 `W3C` 那张表，不看包内代码）。
+    · C 腿（出厂件）编译 `mixmode/frags-shipped/`，字节一起回传，由 Python 与 numpy 实现对照。
+    · **两条腿吃同一份 8-bit 输入字节** ⇒ 差值只可能来自公式与 GPU 量化，不可能来自采样口径。
+  网格生成式与 `scripts/mixmode_opacity_reference.py` 一致（改这边要重跑那边）：
+      LV[i] = round(i*255/16)，fg = (LV[x], LV[y], 128, FA)，bg = (LV[y], LV[x], 64, BA)
+  17×17 × alpha 对 6 组 × `_alpha` ∈ {1.0, 0.5} × 分支 {1=预乘, 2=直通} ⇒ 每模式 24 个 pass、
+  每 pass 17*17*4 = 1156 次通道比较、24 个 pass 合计 27,744；pass_bytes 只发 state=1 的 12 个。
+  alpha-state uniform：三条腿都让**包内着色器不做任何转换**（fgAlphaState = bgAlphaState = blendAlphaState），
+  所以喂进去的字节就是该分支声明的那种解释方式（1=预乘、2=直通）。
+-->
+<html lang="zh"><head><meta charset="utf-8"><title>mixmode-eq</title></head>
+<body style="margin:0;background:#111;color:#ddd;font:12px/1.4 monospace">
+<pre id="log">boot</pre>
+<canvas id="cv" width="17" height="17"></canvas>
+<script type="module">
+const N = 17;
+const OUT = document.getElementById('log');
+const say = (t) => { OUT.textContent = t; console.log(t); };
+
+// ---- W3C 可分离式（独立写，不参照包内代码）--------------------------------------------
+// 约定：入参与返回值都是 0..1 的**非预乘**颜色；B(Cb, Cs) 按 Compositing-1/2 的 separable blend。
+const cl = (v) => v < 0 ? 0 : v > 1 ? 1 : v;
+const W3C = {
+  multiply:     (cb, cs) => cb * cs,
+  screen:       (cb, cs) => cb + cs - cb * cs,
+  darken:       (cb, cs) => Math.min(cb, cs),
+  lighten:      (cb, cs) => Math.max(cb, cs),
+  // overlay 分支看 **Cb**，hardlight 分支看 **Cs**（Compositing-1：overlay 就是 hardlight 把
+  // Cb/Cs exchange；两式的乘/屏项本身对称，所以这一对**只差在分支变量上**）。
+  // 原件把这两条写反了（在册基线 over_lay/glare_pc 的 s1/s2=255 就是它留下的形状），P-122 定对。
+  overlay:      (cb, cs) => cb <= 0.5 ? 2 * cs * cb : 1 - 2 * (1 - cs) * (1 - cb),
+  hardLight:    (cb, cs) => cs <= 0.5 ? 2 * cs * cb : 1 - 2 * (1 - cs) * (1 - cb),
+  softLight:    (cb, cs) => {
+      if (cs <= 0.5) return cb - (1 - 2 * cs) * cb * (1 - cb);
+      const d = cb <= 0.25 ? ((16 * cb - 12) * cb + 4) * cb : Math.sqrt(cb);
+      return cb + (2 * cs - 1) * (d - cb);
+  },
+  linearBurn:   (cb, cs) => cl(cb + cs - 1),
+  // colorBurn 的商是 (1 − **Cb**)/Cs；原件（和我第一版）把它写成了 (1 − Cs)/Cb。
+  // 边界按 Compositing-1：Cs=0 ⇒ 1，Cb=0 ⇒ 0。
+  colorBurn:    (cb, cs) => cs === 0 ? 1 : cb === 0 ? 0 : cl(1 - Math.min(1, (1 - cb) / cs)),
+  colorDodge:   (cb, cs) => cs === 1 ? 1 : cl(Math.min(1, cb / (1 - cs))),
+};
+// nameId -> W3C 函数（**故意按 CSS/W3C 的字面定义**给：F-077 量到包内的 叠加/强光 与 CSS 那一对相反，
+// 所以这两条必须对不上——对得上反而说明我把包内代码誊写进 B 腿了。）
+const W3C_BY_NAME = {
+  multiply_blend_mode: W3C.multiply, color_filter: W3C.screen, dark_en: W3C.darken,
+  bright_en: W3C.lighten, over_lay: W3C.overlay, glare_pc: W3C.hardLight,
+  soft_light: W3C.softLight, linear_deepening: W3C.linearBurn,
+  darken_color: W3C.colorBurn, color_dodge: W3C.colorDodge,
+};
+
+// ---- 输入字节：两条腿共用同一份 ----------------------------------------------------------
+const ALPHAS = [[1.0, 1.0], [0.9, 0.25], [0.25, 0.9], [0.5, 0.5], [1.0, 0.5], [0.5, 1.0]];
+const OPACITY = [1.0, 0.5];
+const LV = (i) => Math.round(i * 255 / (N - 1));
+function inputs(fa, ba, premul) {                 // premul=true ⇒ 分支 1（字节按预乘解释）
+  const fg = new Uint8Array(N * N * 4), bg = new Uint8Array(N * N * 4);
+  const a = Math.round(fa * 255), b = Math.round(ba * 255);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const o = (y * N + x) * 4;
+    // fg 的红/蓝通道取 x/y 级、bg 互换，保证前景/背景在两个方向上都扫到全级
+    const fr = LV(x), fgc = LV(y), br = LV(y), bgc = LV(x);
+    fg[o] = premul ? Math.round(fr * fa) : fr; fg[o + 1] = premul ? Math.round(fgc * fa) : fgc;
+    fg[o + 2] = premul ? Math.round(128 * fa) : 128; fg[o + 3] = a;
+    bg[o] = premul ? Math.round(br * ba) : br; bg[o + 1] = premul ? Math.round(bgc * ba) : bgc;
+    bg[o + 2] = premul ? Math.round(64 * ba) : 64; bg[o + 3] = b;
+  }
+  return [fg, bg];
+}
+
+// B 腿：同一份字节按分支解释 -> W3C 合成 -> 按分支约定写回 8-bit
+function w3cBytes(fg, bg, fn, opacity, premul) {
+  const out = new Uint8Array(N * N * 4);
+  const g = (arr, i, k) => arr[i * 4 + k] / 255;
+  for (let i = 0; i < N * N; i++) {
+    let fa = g(fg, i, 3), ba = g(bg, i, 3);
+    let cs = [0, 1, 2].map(k => premul ? (fa > 0 ? g(fg, i, k) / fa : 0) : g(fg, i, k));
+    let cb = [0, 1, 2].map(k => premul ? (ba > 0 ? g(bg, i, k) / ba : 0) : g(bg, i, k));
+    const sa = fa * opacity;                      // 图层不透明度只作用在前景 alpha 上
+    const ao = sa + ba - sa * ba;
+    for (let k = 0; k < 3; k++) {
+      const bb = fn(cb[k], cs[k]);
+      const straight = ao > 1e-6
+        ? ((1 - sa) * ba * cb[k] + (1 - ba) * sa * cs[k] + sa * ba * bb) / ao : 0;
+      const v = premul ? straight * ao : straight;
+      out[i * 4 + k] = Math.round(cl(v) * 255);
+    }
+    out[i * 4 + 3] = Math.round(cl(ao) * 255);
+  }
+  return out;
+}
+
+// ---- WebGL1 腿 ------------------------------------------------------------------------------
+// ⚠ `alpha` 必须是 **true**：这三条腿比的是**逐 texel 的 RGBA 四个通道**（每 pass 17*17*4=1156 次
+//   通道比较），而包内着色器的输出是 `vec4(color, alpha)`——绘图缓冲若没有 alpha，readPixels 的 A
+//   恒为 255，B 腿算出的 `ao` 与 C/numpy 腿的 alpha 就永远对不上（P-121 第一版就是这么读出
+//   每模式恒差 105 的：`ship=0` 说明两条 GPU 腿彼此一致、I/O 约定没错，错的是我把 alpha 丢了）。
+//   `premultipliedAlpha:false` 同理：合成由着色器自己做，绘图缓冲不许再按预乘解释一遍。
+const gl = document.getElementById('cv').getContext('webgl', {
+  preserveDrawingBuffer: true, alpha: true, premultipliedAlpha: false,
+  antialias: false, depth: false, stencil: false });
+gl.disable(gl.BLEND);                 // 着色器自己合成，帧缓冲不能再混一次
+gl.clearColor(0, 0, 0, 0);
+if (!gl) { say('NO WEBGL1'); throw new Error('no webgl1'); }
+const RENDERER = String(gl.getParameter(gl.RENDERER) || '');
+const VENDOR = String(gl.getParameter(gl.VENDOR) || '');
+say(`gpu vendor=${VENDOR} renderer=${RENDERER}`);
+// **自证 GPU 腿是真的**：SwiftShader/llvmpipe 这类软件光栅也能编 GLSL，但那不是"GPU 上的读数"，
+// F-077 记的读数是 ANGLE(... Direct3D11 ...) ⇒ 换环境时这条先亮出来，别把软件腿当 GPU 腿引用。
+const SOFTWARE = /swiftshader|llvmpipe|software/i.test(RENDERER);
+
+const VS = `attribute vec2 a_pos; varying vec3 uv0; varying vec2 uv1;
+void main(){ vec2 t = a_pos * 0.5 + 0.5; uv0 = vec3(t, 1.0); uv1 = t; gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+
+function compile(src, tag) {
+  const sh = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+    throw new Error(`compile ${tag}: ${gl.getShaderInfoLog(sh)}`.slice(0, 400));
+  const p = gl.createProgram();
+  gl.attachShader(p, sh);
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, VS); gl.compileShader(vs);
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) throw new Error('compile vs');
+  gl.attachShader(p, vs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error(`link ${tag}: ${gl.getProgramInfoLog(p)}`.slice(0, 400));
+  return p;
+}
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+function tex(arr) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, N, N, 0, gl.RGBA, gl.UNSIGNED_BYTE, arr);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function draw(prog, fgt, bgt, opacity, branch) {
+  gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  const loc = gl.getAttribLocation(prog, 'a_pos');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  gl.viewport(0, 0, N, N);
+  gl.clear(gl.COLOR_BUFFER_BIT);        // 每 pass 从透明黑起，别把上一 pass 的字节留在缓冲里
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fgt);
+  gl.uniform1i(gl.getUniformLocation(prog, '_MainTex'), 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bgt);
+  gl.uniform1i(gl.getUniformLocation(prog, 'baseTex'), 1);
+  gl.uniform1f(gl.getUniformLocation(prog, '_alpha'), opacity);
+  // 三个状态量：**相等**才让包内着色器跳过它的转换分支（`if (fgAlphaState != blendAlphaState)`）
+  for (const u of ['blendAlphaState', 'fgAlphaState', 'bgAlphaState'])
+    gl.uniform1i(gl.getUniformLocation(prog, u), branch);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  const px = new Uint8Array(N * N * 4);
+  gl.readPixels(0, 0, N, N, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  gl.deleteTexture(fgt); gl.deleteTexture(bgt);
+  return px;
+}
+const b64 = (u8) => { let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+                      return btoa(s); };
+
+async function main() {
+  const base = '/playback-test/mixmode';
+  const man = await (await fetch(`${base}/manifest.json`)).json();
+  const rows = [], passBytes = [];
+  const problems = [];
+  for (const pkg of man.packages) {
+    const nid = pkg.nameId;
+    let vsrc, ssrc;
+    try {
+      vsrc = await (await fetch(`${base}/frags/${nid}.frag`)).text();
+      ssrc = await (await fetch(`${base}/frags-shipped/${nid}.frag`)).text();
+    } catch (e) { problems.push(`${nid} 取 frag 失败 ${e}`); continue; }
+    if (vsrc.indexOf(pkg.frag_sha256) >= 0) { /* 原文里没有 sha 注释，占位防误解 */ }
+    let pv, ps;
+    try { pv = compile(vsrc, `${nid}/vendor`); ps = compile(ssrc, `${nid}/shipped`); }
+    catch (e) { problems.push(`${nid} 编译失败 ${e}`); continue; }
+    const fn = W3C_BY_NAME[nid];
+    if (!fn) { problems.push(`${nid} 没有 W3C 对照式（新包？先让它变红而不是变绿）`); continue; }
+    for (const branch of [1, 2]) {
+      for (const [fa, ba] of ALPHAS) for (const op of OPACITY) {
+        const [fg, bg] = inputs(fa, ba, branch === 1);
+        const ven = draw(pv, tex(fg), tex(bg), op, branch);
+        const shp = draw(ps, tex(fg), tex(bg), op, branch);
+        const ref = w3cBytes(fg, bg, fn, op, branch === 1);
+        let maxA = 0, over = 0, maxShip = 0;
+        for (let i = 0; i < ven.length; i++) {
+          const d = Math.abs(ven[i] - ref[i]);
+          if (d > maxA) maxA = d;
+          if (d > 1) over++;
+          const ds = Math.abs(ven[i] - shp[i]);
+          if (ds > maxShip) maxShip = ds;
+        }
+        rows.push({ name_id: nid, op: pkg.premul_fn, state: branch,
+                    texels: ven.length, over_1: over, max_abs_255: maxA,
+                    fa, ba, fg_alpha: op, ship_max_abs_255: maxShip });
+        if (branch === 1) passBytes.push({ name_id: nid, state: 1, n: N,
+            fg_in: b64(fg), bg_in: b64(bg), vendor: b64(ven), shipped: b64(shp), fg_alpha: op });
+      }
+    }
+    gl.deleteProgram(pv); gl.deleteProgram(ps);
+  }
+  const summary = rows.reduce((m, r) => {
+    (m[r.name_id] = m[r.name_id] || []).push(r); return m;
+  }, {});
+  say(`pass=${rows.length} bytes=${passBytes.length} softwareRaster=${SOFTWARE} ` +
+      Object.entries(summary).map(([k, v]) => `${k}:s1max=${Math.max(...v.filter(r => r.state === 1).map(r => r.max_abs_255))}`).join(' '));
+  await fetch('/report', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ tag: 'mixmode', epoch_base: Date.now() - performance.now(),
+                           epoch_sent: Date.now(),
+                           mixmode: { rows, pass_bytes: passBytes,
+                                      gpu: !SOFTWARE, renderer: RENDERER,
+                                      error: problems.length ? problems.join('; ') : '',
+                                      alphas: ALPHAS, opacity: OPACITY, grid: N } }) });
+  say(`posted rows=${rows.length} pass_bytes=${passBytes.length} problems=${problems.length}`);
+}
+main().catch(e => say('FATAL ' + e));
+</script>
+</body></html>

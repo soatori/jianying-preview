@@ -318,10 +318,31 @@ def main() -> int:
     s = m["stats"]
     verdict("L1 errors/warnings", not m["errors"] and not m["warnings"],
             f"errors {len(m['errors'])} warnings {len(m['warnings'])}")
-    verdict("L1 geometry channel", s["geometry_segments"] > 0,
+    # 裸比值挡不住部分塌：`clip` 取错对象那次的形状是静默 0/136（playback_model.py:504），
+    # 而"27 条 video 段掉了 3 条"在今天这条判据下仍然是绿。所以把无 clip 的段**按轨类型**摊开，
+    # 并要求画面类轨（video/text）一个都不许少——audio 段本就没有 clip，不参与判定。
+    def _clip_less(nodes):
+        out = []
+        for tr in nodes:
+            for sg in tr.get("segments") or []:
+                if not sg.get("clip"):
+                    out.append(tr.get("type"))
+                if sg.get("composite"):
+                    out += _clip_less(sg["composite"]["tracks"])
+        return out
+
+    clip_less = _clip_less(m["tracks"])
+    by_type: dict = {}
+    for t in clip_less:
+        by_type[t] = by_type.get(t, 0) + 1
+    visual_lost = sorted(f"{t} {by_type[t]}" for t in ("video", "text") if by_type.get(t))
+    verdict("L1 geometry channel", s["geometry_segments"] > 0 and not visual_lost,
             f"clip on {s['geometry_segments']}/{s['geometry_total']} segments, "
             f"{s['segment_count']} segments, {s['media_count']} media "
-            f"(missing {s['media_missing']}, unreadable {s['media_unreadable']})")
+            f"(missing {s['media_missing']}, unreadable {s['media_unreadable']}), "
+            f"无 clip 段 {by_type or {}} "
+            + (f"⇒ 画面轨丢了几何 {visual_lost}" if visual_lost else "")
+            + "（画面类轨 video/text 必须带 clip）")
     # 轨类型覆盖（U-98）：不判 PASS/FAIL —— 草稿里有 mixed/sticker 轨不是错误，
     # 但"没被任何一条腿路由的段数"必须出现在门面上，否则它又变成一个没人读的数。
     checks.append(("L1 track coverage", "INFO",
@@ -688,6 +709,38 @@ def main() -> int:
         # 合并成一个数就会把「两条通路不一致」读成「成片本来就这样」。
         if not args.skip_browser_shots:
             times = args.shot_times
+            # 闪白曲线表是**浏览器那一侧唯一的闪白输入**：`player.html:88-90` fetch 它，取不到就
+            # AE.n=0 ⇒ `flashApply` 全程空转，页面**不报错、只是不闪**。它和 mixmode 抽取件同族
+            # （派生物、不进 git、temp 一清就没）。P-119 那两条 `L10 t=6.633 跨通道 0.877 /
+            # 对成片 0.899` 就是这么来的：浏览器不闪，而通道 2 与成片闪。同页同网关同模型把表放回
+            # 原位后同刻读 0.973 / 0.934（负样本＝缺表那一跑本身）。所以缺了当场补建，并把表的
+            # 覆盖度与"截图有没有命中闪白窗"一起报出来——否则下一次又是"相关度塌了但没人知道
+            # 闪白根本没参与"。
+            ae = OUT / "ae-curves.json"
+            ae_note = ""
+            if not ae.is_file():
+                mk = run([PY, "scripts/ae_table_export.py", "--model", media_model,
+                          "--out", str(ae)])
+                ae_note = f"闪白表缺失，本层补建 rc={mk.returncode}; "
+            win, mm, astats = None, {}, {}
+            try:
+                tbl = json.loads(ae.read_text(encoding="utf-8"))
+                mm = json.loads(Path(media_model).read_text(encoding="utf-8-sig"))
+                astats = mm.get("stats") or {}
+                win = [(seg["target"]["start_us"] / 1e6,
+                        (seg["target"]["start_us"] + c["duration_us"]) / 1e6)
+                       for tr in mm.get("tracks") or [] for seg in tr.get("segments") or []
+                       for a in seg.get("animations") or []
+                       if a.get("kind") == "in"
+                       for c in [(tbl.get("curves") or {}).get(
+                           str(a.get("path") or "").replace("\\", "/"))] if c]
+                shot_ts = [float(x) for x in (s.strip() for s in times.split(",")) if x]
+                hit = sum(1 for v in shot_ts if any(s <= v < e for s, e in win))
+                ae_note += (f"闪白表 pkgs={len(tbl.get('curves') or {})} "
+                            f"段={tbl.get('segments_covered')}/{astats.get('animation_segments')} "
+                            f"截图命中={hit}; ")
+            except Exception as e:  # noqa: BLE001
+                ae_note += f"闪白表读不动（{type(e).__name__}: {str(e)[:60]}）⇒ 覆盖度不判; "
             for x in [s.strip() for s in times.split(",") if s.strip()]:
                 (OUT / f"browser-shot-{x.replace('.', '-')}.png").unlink(missing_ok=True)
             url = (f"http://127.0.0.1:{port}/playback-test/{args.player}"
@@ -709,9 +762,13 @@ def main() -> int:
                 rep = json.loads(js.read_text(encoding="utf-8"))
                 n = len([r for r in rep.get("rows", []) if "browser_vs_channel2" in r])
                 problems = len(rep.get("problems", []))
+            # 覆盖度牙齿：模型里有入场动画、闪白表一段都求值不出来 ⇒ 这一层量的只是"两条通路都不闪"
+            # 的帧，过线也不能算"闪白一致"。判红，不静默。
+            blind = bool(win is not None and not win and (astats.get("animation_segments") or 0) > 0)
             verdict("L10 browser pixels (vs channel 2 and vs export, same frame)",
-                    sh.returncode == 0 and n >= 3 and problems == 0,
-                    f"{n} timestamps compared, {problems} problems"
+                    sh.returncode == 0 and n >= 3 and problems == 0 and not blind,
+                    ae_note + f"{n} timestamps compared, {problems} problems"
+                    + (" | 模型有入场动画但闪白表 0 段可用⇒闪白这一族没被量到" if blind else "")
                     + (" | " + "; ".join((sh.stdout or "").strip().splitlines()[-4:])
                        if sh.returncode else ""))
 
@@ -816,9 +873,11 @@ def main() -> int:
                         over = int(row["numpy_cells_over_tolerance"])
                         if ship > 1 or npx > 1 or over > 0:
                             bad.append(f"{row['name_id']} ship={ship} numpy={npx} over={over}")
+            fix = next((ln.split(' ', 1)[1] for ln in (eq.stdout or "").splitlines()
+                        if ln.startswith("FIXTURE")), "夹具来源未报")
             verdict("L7 mixmode GPU three-way (vendor GLSL = oracle)",
                     eq.returncode == 0 and n_rows == 10 and not bad,
-                    f"{n_rows} modes read from the table, {len(bad)} out of tolerance"
+                    f"{fix} | {n_rows} modes read from the table, {len(bad)} out of tolerance"
                     # 判据不看 stdout，只看 rc + 表。所以子进程一旦非零，**表可能是上一跑的**
                     # （本轮就撞上一次：门里这层红、行里却写"10 modes / 0 out of tolerance"，
                     # 读起来像"全对却 FAIL"）。把 rc 与尾巴、表的 mtime 一起打出来，下次能归因。

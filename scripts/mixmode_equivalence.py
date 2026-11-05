@@ -87,6 +87,26 @@ def main() -> int:
         return 2
     manifest = json.loads((OUT / "mixmode" / "manifest.json").read_text(encoding="utf-8"))
 
+    # 2a. 比对台夹具：**在册件物化进 temp**（照 L0 对 player.html 的配方：临时件→replace→逐字节回读）。
+    #     这支页面是手写的测试夹具、不是装机派生物，过去只住在 gitignore 的 temp/ 里：
+    #     P-119 那次清 temp 后它没了，Chrome 打 404、页面从没报过 mixmode 载荷，而判定读的是
+    #     上一跑留在 evidence/tables 的旧表 ⇒ 门面上就是一行"10 modes 全在容差里却 FAIL"。
+    #     所以：在册件在场就覆盖 temp 件并打印来源，缺了才退回 temp 件（也打印，绝不静默）。
+    import hashlib
+    fixture = OUT / "mixmode-eq.html"
+    tracked = ROOT / "scripts" / "fixtures" / "mixmode-eq.html"
+    if tracked.is_file():
+        blob = tracked.read_bytes()
+        tmp = fixture.with_suffix(".html.sync.tmp")
+        tmp.write_bytes(blob)
+        tmp.replace(fixture)
+        note = "tracked:" + hashlib.sha256(blob).hexdigest()[:8]
+        note += "/synced" if fixture.read_bytes() == blob else "/MISMATCH"
+    elif fixture.is_file():
+        note = "temp-only:" + hashlib.sha256(fixture.read_bytes()).hexdigest()[:8]
+    else:
+        note = "ABSENT"
+    print("FIXTURE " + note)
     # 2. 起网关（serve-dir=temp => 页面 URL /playback-test/mixmode-eq.html）
     port = free_port()
     report = OUT / "report-mixmode.jsonl"
