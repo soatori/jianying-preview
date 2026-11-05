@@ -352,18 +352,24 @@ function ensureAudio() {
 // 视频侧 composited_fps 是均值，1.2 s 的停顿摊进均值只剩 0.03 fps）。ScriptProcessor 由音频
 // 线程连续喂，录 post-compressor 的混音，能判出静音段、削顶、跳变(click) 与对成片的电平差。
 // 边界要说清：这条证明的是"混音器产出了什么"，不是"声卡播出了什么"（驱动层问题看不见）。
-const CAP = { on: Q.get('tap') !== '0', chunks: [], rate: 0, node: null, caps: 0 };
+const CAP = { on: Q.get('tap') !== '0', chunks: [], rate: 0, node: null, caps: 0,
+              t0Pos: 0, trace: [] };   // P-142：录音第 0 个样本时的播放头，与 (音频时钟, 播放头) 轨迹
 
 function startCapture() {
   if (!CAP.on || CAP.node || !analyser) return;
   CAP.rate = actx.sampleRate;
   // 录音第 0 个样本对应哪一刻：墙钟与音频时钟都记下来。
   // 这样录音里的"声音起点"能换算回墙钟，再与时钟轨上"画面走到那段内容的墙钟"直接相减。
-  CAP.t0Wall = now(); CAP.t0Ctx = actx.currentTime;
+  CAP.t0Wall = now(); CAP.t0Ctx = actx.currentTime; CAP.t0Pos = pos;
+  CAP.trace = [[+actx.currentTime.toFixed(3), +pos.toFixed(3)]];
   CAP.node = actx.createScriptProcessor(4096, 2, 2);
   CAP.node.onaudioprocess = (e) => {
     CAP.chunks.push(Float32Array.from(e.inputBuffer.getChannelData(0)));
     CAP.caps++;
+    // 每 ~1 s 记一对（音频时钟, 播放头）：录音样本↔时间线的映射要**测**出来，
+    // 不能拿相关去凑（P-141：拟合能让散布在好几个不相干挪量上都达标，说明它没分辨力）。
+    if (CAP.caps % 12 === 0 && CAP.trace.length < 200)
+      CAP.trace.push([+actx.currentTime.toFixed(3), +pos.toFixed(3)]);
     const s = CAP.chunks.reduce((a, c) => a + c.length, 0) / CAP.rate;
     if (s > 75) { CAP.node.onaudioprocess = null; }   // 上限保护：不无限堆内存
   };
@@ -393,7 +399,8 @@ async function postCapture(name) {
   await fetch('/wave?name=' + encodeURIComponent(name), { method: 'POST', body: c.blob });
   return { seconds: +c.seconds.toFixed(2), blocks: c.blocks, bytes: c.blob.size, name,
     // 录音原点的两把时钟：样本 i 的墙钟 ≈ t0Wall + i/rate*1000（音频线程按 ctx 连续喂）。
-    t0_wall_ms: Math.round(CAP.t0Wall || 0), t0_ctx_ms: Math.round((CAP.t0Ctx || 0) * 1000) };
+    t0_wall_ms: Math.round(CAP.t0Wall || 0), t0_ctx_ms: Math.round((CAP.t0Ctx || 0) * 1000),
+    t0_pos_s: +(CAP.t0Pos || 0).toFixed(3), trace: CAP.trace };
 }
 
 function measureAudio() {
