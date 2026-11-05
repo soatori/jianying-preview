@@ -6847,3 +6847,15 @@ patcher 在 `assert` 处退出 ⇒ **文件没被写**，而我按预期写了�
 `report-synth-starved.jsonl`（把 p149 旁证里第 4 个作业的 `ctx1` 改成等于 `ctx0`）→
 `零排期段 = 1：87E30DAD`；同一份未改 → `0`；判定行会带上这栏账。
 三方读数至此都成立：0（好跑）／4（p150 真饿死）／1（合成）。
+
+## P-156 2026-11-05 停放前的门前置自检（证明接手的人可以直接起门，不必先修我自己留下的断口）
+- `l1_geometry_selftest.py`：SELFTEST PASS（正例绿、video 丢 clip 转红、audio 不误伤）。
+- 通道 2 调色开关自检：SELFTEST PASS（`COLOR['on']=True`，128 → (173,173,173)，无 brightness 的段逐位不变）。
+- `l10_guard_selftest.py`：SELFTEST PASS（L10 分支整段可 exec、正例不 blind、反例转红）
+  ——这条存在的原因很具体：本 session 早期一次改 L10 时行尾注释吞过字段、一次漏过 `ROOT`，
+  都靠"整段 exec"的自检在花钱起门**之前**接住。
+- `audio_match_check.py --selftest`：PASS（消音反例缺 6 段 + 108.67 dB 红；挖 0.4 s 洞被抓；同一份自比不误报）。
+- `py_compile`：audio_match_check / playback_check / render_frame / browser_shot_check / mixmode_equivalence / playback_model 全过；
+  页内模块 `node --check` 过；运行副本与在册件 md5 一致（L0 口径）。
+- 无本仓库起的 python 残留进程；放行仍须按 `idle_check.py` 的 RC 与四问，不用 tasklist 行数当判据。
+⇒ 停放状态下门是**可起跑**的；下一条动作按计划停放节的第 1 项（修饿死的音频泵，验收已写死）。
