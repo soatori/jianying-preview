@@ -280,7 +280,7 @@ def find_holes(ours: np.ndarray, our_rate: int, exp: np.ndarray, exp_rate: int,
     return holes
 
 
-def delivery_ledger(report: str) -> str:
+def delivery_ledger(report: str) -> tuple[str, int]:
     """把页内自己的交付账读出来贴在判定行旁边。
 
     为什么需要：`L29` 从音频推"有没有洞"，而**为什么**要看在跑时记下的账——
@@ -299,14 +299,15 @@ def delivery_ledger(report: str) -> str:
         if (j.get("play") or {}).get("audio"):
             obj = j["play"]["audio"]
     if not obj:
-        return "交付账：没有旁证可读"
+        return "交付账：没有旁证可读", 0
     ps = obj.get("per_seg") or []
     zero = [str(x.get("id"))[:8] for x in ps
             if x.get("ctx0") is not None and x.get("ctx1") is not None and x["ctx1"] <= x["ctx0"]]
-    return ("交付账：jobs_started=%s flushes=%s lost_s=%.2f s clamps=%s(%.0f ms) short_jobs=%s "
+    line = ("交付账：jobs_started=%s flushes=%s lost_s=%.2f s clamps=%s(%.0f ms) short_jobs=%s "
             "零排期段=%d%s" % (obj.get("jobs_started"), obj.get("flushes"), obj.get("lost_s") or 0,
                               obj.get("clamps"), obj.get("clamp_ms_total") or 0, obj.get("short_jobs"),
                               len(zero), ("：" + ",".join(zero[:6])) if zero else ""))
+    return line, len(zero)
 
 
 def judge(args) -> int:
@@ -353,8 +354,13 @@ def judge(args) -> int:
     # 固定对齐却是 10.6 dB ⇒ 这条散布对"对齐"没有分辨力。判定只能按固定对齐做，
     # 原点必须由页面实测给出（t0_ctx/t0_wall/first_playable），不许本脚本自己凑。
     # 交付这一半不只判"整段没响"，还判**跨段的洞**（P-150：段级读数 0 缺段却有 2.9 s 掉落 ⇒ 失明）
+    starved, ledger_line = 0, ""
+    if args.report_jsonl:
+        ledger_line, starved = delivery_ledger(args.report_jsonl)
+    # 零排期段：作业起了却一段都没排进图（P-154：坏跑 4 条、lost_s 10.95 s，好跑 0 条 / 0.17 s）。
+    # "起了却没排"本身就是失败，给它容差只会把失败摊成数值 ⇒ 这条不要阈值。
     ok = (not missing) and (rel <= tol) and (n_drop == 0) and not fitted and args.shift_ms == 0 \
-        and hole_s <= args.hole_allow
+        and hole_s <= args.hole_allow and starved == 0
     if fitted or args.shift_ms != 0:
         note += "（挪量＝拟合/手工 ⇒ 只作诊断，不判绿）"
     print(f"{'PASS' if ok else 'FAIL'}  L29 audio vs export (delivery + relative level)   {note}   "
@@ -377,7 +383,7 @@ def judge(args) -> int:
         print(f"   偏得最多的段：{worst['id']}@{worst['t0']}–{worst['t1']} Δ={worst['delta_db']} "
               f"（相对 {abs(worst['delta_db'] - med):.2f} dB）")
     if args.report_jsonl:
-        print("   " + delivery_ledger(args.report_jsonl))
+        print("   " + ledger_line)
     if args.dump:
         Path(args.dump).write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
     return 0 if ok else 1
