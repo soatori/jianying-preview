@@ -413,13 +413,23 @@ class Model:
         if seg.get("common_keyframes"):
             fx["keyframes"] = sorted({k.get("property_type", "").split("_")[-1] for k in seg["common_keyframes"]})
         effect_types = set()
+        # 调色滑杆的**值**也在 effects 里（`materials.effects[type=brightness].value`）。
+        # 只留类型名 = 看得见"这段调了色"却算不出来，通道 2/浏览器就只能整段跳过调色，
+        # 实测最坏一段比成片暗 36 %（P-129）。同类型多条时取**第一条非空值**：
+        # `figure`（美颜）有 528 条、类型内多值，但那些不是颜色滑杆，本字段先只被 brightness 消费。
+        effect_values = {}
         for r in refs:
             if r["bucket"] == "effects":
                 b, item = self.buckets[r["id"]]
                 if item.get("type"):
                     effect_types.add(item["type"])
+                    v = item.get("value")
+                    if isinstance(v, (int, float)) and effect_values.get(item["type"]) is None:
+                        effect_values[item["type"]] = float(v)
         if effect_types:
             fx["effects"] = sorted(effect_types)
+        if effect_values:
+            fx["effect_values"] = effect_values
         crop = (mat or {}).get("crop") or {}
         if crop and not (
             crop.get("upper_left_x", 0) == 0 and crop.get("upper_left_y", 0) == 0

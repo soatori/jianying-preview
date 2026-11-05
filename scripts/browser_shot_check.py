@@ -58,6 +58,23 @@ def luma_at(path_or_arr, w: int, h: int) -> np.ndarray:
     return v / (np.linalg.norm(v) + 1e-9)
 
 
+def mean_lum(path_or_arr, w: int, h: int) -> float:
+    """原始平均亮度（不中心化、不归一化）。
+
+    为什么必须有这一条：`corr()` 是去均值再归一化的，**对乘性亮度完全不敏感**——
+    一段比成片暗 36 % 的画面在 corr 上照样能到 0.94（P-129 就是这么被门放过去的）。
+    所以相关度之外必须同时报一个**带的量**。这里只报数，容差等用户定（U-105）。
+    """
+    if isinstance(path_or_arr, (str, Path)):
+        im = Image.open(path_or_arr).convert("RGB")
+    else:
+        im = path_or_arr.convert("RGB")
+    if im.size != (w, h):
+        im = im.resize((w, h), Image.BOX)
+    a = np.asarray(im, dtype=np.float32)
+    return float((a @ np.array([0.299, 0.587, 0.114], dtype=np.float32)).mean())
+
+
 def corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(a @ b)
 
@@ -145,15 +162,18 @@ def main() -> int:
         cand = [(k, corr(b, luma_at(frames[idx + k], args.width, h)))
                 for k in range(-3, 4) if 0 <= idx + k < len(frames)]
         off, ecorr = max(cand, key=lambda x: x[1])
+        # 亮度比取**同一个被选中的帧**，否则比值与相关度量的不是同一对像素
+        lum_ratio = round(mean_lum(png, args.width, h) / max(mean_lum(frames[idx + off], args.width, h), 1e-6), 3)
         xcorr = corr(b, c)
         xcorr, ecorr = round(xcorr, 3), round(ecorr, 3)
         ok_x, ok_e = xcorr >= args.min_cross, ecorr >= args.min_export
         rows.append({"t": t, "export_frame": idx, "chosen_offset_frames": off,
                      "browser_vs_channel2": xcorr,
                      "browser_vs_export": ecorr, "cross_ok": ok_x, "export_ok": ok_e,
-                     "capture_dt_s": dt_paint, "shot": png.name})
+                     "capture_dt_s": dt_paint, "luma_ratio": lum_ratio, "shot": png.name})
         line = (f"  t={t:7.3f}  浏览器 vs 通道2 {xcorr:.3f} {'PASS' if ok_x else 'FAIL'}   "
-                f"浏览器 vs 成片 {ecorr:.3f} {'PASS' if ok_e else 'FAIL'} (偏移 {off:+d} 帧, "
+                f"浏览器 vs 成片 {ecorr:.3f} {'PASS' if ok_e else 'FAIL'} 亮度比 {lum_ratio} "
+                f"(偏移 {off:+d} 帧, "
                 f"截图与目标时刻差 {dt_paint} s)")
         print(line)
         if not ok_x:

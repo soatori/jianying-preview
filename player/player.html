@@ -25,7 +25,8 @@
 // Geometry law from F-035: offset px = (x*W/2, -y*H/2), origin at canvas centre, y up.
 // Font law from F-035/F-036: em_px = size * canvasWidth * 0.00574 (band 0.00574-0.00578).
 // Draw order is NOT calibrated (U-15): larger render_index = on top is the working assumption.
-import { Application, Sprite, Texture, Text, Container, BlendModeFilter, ColorMatrixFilter, BlurFilter }
+import { Application, Sprite, Texture, Text, Container, BlendModeFilter, ColorMatrixFilter, BlurFilter,
+         Filter, GlProgram }
   from '/px-probe/node_modules/pixi.js/dist/pixi.min.mjs';
 import { Input, CustomSource, VideoSampleSink, AudioBufferSink, ALL_FORMATS }
   from '/px-probe/node_modules/mediabunny/dist/bundles/mediabunny.mjs';
@@ -1147,6 +1148,113 @@ async function mixFilterFor(md5) {
 }
 
 // 每帧在 paintTracks 的段循环里登记（含合成子时间线，因为递归走的也是这里）
+
+// ---- 调色（brightness 一支；律与参数映射都由成片判，见 evidence/playback-log.md P-130）----
+// 律逐字取自装机包内明文 GLSL `AmazingFeature_adjustColor/xshader/colorAdjust.frag`：
+//   p = 1+5B（B>0），否则 p = 1/(1−2.5B) 且先 x −= −B·0.01，再 y = 1 − (1−x)^p。
+// B 就是模型里 `segments[].features.effect_values.brightness`（草稿 effects 的原值）。
+// 一元曲线不需要第二个 sampler ⇒ 走普通 `Filter`+`GlProgram`（P-132 探针：`BlendModeFilter`
+// 那条槽在本包渲染路径里空转，见下方 COLOR_VERTEX 的判决样本）。
+// **与通道 2 同批开关**：`render_frame.apply_color_adjust` 是同一支律的另一半，
+// 只有一边调会让跨通道一致性变差（那是我们自己半套实现，不是播放器坏）。
+// P-131 那次"形状未验通"的根因是声明被行尾注释吞掉（见 P-132），不是坐标轴；现在两边同批开。
+// P-133 同批打开：半边是通道 2 的 numpy 律（P-130 对成片判过），半边是这里的 GLSL 律，
+// 同一张 8 步灰阶 ramp 上两边走到 153.25 / 154.22（差 <1/255）。`&color=0` 留作负样本开关。
+const COLOR = { on: Q.get('color') !== '0', byId: new Map(), filters: new Map(), applied: 0,
+                carry: new Set() };
+
+function colorP(b) { return b > 0 ? 1.0 + b * 5.0 : 1.0 / (1.0 - b * 2.5); }
+
+// P-132 实测：`new BlendModeFilter({gl:{functions,main}})` 这条槽在**渲染路径里不执行**——
+// 纯红 body 挂上去，截图与屏上画布两把尺子都不动，`finalColor = this is not glsl` 也不报错；
+// 同页 ColorMatrixFilter（Pixi 自带滤镜）在两把尺子下都显形 ⇒ 不是仪器瞎，是这条路不走程序。
+// 调色是一元曲线、不需要第二个 sampler，所以改走普通 `Filter` + `GlProgram`：探针里这条臂
+// 纯红出 [255,0,0]、B=0.1264 把灰阶均值 127.49 抬到 154.22（∫(1−(1−x)^1.632)dx·255 ≈ 158）。
+// ⚠ 混合模式（MIX）仍挂在这条空转的槽上，本时间线没有混合段（截图旁证 expected_segs 恒 0），
+//    所以 L10 从没暴露过它；那半件事记在 unresolved 里，不在这里顺手改。
+const COLOR_VERTEX = `in vec2 aPosition;
+out vec2 vTextureCoord;
+
+uniform vec4 uInputSize;
+uniform vec4 uOutputFrame;
+uniform vec4 uOutputTexture;
+
+vec4 filterVertexPosition( void )
+{
+    vec2 position = aPosition * uOutputFrame.zw + uOutputFrame.xy;
+    
+    position.x = position.x * (2.0 / uOutputTexture.x) - 1.0;
+    position.y = position.y * (2.0*uOutputTexture.z / uOutputTexture.y) - uOutputTexture.z;
+
+    return vec4(position, 0.0, 1.0);
+}
+
+vec2 filterTextureCoord( void )
+{
+    return aPosition * (uOutputFrame.zw * uInputSize.zw);
+}
+
+void main(void)
+{
+    gl_Position = filterVertexPosition();
+    vTextureCoord = filterTextureCoord();
+}
+`;   // 逐字取自本包 pixi.min.mjs 里 Pixi 自己的默认滤镜顶点，不自己造坐标映射
+
+function colorFilterFor(b) {
+  if (COLOR.filters.has(b)) return COLOR.filters.get(b);
+  const p = colorP(b).toFixed(6);
+  const off = (b < 0 ? -b * 0.01 : 0.0).toFixed(6);
+  const f = new Filter({ glProgram: GlProgram.from({ vertex: COLOR_VERTEX, fragment: `
+in vec2 vTextureCoord;
+out vec4 finalColor;
+uniform sampler2D uTexture;
+void main() {
+    vec4 front = texture(uTexture, vTextureCoord);
+    vec3 cb = max(front.rgb - vec3(${off}), 0.0);
+    finalColor = vec4(clamp(1.0 - pow(1.0 - cb, vec3(${p})), 0.0, 1.0), front.a);
+}
+` }), resolution: 1 });
+  f.__isColor = true;
+  f.__b = b;
+  COLOR.filters.set(b, f);
+  return f;
+}
+
+function colorRecord(seg) {
+  const b = ((seg.features || {}).effect_values || {}).brightness;
+  const has = typeof b === 'number' && b !== 0;
+  // carry 不看 `on`、且按段 id 去重：关掉时也要能分清「模型本来没得调」和「该调的一个没挂上」，
+  // 而 paint 每帧都重新登记，用计数会把同一个段数到几十次。
+  if (has) COLOR.carry.add(seg.id);
+  const want = (COLOR.on && has) ? b : null;
+  COLOR.byId.set(seg.id, want);
+  if (want !== null) colorFilterFor(want);
+}
+
+// 只追加自己那一段：mixApply 只有在"曾经挂过混合"时才清 filters，两条律才能共存。
+function colorApply() {
+  let n = 0;
+  for (const [id, b] of COLOR.byId) {
+    const node = sprites.get(id) || comps.get(id) || texts.get(id);
+    if (!node) continue;
+    const cur = node.filters || [];
+    const base = cur.filter((f) => !(f && f.__isColor));
+    const f = b === null ? null : colorFilterFor(b);
+    const want = f ? base.concat([f]) : base;
+    const sig = want.map((x) => (x && (x.__mixMd5 || x.__b || x.__sig)) || '').join('+');
+    if (node.__colorSig !== sig) {
+      node.filters = want.length ? want : null;
+      node.__colorSig = sig;
+    }
+    if (f) n++;
+  }
+  COLOR.applied = n;
+}
+
+const colorStats = () => ({ on: COLOR.on, expected: COLOR.carry.size, registered: COLOR.byId.size,
+                             distinct_values: COLOR.filters.size, applied_nodes: COLOR.applied });
+
 function mixRecord(seg) {
   const mm = seg.mix_mode;
   MIX.byId.set(seg.id, mm && mm.package_md5 ? mm.package_md5 : null);
@@ -1465,6 +1573,7 @@ async function paintTracks(container, tracks, posUs, size, depth) {
     z += 1e5;
     if (!seg) continue;
     mixRecord(seg);
+    colorRecord(seg);
     if (track.type === 'text') {
       if (seg.text?.text) drawText(seg, zz, container, size, posUs);
       continue;
@@ -1649,6 +1758,7 @@ async function paint(posUs) {
   visibleThisFrame.clear();
   const { files } = await paintTracks(world, [...videoTracks, ...textTracks], posUs, { w: W, h: H }, 0);
   mixApply();
+  colorApply();
   flashApply(posUs);   // 全画布后处理：顺序与通道 2 一致（先糊后曝，`Exposure` 是最后一趟）
   lastFiles = files;
   // Only segments actually on screen keep a decoder running: five concurrent pumps
@@ -2102,7 +2212,10 @@ if (Q.get('shots')) {
                           t_paint_us: window.__lastPaintUs || 0,
                           // 截图这一路也带上混合模式读数：L10 只看像素的话，
                           // "这模型本来没混合段"和"混合段一个没挂"是同一个数
-                          mix: mixStats() }) });
+                          mix: mixStats(),
+                          // 调色同样带仪表：P-131 那次「两跑像素逐位相同」= 滤镜空转，
+                          // 光看像素分不清「本来没得调」与「一个都没挂上」，所以把 applied/expected 摆上报文。
+                          color: colorStats() }) });
   }
 }
 if (Q.get('seek')) await seekTo(+Q.get('seek'));

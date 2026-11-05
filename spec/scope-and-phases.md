@@ -24,7 +24,19 @@ phase 1 的显式近似（允许降级但需标注）：
 - `useLetterColor`（逐字配色：r3 有 10,637 个 styles 条目带该键，且**带键即 true**）先支持整体色，逐字色随后
 - 转场效果先做窗口与方向正确性，逐种转场内核按 top 频次补
 
-## skip —— 调色（按用户要求）
+## skip —— 调色（**除 `brightness` 外仍按用户要求跳过**）
+
+**2026-11-05 变更**：`effects.type == brightness` 从「只记录不渲染」变成**已实现并被成片验**——
+律逐字取自装机包内明文 GLSL `AmazingFeature_adjustColor/xshader/colorAdjust.frag`，参数就是草稿里的原值；
+两条通路**同批**作用（通道 2 `render_frame.apply_color_adjust` ＋ 页内 `COLOR` 走普通
+`Filter`+`GlProgram`，P-133；`BlendModeFilter` 那条槽不执行，见 F-094 更正），
+负样本是 `COLOR` 关掉 / `&color=0`——关掉要逐位回到改前（P-132 验的就是这个）。
+整轴实测 `<0.90` 的点 13/37 → 7/37、
+`|1−亮度比|` 中位 0.024 → 0.013（读数见 evidence/playback-log.md P-130/P-131，
+出处 `temp/playback-test/luma-scan*.json`）。
+**其余调色项仍 skip**：它们的滑杆→uniform 映射**还没有被成片验过**
+（contrast 的 `pivot/xFactor`、black→`slope/bias`、`clear`/`light_sensation` 需要 17³ LUT，
+`fade_max.texture`、`lightSensation_min/max.png` 在包里是**有**的，但取用与求值都没验）。
 
 只记录、不渲染，且不得在写回时破坏：
 `material_colors`（2670 份）、`hsl`（1970）、`color_curves`（240）、`log_color_wheels`（20）、
@@ -52,6 +64,10 @@ smart_color_adjust, vignetting}`、`segment.enable_lut / enable_adjust / enable_
 | 阶段 | 验收 |
 |---|---|
 | phase 1 | 选定草稿的**字幕与画面**与剪映成片逐帧比对：位置/缩放/旋转误差 ≤ 标定阈值，字幕字高与描边宽度经 U-07 标定后误差 ≤ 2%，混合模式与 `BlendPreMul` 参考实现数值一致，蒙版边缘羽化方向正确 |
-| skip（调色） | 不渲染即不引入色差：跳过调色字段时成片比对需在**未使用调色**的草稿上做，或比对时显式关闭调色 |
+| skip（调色） | 不渲染即不引入色差：跳过调色字段时成片比对需在**未使用调色**的草稿上做，或比对时显式关闭调色。
+**2026-11-05 补**：`brightness` 实现之后，这句话对**其余**调色项依然成立——这条草稿剩余 7/37 个点
+仍 `<0.90`，且全落在只有 `contrast/clear/shadow/black/light_sensation` 的段上。
+**`corr()` 类判据看不见乘性偏差**（P-129：暗 36 % 的帧相关度仍读 0.94），
+所以比对口径必须带**亮度比**这一列（`browser_shot_check.py` 现在每时刻都报） |
 | phase 2 | 波形/音量/淡入淡出与剪映导出音频一致（相关性阈值另定） |
 | phase 3 | 每个新支持的预设/特效类别都需一条 E→F→P 证据与一条成片比对 |

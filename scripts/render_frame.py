@@ -385,6 +385,41 @@ def load_font(path, px, _cache=None):
     return f
 
 
+# ---- 调色（**逐字取自装机包内明文 GLSL**，不猜律）-------------------------------------------
+# `Cache/effect/7416258989467374091/9e1cfdca…/AmazingFeature_adjustColor/xshader/colorAdjust.frag`
+# 的 brightness 支：p = 1+5B（B>0），否则 p = 1/(1−2.5B) 且先减 −B·0.01，再 `y = 1 − (1−x)^p`。
+# 参数就是草稿 `materials.effects[type=brightness].value`——**成片判**过这个映射
+# （P-130：0.645→0.967、0.815→0.997、1.111→1.025，滑杆全 null 的对照段不动）。
+# 其余支（contrast 的 pivot/xFactor、black→slope/bias、light_sensation 的 17³ LUT）没有成片验过的
+# 参数映射，未验不上；`COLOR["on"]=False` 是负样本开关（关掉必须逐位回到改前的像素）。
+# **默认关**：浏览器那半还没接（要走 mixmode 那条"抽明文 frag → 出厂件 → 槽注入"的路，
+# F-093④/F-094 已定形状）。一边调一边不调会让**跨通道**变差——那是我们半套实现造成的，
+# 不是播放器坏了。律与成片验的参数映射都留着（P-130），两边同批打开才是完整一步。
+# **两边都默认关**（P-131）：浏览器那半验证失败——`BlendModeFilter` 槽的形状是给
+# **两张贴图**用的（F-094），一元律挂上去**没生效**（同一时刻比值仍是改前的 0.66/0.83/1.12，
+# 而通道 2 已是 0.965/0.996/1.025），于是跨通道从 0.97 档掉到 0.908 ⇒ 只开一边是倒退。
+# 律与参数映射都留着（成片验过，P-130），等浏览器侧形状修对再同批打开。
+COLOR = {"on": True, "applied": 0}   # P-133 同批打开：浏览器半边已由普通 Filter 验通（P-132/133）
+
+
+def apply_color_adjust(img, seg):
+    """目前只作用已验的 brightness 一支。"""
+    if not COLOR["on"] or img is None:
+        return img
+    b = ((seg.get("features") or {}).get("effect_values") or {}).get("brightness")
+    if not b:
+        return img
+    a = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+    if b > 0:
+        p = 1.0 + b * 5.0
+    else:
+        p = 1.0 / (1.0 - b * 2.5)
+        a -= -b * 0.01
+    a = np.clip(1.0 - np.power(1.0 - a, p), 0.0, 1.0)
+    COLOR["applied"] += 1
+    return Image.fromarray((a * 255).astype(np.uint8)).convert("RGBA")
+
+
 def active_segment(track, pos_us):
     for s in track["segments"]:
         if s.get("visible") is False:
@@ -569,6 +604,7 @@ def collect(canvas, model, pos_us, fonts_dir_cache, depth=0):
                  * (seg.get("speed") or 1)) / 1e6
         frame = decode_frame(mm["path"], src_s)
         if frame:
+            frame = apply_color_adjust(frame, seg)
             layers.append(("image", z, seg, frame.convert("RGBA")))
     for kind, z, seg, payload in sorted(layers, key=lambda x: x[1]):
         if kind == "text":
