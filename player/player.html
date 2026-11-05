@@ -368,7 +368,7 @@ function startCapture() {
     CAP.caps++;
     // 每 ~1 s 记一对（音频时钟, 播放头）：录音样本↔时间线的映射要**测**出来，
     // 不能拿相关去凑（P-141：拟合能让散布在好几个不相干挪量上都达标，说明它没分辨力）。
-    if (CAP.caps % 12 === 0 && CAP.trace.length < 200)
+    if (CAP.caps % 2 === 0 && CAP.trace.length < 400)   // ~170 ms 一对：登记粒度决定取窗准不准（P-148）
       CAP.trace.push([+actx.currentTime.toFixed(3), +pos.toFixed(3)]);
     const s = CAP.chunks.reduce((a, c) => a + c.length, 0) / CAP.rate;
     if (s > 75) { CAP.node.onaudioprocess = null; }   // 上限保护：不无限堆内存
