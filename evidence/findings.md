@@ -2189,6 +2189,37 @@ k/16 全部可被 8 bit 精确表示）× alpha 对 6 组 × `_alpha` ∈ {1.0, 
 
 **证据等级**：已验证（oracle 为包内原文编译执行，独立实现腿不看包内代码，单变量=公式）。
 
+### 更正（2026-11-05，P-123）：这条的**结论标签**错了，测量本身没错——`叠加/强光` 不是 CSS 那一对的反面
+
+本节"反面"这句话一直靠**比对台对照腿自己的两条读数**撑着（`over_lay`/`glare_pc` 的 maxΔ=255）。
+2026-11-04 重建那支对照台（P-121）时把同一族错抄了一遍，P-123 把对照腿按 Compositing-1 逐条定对之后：
+
+| nameId | 对照腿 maxΔ（预乘/直通） | 变化 |
+|---|---|---|
+| `over_lay`（OverlayBlend） | 255/255 → **1/1** | 原对照腿把 overlay 的分支变量写成了 `Cs`（那是 hardlight） |
+| `glare_pc`（HardLightBlend） | 255/255 → **1/1** | 同一条错的另一面 |
+| `color_dodge` | 255/255 → **1/1** | 原件的 dodge 也不对，重建第一版才碰巧对 |
+| `darken_color`（ColorBurnBlend） | 255/**1** → 255/255 | 定对成 spec 的 `1 − min(1,(1−Cb)/Cs)` 后**直通分支也越了**，见下 |
+| `soft_light` | 11/11 → 11/11 | 没变：厂商柔光式与 CSS 的 `D(Cb)` 分段不同，**这条是真的偏离** |
+
+纯 numpy 复核（`temp/playback-test/l7_operand_roles.py`，不起浏览器；被解释方是**已在册且
+`numpy_vs_vendor_max_abs=1` 的 `mixmode_blend.py`**）：把可分离式按
+**(numpy 的 `b` = CSS 的 `Cb`、`f` = `Cs`)** 这一地位代入，10 个模式里 **8 个 maxΔ = 0.0/255**，
+把 `Cb/Cs` 换成相反地位则**每一个都坏**（165.8～255）。所以：
+
+- **包内 `OverlayBlend` 按背景分支 ≡ CSS `overlay`**（Compositing-1 里 overlay 的分支变量就是 Cb，
+  hardlight 的才是 Cs；两者闭式对称、只差分支变量）。本节原先把它叫"CSS 那一对的反面"是**贴错了标签**，
+  但"包内 Overlay 分支看 `b`、HardLight 分支看 `f`"这个**测量事实不变**（`scripts/mixmode_blend.py:61-74`）。
+- **"必须移植包内数学"这一判定只剩两条**：`soft_light`（体内就差 ~11/255）与 `darken_color`
+  （**体与 CSS 逐位相同：内部格 maxΔ = 0.00/255**，255 全落在 `Cs=0 / Cb∈{0,1}` 这些边界格上 ⇒
+  差的是边界规则，不是公式）。其余 8 条在 1/255 容差内就是 CSS。
+- ⚠ **没解决的那一半是几何**：以上只确立"numpy 的 `b` 在**公式地位**上扮演 Cb"，
+  而**没**确立它在剪映合成里对应画面层还是特效层。两种叫法在表里差一个词，
+  真要定它得拿一张已知位移的网格先验层序（playback-log:1626 那条"先测几何再测数学"），仍是欠口。
+- **门不受影响**：判定读的三列（`shipped_vs_vendor` / `numpy_vs_vendor` / `numpy_cells_over_tolerance`）
+  十行全 `0 / 1 / 0`，与在册基线逐位相同；改的只有对照腿那两列与 `verdict`。旧表整支留在
+  `temp/playback-test/mixmode_equivalence.PRE-P122.csv`。
+
 ## F-078 `material_animations` 的实际形状是 `animations[]`，L1 按 `{in/out/loop:{actions}}` 取所以整条通道为空（2026-10-23，P-29 的因）
 
 - **Evidence**：`<草稿A>` 时间线 `017E2FEC`，段 `14D93F1F`（flag=2 叠加、t0=6.600 s、
@@ -2817,6 +2848,17 @@ k/16 全部可被 8 bit 精确表示）× alpha 对 6 组 × `_alpha` ∈ {1.0, 
   （`compileBlendModeShader` 32260 行就是 `{FUNCTIONS}`/`{MAIN}` 两个 replace）。
   背景、`blendRequired`、`uTexture`/`uBackTexture` 的绑定**全部由厂商机器自己完成**，
   我不再碰 uniform 管道 —— 于是 F-093④ 那个拦路石被绕开，而不是被我修好。
+- **P-132 就地更正（2026-11-05）**：上面这段「注入槽」的等价性**在渲染路径里判不成立**。
+  探针（`temp/playback-test/blend-slot-probe.html`、`blend-slot-probe2.html`）在 Chrome WebGL 下、
+  两把尺子（`extract.pixels(stage)` 与屏上画布回读）都测过：往 `BlendModeFilter` 的 `{MAIN}` 注入
+  纯红 body，孤立 sprite / 有真背景的节点级 / `stage.filters` 全局三种场面**都不动像素**，注入
+  故意写坏的 GLSL **也不报错**；同一页 `ColorMatrixFilter`（Pixi 自带滤镜）两把尺子都显形，
+  普通 `Filter`+`GlProgram` 纯红出 `[255,0,0]`。而 `glProgram.fragment` 里 `{MAIN}` 确实被替换干净
+  （`baked:true`、无残留花括号）⇒ 文本进了程序对象，渲染不走这条程序。
+  ⇒ 当年 `report-mixinject.jsonl` 的 maxΔ=0 只能是**两臂都没执行**时的相等（未滤镜内容自比），
+  那是假阳性；包内混合数学本身仍由 F-079/F-082 的裸 GL 腿撑着，**悬的是「Pixi 注入腿」这一环**。
+  本时间线混合段数 0（每张截图旁证 `mix.expected_segs=0`），所以 L10 从没因它报错——
+  L7「浏览器 wiring」这条不许再当已通；见 U-107。
 - **读数**（`report-mixinject.jsonl`，pixi **VERSION 8.22.0**，`g0/g2v` 几何腿均 maxΔ=0 先行通过）：
 
   | 模式 | 注入字符数 | vs 腿 A（出厂件 GLSL） |
