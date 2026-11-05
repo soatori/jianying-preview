@@ -159,6 +159,92 @@ def shift_scan(args) -> int:
     return 0
 
 
+def load_registered(capture: str, report: str):
+    """按页面实测轨迹把录音重采样到**时间线坐标**，返回 (数组, 采样率)。
+
+    所有跑都走这一个函数，A/B 才可比（P-145 的错就是手写时把已登记的数组又减了一次原点）。
+    只取播放头单调推进的前缀：`loop=1` 绕回之后的部分不能拿来重采样。
+    """
+    obj = None
+    for line in open(report, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            j = json.loads(line)
+        except Exception:
+            continue
+        ac = j.get("audio_capture") or {}
+        if ac.get("trace"):
+            obj = ac
+    if not obj:
+        raise SystemExit(f"旁证里没有实测轨迹（trace）：{report}")
+    tr = obj["trace"]
+    cs, ps = [float(tr[0][0])], [float(tr[0][1])]
+    for c, v in tr[1:]:
+        c, v = float(c), float(v)
+        if v > ps[-1] - 0.05 and v - ps[-1] < 3.0:
+            cs.append(c)
+            ps.append(v)
+        else:
+            break                                   # 绕回：后面不参与
+    cs = np.asarray(cs, dtype=np.float64)
+    ps = np.asarray(ps, dtype=np.float64)
+    with wave.open(capture, "rb") as w:
+        rate, ch, n = w.getframerate(), w.getnchannels(), w.getnframes()
+        raw = np.frombuffer(w.readframes(n), dtype="<i2").reshape(-1, ch)
+        raw = raw.mean(axis=1).astype(np.float64) / 32768.0
+    upto = int(min(cs[-1], raw.size / rate) * rate)
+    sample_ctx = np.arange(upto) / rate
+    sample_pos = np.interp(sample_ctx, cs, ps)
+    grid = np.arange(sample_pos[0], sample_pos[-1], 1.0 / rate)
+    return np.interp(grid, sample_pos, raw[:upto]), rate
+
+
+def compare_captures(args) -> int:
+    """同一批段、同一个登记函数下比较多次录音：谁更接近成片、彼此差多少。"""
+    runs = []
+    for spec in args.compare:
+        label, _, rest = spec.partition("=")
+        cap, _, rep = rest.partition(":")
+        x, r = load_registered(cap, rep)
+        runs.append((label, x, r))
+        print(f"登记完成 {label}：{x.size / r:.2f} s @ {r} Hz（已换算到时间线坐标）")
+    exp, er = read_wav(Path(args.export_audio))
+    segs = audio_segments(Path(args.media_model), args.min_seg)
+    tol = args.tol if args.tol > 0 else SELF_Spread_DB
+    print("\n段         窗            成片     " + "  ".join("%9s" % l for l, _, _ in runs))
+    per = {label: [] for label, _, _ in runs}
+    for sid, t0, t1 in segs:
+        e = db(window(exp, er, t0, t1))
+        if e <= args.silent_db:
+            continue
+        vals = []
+        for label, x, r in runs:
+            v = db(window(x, r, t0, t1)) - e
+            vals.append(v)
+            per[label].append(v)
+        print("%s  %6.2f-%6.2f  %7.2f   " % (sid, t0, t1, e)
+              + "  ".join("%+8.2f" % v for v in vals))
+    print("\n每次跑 vs 成片（逐段 Δ 的统计）：中位＝整体电平（只报数）；散布＝判定那条，线 %.2f dB" % tol)
+    for label, _, _ in runs:
+        a = np.asarray(per[label], dtype=np.float64)
+        if a.size == 0:
+            print("  %-10s 没有可比的段" % label)
+            continue
+        med = float(np.median(a))
+        rel = float(np.max(np.abs(a - med)))
+        print("  %-10s 有效段 %2d  中位 %+6.2f dB  散布 %6.2f dB  ⇒ %s"
+              % (label, a.size, med, rel, "绿" if rel <= tol else "红"))
+    base_label, base = runs[0][0], np.asarray(per[runs[0][0]], dtype=np.float64)
+    for label, _, _ in runs[1:]:
+        d = np.asarray(per[label], dtype=np.float64) - base
+        print("  差值 %s−%s：中位 %+5.2f dB、区间 %+5.2f…%+5.2f ⇒ %s"
+              % (label, base_label, float(np.median(d)), float(d.min()), float(d.max()),
+                 "两次没有系统性差别" if abs(float(np.median(d))) < 1.0 else "有系统性差别"))
+    return 0
+
+
 def judge(args) -> int:
     ours, our_rate = read_wav(Path(args.capture))
     exp, exp_rate = read_wav(Path(args.export_audio))
@@ -294,6 +380,8 @@ def main() -> int:
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--shift-sweep", action="store_true", help="扫原点，分清错位与缺内容（不改判据线）")
     ap.add_argument("--shift-ms", type=float, default=0.0, help="手工登记录音原点（毫秒，窗往前挪）")
+    ap.add_argument("--compare", action="append", default=[],
+                    help="label=录音.wav:旁证.jsonl，可重复；同一登记函数下比多次录音")
     ap.add_argument("--shift-scan", action="store_true", help="只挪我方扫录音原点，报表给判定提供依据")
     ap.add_argument("--auto-shift", action="store_true",
                     help="用整段波形互相关自己找录音原点，判之前先登记")
@@ -305,6 +393,8 @@ def main() -> int:
         return selftest(args)
     if args.shift_sweep:
         return shift_sweep(args)
+    if args.compare:
+        return compare_captures(args)
     if args.shift_scan:
         return shift_scan(args)
     if not (args.capture and Path(args.capture).is_file()):
