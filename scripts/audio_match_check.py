@@ -81,10 +81,13 @@ def audio_segments(model_path: Path, min_len: float) -> list[tuple[str, float, f
 
 
 def measure(ours: np.ndarray, our_rate: int, exp: np.ndarray, exp_rate: int,
-            segs: list[tuple[str, float, float]], silent_db: float):
+            segs: list[tuple[str, float, float]], silent_db: float,
+            our_shift: float = 0.0):
+    """`our_shift` **只挪我方那一侧**。两边一起挪量的还是同窗对齐（P-139 第一次就栽在这里，
+    P-141 又在自己新加的参数上重犯过一次）——那测的不是原点，是随便挑的时间。"""
     rows = []
     for sid, t0, t1 in segs:
-        e, o = db(window(exp, exp_rate, t0, t1)), db(window(ours, our_rate, t0, t1))
+        e, o = db(window(exp, exp_rate, t0, t1)), db(window(ours, our_rate, t0 + our_shift, t1 + our_shift))
         rows.append({"id": sid, "t0": round(float(t0), 3), "t1": round(float(t1), 3),
                      "export_db": round(float(e), 2), "ours_db": round(float(o), 2),
                      "delta_db": round(float(o - e), 2),
@@ -101,6 +104,61 @@ def measure(ours: np.ndarray, our_rate: int, exp: np.ndarray, exp_rate: int,
     return rows, live, missing, med, rel, duty_exp, duty_our
 
 
+def estimate_shift(ours: np.ndarray, exp: np.ndarray, rate: int, span: float = 4.0,
+                   step_ms: float = 5.0) -> tuple[float, float, float]:
+    """整段波形的互相关找"录音零点对时间线"的偏移（P-140 的教训：页内 `ctx0` 是**音频时钟坐标**，
+    不是时间线坐标；不登记就会把每个窗都错配 ~1.8 s，把仪器误差报成通路缺陷）。
+
+    返回 (滞后秒, 峰, 候选中位)。峰/中位 太接近 1 就是"这条尺子没有分辨力"，调用方必须报出来——
+    当年包络相关就是这么被"同一条混音自比只有 0.344"否掉的（P-127），所以这里带自比对照与分辨力读数。
+    """
+    n = 1
+    while n < ours.size + exp.size:
+        n *= 2
+    O = np.fft.rfft(ours - ours.mean(), n)
+    X = np.fft.rfft(exp - exp.mean(), n)
+    c = np.fft.irfft(O * np.conj(X), n)
+    den = float(np.linalg.norm(ours - ours.mean()) * np.linalg.norm(exp - exp.mean())) + 1e-12
+    lim = int(span * rate)
+    step = max(1, int(rate * step_ms / 1000.0))
+    cand = [(L / rate, abs(float(c[L if L >= 0 else n + L])) / den) for L in range(-lim, lim + 1, step)]
+    best = max(cand, key=lambda z: z[1])
+    med = float(np.median([v for _, v in cand]))
+    return best[0], best[1], med
+
+
+def shift_scan(args) -> int:
+    """只挪我方那一侧，扫一遍录音原点：报表 (挪量, 参与段数, 相对散布, 中位Δ)。
+    这条存在的理由：P-139/P-141 两次都把"两边一起挪"当成了原点检验，量到的其实是随便挑的时间。"""
+    ours, our_rate = read_wav(Path(args.capture))
+    exp, exp_rate = read_wav(Path(args.export_audio))
+    segs = audio_segments(Path(args.media_model), args.min_seg)
+    tol = args.tol if args.tol > 0 else SELF_Spread_DB
+    lag, peak, med0 = estimate_shift(ours, exp, our_rate, span=args.search_span)
+    print(f"整段互相关给出滞后 {lag:+.3f} s（峰 {peak:.4f}/中位 {med0:.4f}＝{(peak/med0 if med0 else 0):.1f} 倍分辨力）")
+    # 可比性：每个挪量都判**同一批段**（所有挪量下窗都留在界内的那批），
+    # 否则"越界丢窗"会让大挪量看起来更干净（P-141 第一版就差点把这当成登记后的绿）。
+    dur = ours.size / our_rate
+    keep = [(sid, t0, t1) for sid, t0, t1 in segs
+            if t0 - args.search_span >= 0 and t1 + args.search_span <= dur]
+    print("  可比段 %d/%d（±%.1f s 内窗都不出界），挪量只在这批上算" % (len(keep), len(segs), args.search_span))
+    print("  挪量s  有效段  相对散布dB  中位ΔdB   缺段  对 %.2f dB 线" % tol)
+    best = None
+    for ms in range(-4000, 4001, 100):
+        sh = ms / 1000.0
+        _, live, missing, med, rel, _, _ = measure(ours, our_rate, exp, exp_rate, keep,
+                                                   args.silent_db, our_shift=sh)
+        if best is None or rel < best[1]:
+            best = (sh, rel, med, len(live))
+        if ms % 200 == 0:
+            print("  %+6.2f  %5d/%d   %8.2f   %+7.2f   %3d   %s" % (
+                sh, len(live), len(keep), rel, med, len(missing),
+                "绿" if (rel <= tol and not missing) else "红"))
+    print("BEST（只取窗全部在界的点）：挪量 %+.2f s ⇒ 相对散布 %.2f dB，中位Δ %+.2f dB，有效段 %d/%d" % (
+        best[0], best[1], best[2], best[3], len(segs)) if best else "没有一个挪量能让所有窗留在界内")
+    return 0
+
+
 def judge(args) -> int:
     ours, our_rate = read_wav(Path(args.capture))
     exp, exp_rate = read_wav(Path(args.export_audio))
@@ -110,13 +168,32 @@ def judge(args) -> int:
         ctl, ctl_rate = read_wav(Path(args.control))
         _, _, _, _, ctl_rel, _, _ = measure(ctl, ctl_rate, ours, our_rate, segs, args.silent_db)
         tol = max(tol, ctl_rel)          # 容差不许低于"同一内容自己录两次"的散布
+    shift = args.shift_ms / 1000.0
+    note = "固定对齐"
+    fitted = False            # 挪量若是拟合/手工来的，本行只作诊断（P-141）
+    if args.shift_ms:
+        note = f"手工挪量 {args.shift_ms:+.0f} ms"
+    if args.auto_shift:
+        lag, peak, med0 = estimate_shift(ours, exp, our_rate, span=args.search_span)
+        shift = lag                                     # 符号由 --shift-scan 实测决定，不靠猜
+        fitted = True
+        note = (f"已按整段互相关登记原点：滞后 {lag:+.3f} s（峰 {peak:.4f}/中位 {med0:.4f}"
+                f"＝{(peak/med0 if med0 else 0):.1f} 倍分辨力）")
+    n_drop = sum(1 for _, t0, t1 in segs if t0 + shift < 0 or t1 + shift > ours.size / our_rate)
     rows, live, missing, med, rel, dexp, dour = measure(ours, our_rate, exp, exp_rate, segs,
-                                                       args.silent_db)
+                                                       args.silent_db, our_shift=shift)
     duty = (dour / dexp) if dexp else 1.0
-    ok = (not missing) and (rel <= tol)
-    print(f"{'PASS' if ok else 'FAIL'}  L29 audio vs export (delivery + relative level)   "
+    # 丢窗不许当成"过"：把录音挪出范围会让参与判定的段变少，散布自然变小（P-141 的坑）
+    # P-141 的牙齿：拟合/手工挪量不给绿——同一批段上散布在 −2.6 s 与 +1.0/+1.2 s 都能压进线内，
+    # 固定对齐却是 10.6 dB ⇒ 这条散布对"对齐"没有分辨力。判定只能按固定对齐做，
+    # 原点必须由页面实测给出（t0_ctx/t0_wall/first_playable），不许本脚本自己凑。
+    ok = (not missing) and (rel <= tol) and (n_drop == 0) and not fitted and args.shift_ms == 0
+    if fitted or args.shift_ms != 0:
+        note += "（挪量＝拟合/手工 ⇒ 只作诊断，不判绿）"
+    print(f"{'PASS' if ok else 'FAIL'}  L29 audio vs export (delivery + relative level)   {note}   "
           f"成片有声段 {len(live)}/{len(rows)}，我方缺 {len(missing)} 段；"
-          f"相对散布 max|Δ−中位| = {rel:.2f} dB（线 ≤{tol:.2f}，来自同内容自比）；"
+          f"相对散布 max|Δ−中位| = {rel:.2f} dB（线 ≤{tol:.2f}，来自同内容自比；"
+          f"窗被挪出录音范围的段 {n_drop}——不为 0 就不许判绿）；"
           f"整体偏移 {med:+.2f} dB（只报数，不判——律/增益侧，见 U-88）；"
           f"占空比 {duty:.3f}（我方/成片响窗比）")
     if missing:
@@ -216,6 +293,11 @@ def main() -> int:
     ap.add_argument("--dump", default="")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--shift-sweep", action="store_true", help="扫原点，分清错位与缺内容（不改判据线）")
+    ap.add_argument("--shift-ms", type=float, default=0.0, help="手工登记录音原点（毫秒，窗往前挪）")
+    ap.add_argument("--shift-scan", action="store_true", help="只挪我方扫录音原点，报表给判定提供依据")
+    ap.add_argument("--auto-shift", action="store_true",
+                    help="用整段波形互相关自己找录音原点，判之前先登记")
+    ap.add_argument("--search-span", type=float, default=4.0, help="--auto-shift 的搜索半径（秒）")
     args = ap.parse_args()
     if args.export_mp4 and not Path(args.export_audio).is_file():
         export_wav(Path(args.export_mp4), Path(args.export_audio))
@@ -223,6 +305,8 @@ def main() -> int:
         return selftest(args)
     if args.shift_sweep:
         return shift_sweep(args)
+    if args.shift_scan:
+        return shift_scan(args)
     if not (args.capture and Path(args.capture).is_file()):
         print("没有 --capture（先跑一次带音频录音的会话：audio_capture_check.py）")
         return 3
