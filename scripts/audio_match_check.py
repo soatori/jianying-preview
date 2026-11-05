@@ -164,6 +164,45 @@ def export_wav(mp4: Path, out: Path) -> None:
     print(f"成片音轨已抽到 {out}（48 kHz 单声道）")
 
 
+def shift_samples(x: np.ndarray, rate: int, ms: float) -> np.ndarray:
+    """把录音整体挪 ms（正数＝往后），零填充——用来分清"窗内电平差是错位还是真缺内容"。"""
+    k = int(round(ms / 1000.0 * rate))
+    out = np.zeros_like(x)
+    if k == 0:
+        return x.copy()
+    if k > 0:
+        if k < x.size:
+            out[k:] = x[:-k]
+    else:
+        if -k < x.size:
+            out[:k] = x[-k:]
+    return out
+
+
+def shift_sweep(args) -> int:
+    """扫一遍原点：若某个位移能把相对散布压进线内 ⇒ 红是**错位**；压不进去 ⇒ 是**分段缺内容**。
+    这条不代替判据（线不动），只回答"红该归给谁"。"""
+    ours, our_rate = read_wav(Path(args.capture))
+    exp, exp_rate = read_wav(Path(args.export_audio))
+    segs = audio_segments(Path(args.media_model), args.min_seg)
+    tol = args.tol if args.tol > 0 else SELF_Spread_DB
+    best = None
+    print(f"sweep  位移ms   相对散布dB   中位ΔdB   缺段   （线 ≤{tol:.2f}）")
+    for ms in range(-800, 801, 100):
+        r = judge_of(shift_samples(ours, our_rate, ms), our_rate, exp, exp_rate, segs,
+                     args.silent_db, tol)
+        rel, med, miss = r["rel"], r["med"], len(r["missing"])
+        print(f"       {ms:+5d}   {rel:9.2f}   {med:+8.2f}   {miss:3d}")
+        if best is None or rel < best[1]:
+            best = (ms, rel, med, miss)
+    verdict = ("错位可解释：某位移能把散布压进线内 ⇒ 红归给原点/延迟"
+               if best[1] <= tol else
+               "任何 ±800 ms 位移都压不进线 ⇒ 红归给分段缺内容，不是错位")
+    print(f"BEST 位移 {best[0]:+d} ms：相对散布 {best[1]:.2f} dB，中位Δ {best[2]:+.2f} dB，缺段 {best[3]} ⇒ {verdict}")
+    return 0
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--capture", default="", help="页内录音（网关 /wave 落的那份）")
@@ -176,11 +215,14 @@ def main() -> int:
     ap.add_argument("--min-seg", type=float, default=0.5, help="短于此的段不参与（避免窗口边噪）")
     ap.add_argument("--dump", default="")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--shift-sweep", action="store_true", help="扫原点，分清错位与缺内容（不改判据线）")
     args = ap.parse_args()
     if args.export_mp4 and not Path(args.export_audio).is_file():
         export_wav(Path(args.export_mp4), Path(args.export_audio))
     if args.selftest:
         return selftest(args)
+    if args.shift_sweep:
+        return shift_sweep(args)
     if not (args.capture and Path(args.capture).is_file()):
         print("没有 --capture（先跑一次带音频录音的会话：audio_capture_check.py）")
         return 3
