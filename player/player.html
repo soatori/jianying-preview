@@ -519,6 +519,11 @@ async function pumpAudio(seg, st, ctxAt, mediaStart, mediaEnd, speed) {
       const ms = (at - when) * 1000;
       audioStats.clamp_ms_total += ms;
       audioStats.clamp_ms_max = Math.max(audioStats.clamp_ms_max, ms);
+      // 被夹 = `when` 到 `at` 这段已经是数字静音。要把它钉到"哪一刻哑的"，就得记下发生的 ctx 时刻
+      // （P-150：掉落 0.37 s 与 clamp 合计 392 ms 量级吻合，但只有时间戳能证明是同一次）。
+      if ((audioStats.clamp_at = audioStats.clamp_at || []).length < 64)
+        audioStats.clamp_at.push({ at: +at.toFixed(3), skipped_ms: +ms.toFixed(1),
+                                   seg: String(j.seg_id || sid || '').slice(0, 8) });
     }
     g.gain.setValueAtTime(gainAt(localT), at);
     g.gain.linearRampToValueAtTime(gainAt(localT + d), at + d);

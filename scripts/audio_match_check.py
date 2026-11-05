@@ -198,7 +198,11 @@ def load_registered(capture: str, report: str):
     sample_ctx = np.arange(upto) / rate
     sample_pos = np.interp(sample_ctx, cs, ps)
     grid = np.arange(sample_pos[0], sample_pos[-1], 1.0 / rate)
-    return np.interp(grid, sample_pos, raw[:upto]), rate
+    y = np.interp(grid, sample_pos, raw[:upto])
+    # 数组下标必须等于**时间线秒**：录音从 timeline t0_pos 开始，前面补零，否则判据拿 (t0,t1) 取窗时
+    # 会整体偏一个原点（P-151：洞被标成 2.07 而实际在 3.88）。
+    pad = int(round(grid[0] * rate))
+    return np.concatenate([np.zeros(pad, dtype=np.float64), y]), rate
 
 
 def compare_captures(args) -> int:
@@ -245,6 +249,37 @@ def compare_captures(args) -> int:
     return 0
 
 
+def find_holes(ours: np.ndarray, our_rate: int, exp: np.ndarray, exp_rate: int,
+               hole_s: float, our_db: float, exp_db: float,
+               win_ms: float = 30.0) -> list[dict]:
+    """我方连续静音而**成片同区不静音**的跨度 ⇒ 洞。
+
+    只看我方会误报（成片本来也有静场），所以要求两侧同时成立：
+    我方窗 < `our_db` 且 成片窗 > `exp_db`。跨度 ≥ `hole_s` 才计入。
+    """
+    w = max(1, int(our_rate * win_ms / 1000.0))
+    flags = []
+    for i in range(0, ours.size - w, w):
+        t0 = i / our_rate
+        t1 = t0 + w / our_rate
+        o = db(ours[i:i + w])
+        e = db(window(exp, exp_rate, t0, t1))
+        flags.append((t0, o < our_db and e > exp_db))
+    holes, cur = [], None
+    for t0, bad in flags:
+        if bad:
+            cur = [t0, t0 + w / our_rate] if cur is None else [cur[0], t0 + w / our_rate]
+        else:
+            if cur and cur[1] - cur[0] >= hole_s:
+                holes.append({"t0": round(cur[0], 3), "t1": round(cur[1], 3),
+                              "seconds": round(cur[1] - cur[0], 3)})
+            cur = None
+    if cur and cur[1] - cur[0] >= hole_s:
+        holes.append({"t0": round(cur[0], 3), "t1": round(cur[1], 3),
+                      "seconds": round(cur[1] - cur[0], 3)})
+    return holes
+
+
 def judge(args) -> int:
     ours, our_rate = read_wav(Path(args.capture))
     exp, exp_rate = read_wav(Path(args.export_audio))
@@ -269,11 +304,16 @@ def judge(args) -> int:
     rows, live, missing, med, rel, dexp, dour = measure(ours, our_rate, exp, exp_rate, segs,
                                                        args.silent_db, our_shift=shift)
     duty = (dour / dexp) if dexp else 1.0
+    holes = find_holes(ours, our_rate, exp, exp_rate, args.hole_s,
+                       args.hole_our_db, args.hole_exp_db)
+    hole_s = sum(h["seconds"] for h in holes)
     # 丢窗不许当成"过"：把录音挪出范围会让参与判定的段变少，散布自然变小（P-141 的坑）
     # P-141 的牙齿：拟合/手工挪量不给绿——同一批段上散布在 −2.6 s 与 +1.0/+1.2 s 都能压进线内，
     # 固定对齐却是 10.6 dB ⇒ 这条散布对"对齐"没有分辨力。判定只能按固定对齐做，
     # 原点必须由页面实测给出（t0_ctx/t0_wall/first_playable），不许本脚本自己凑。
-    ok = (not missing) and (rel <= tol) and (n_drop == 0) and not fitted and args.shift_ms == 0
+    # 交付这一半不只判"整段没响"，还判**跨段的洞**（P-150：段级读数 0 缺段却有 2.9 s 掉落 ⇒ 失明）
+    ok = (not missing) and (rel <= tol) and (n_drop == 0) and not fitted and args.shift_ms == 0 \
+        and hole_s <= args.hole_allow
     if fitted or args.shift_ms != 0:
         note += "（挪量＝拟合/手工 ⇒ 只作诊断，不判绿）"
     print(f"{'PASS' if ok else 'FAIL'}  L29 audio vs export (delivery + relative level)   {note}   "
@@ -281,7 +321,11 @@ def judge(args) -> int:
           f"相对散布 max|Δ−中位| = {rel:.2f} dB（线 ≤{tol:.2f}，来自同内容自比；"
           f"窗被挪出录音范围的段 {n_drop}——不为 0 就不许判绿）；"
           f"整体偏移 {med:+.2f} dB（只报数，不判——律/增益侧，见 U-88）；"
-          f"占空比 {duty:.3f}（我方/成片响窗比）")
+          f"占空比 {duty:.3f}（我方/成片响窗比）；"
+          f"我方静音而成片不静音的洞 {len(holes)} 处 / {hole_s:.2f} s（线 ≤{args.hole_allow:.2f} s，"
+          f"单洞 ≥{args.hole_s:.2f} s 才计）")
+    for h in holes[:8]:
+        print(f"   洞：{h['t0']:.2f}–{h['t1']:.2f} s（{h['seconds']:.2f} s）")
     if missing:
         print("   缺的段：" + "; ".join(f"{r['id']}@{r['t0']}–{r['t1']} 成片 {r['export_db']} "
                                         f"我方 {r['ours_db']}" for r in missing[:6]))
@@ -300,6 +344,7 @@ def selftest(args) -> int:
     segs = audio_segments(Path(args.media_model), args.min_seg)
     tol = args.tol if args.tol > 0 else SELF_Spread_DB
     bad = []
+    pos = []
     if judge_of(exp, exp_rate, exp, exp_rate, segs, args.silent_db, tol)["fail_lines"]:
         bad.append("正例（同一份内容自比）竟然红 ⇒ 判据在没有误差时也报错")
     mut = exp.copy()
@@ -309,9 +354,22 @@ def selftest(args) -> int:
     r = judge_of(mut, exp_rate, exp, exp_rate, segs, args.silent_db, tol)
     if not r["fail_lines"]:
         bad.append("反例（一段消音）还是绿的 ⇒ 守卫没牙")
-    print(("SELFTEST PASS：正例绿、一段消音转红（缺段 %d、相对散布 %.2f dB）"
-           % (len(r["missing"]), r["rel"])) if not bad else
-           "SELFTEST FAIL：" + "；".join(bad))
+    # 反例 2：只挖一个 0.4 s 的短洞（段级读数不会报"缺段"，洞检测必须抓到）
+    mut2 = exp.copy()
+    t0 = 6.6
+    mut2[int(t0 * exp_rate):int((t0 + 0.4) * exp_rate)] = 0.0
+    hl = find_holes(mut2, exp_rate, exp, exp_rate, 0.2, -60.0, -45.0)
+    if not hl:
+        bad.append("反例 2（挖 0.4 s 洞）洞检测没抓到 ⇒ 交付判据对跨段掉落失明")
+    else:
+        pos.append(f"洞检测抓到 {len(hl)} 处、首个在 {hl[0]['t0']:.2f} s")
+    # 正例：原样（等于成片）不该有洞
+    hl0 = find_holes(exp, exp_rate, exp, exp_rate, 0.2, -60.0, -45.0)
+    if hl0:
+        bad.append(f"正例（同一份自比）却有 {len(hl0)} 个洞 ⇒ 洞检测在自己身上就误报")
+    print(("SELFTEST PASS：正例绿、一段消音转红（缺段 %d、相对散布 %.2f dB）；%s"
+           % (len(r["missing"]), r["rel"], "；".join(pos) if pos else "洞检测未触发"))
+           if not bad else "SELFTEST FAIL：" + "；".join(bad))
     return 0 if not bad else 2
 
 
@@ -376,6 +434,12 @@ def main() -> int:
     ap.add_argument("--tol", type=float, default=0.0, help="0＝用实测自身散布下限 4.41 dB")
     ap.add_argument("--silent-db", type=float, default=-60.0)
     ap.add_argument("--min-seg", type=float, default=0.5, help="短于此的段不参与（避免窗口边噪）")
+    ap.add_argument("--hole-s", type=float, default=0.2,
+                    help="连续这么久才算一个洞（秒）")
+    ap.add_argument("--hole-allow", type=float, default=0.5,
+                    help="允许的洞总时长（秒）——超过即转红")
+    ap.add_argument("--hole-our-db", type=float, default=-60.0, help="我方视为静音的门限")
+    ap.add_argument("--hole-exp-db", type=float, default=-45.0, help="成片视为有声的门限")
     ap.add_argument("--dump", default="")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--shift-sweep", action="store_true", help="扫原点，分清错位与缺内容（不改判据线）")
