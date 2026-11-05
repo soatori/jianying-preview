@@ -280,6 +280,35 @@ def find_holes(ours: np.ndarray, our_rate: int, exp: np.ndarray, exp_rate: int,
     return holes
 
 
+def delivery_ledger(report: str) -> str:
+    """把页内自己的交付账读出来贴在判定行旁边。
+
+    为什么需要：`L29` 从音频推"有没有洞"，而**为什么**要看在跑时记下的账——
+    P-154 就是靠它对上机制的：坏的那次 `0DB4E847` 与 BGM 的 `ctx0 == ctx1`（一段都没排进图）、
+    `lost_s 10.95 s`，好的那次 `lost_s 0.174 s` 且区间正常。光看录音只能看到"有洞"，看不到"饿死"。
+    """
+    obj = None
+    for line in open(report, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            j = json.loads(line)
+        except Exception:
+            continue
+        if (j.get("play") or {}).get("audio"):
+            obj = j["play"]["audio"]
+    if not obj:
+        return "交付账：没有旁证可读"
+    ps = obj.get("per_seg") or []
+    zero = [str(x.get("id"))[:8] for x in ps
+            if x.get("ctx0") is not None and x.get("ctx1") is not None and x["ctx1"] <= x["ctx0"]]
+    return ("交付账：jobs_started=%s flushes=%s lost_s=%.2f s clamps=%s(%.0f ms) short_jobs=%s "
+            "零排期段=%d%s" % (obj.get("jobs_started"), obj.get("flushes"), obj.get("lost_s") or 0,
+                              obj.get("clamps"), obj.get("clamp_ms_total") or 0, obj.get("short_jobs"),
+                              len(zero), ("：" + ",".join(zero[:6])) if zero else ""))
+
+
 def judge(args) -> int:
     ours, our_rate = read_wav(Path(args.capture))
     exp, exp_rate = read_wav(Path(args.export_audio))
@@ -347,6 +376,8 @@ def judge(args) -> int:
         worst = max(live, key=lambda r: abs(r["delta_db"] - med))
         print(f"   偏得最多的段：{worst['id']}@{worst['t0']}–{worst['t1']} Δ={worst['delta_db']} "
               f"（相对 {abs(worst['delta_db'] - med):.2f} dB）")
+    if args.report_jsonl:
+        print("   " + delivery_ledger(args.report_jsonl))
     if args.dump:
         Path(args.dump).write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
     return 0 if ok else 1
@@ -456,6 +487,7 @@ def main() -> int:
                     help="允许的洞总时长（秒）——超过即转红")
     ap.add_argument("--hole-our-db", type=float, default=-60.0, help="我方视为静音的门限")
     ap.add_argument("--hole-exp-db", type=float, default=-45.0, help="成片视为有声的门限")
+    ap.add_argument("--report-jsonl", default="", help="该次跑的页内旁证，用来贴出交付账（lost_s/零排期段等）")
     ap.add_argument("--dump", default="")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--shift-sweep", action="store_true", help="扫原点，分清错位与缺内容（不改判据线）")
