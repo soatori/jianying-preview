@@ -52,6 +52,12 @@ def media_id(path: str) -> str:
     return hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
 
 
+def safe_tag(raw: str) -> str:
+    """POST body 里的名字只能落成 scratch 根下的一个文件名，不许带路径。"""
+    cleaned = "".join(c for c in str(raw) if c.isalnum() or c in "._-").lstrip(".")
+    return cleaned[:60] or "report"
+
+
 # ---- S2 仪表：日志按 epoch 毫秒记时，并按大小滚动（改名归档，不删历史）----------------------
 # 为什么必须换尺子：`_note()` 过去只写 `HH:MM:SS`，所以 P-95 那句"这批请求里没有一次接近 350 ms"
 # 其实是**覆盖率缺口**而不是结论——秒级戳既对不上页内的 await 窗，也分不出日期。
@@ -204,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
             # 判静音段/削顶/跳变要的是连续波形：现有 peak_fs/rms_windows 是 analyser 在 JS 循环里
             # 轮询出来的，循环一冻几百 ms 缺席的正是这些采样——自报数字会被它想测的故障本身破坏。
             nm = (self.path.split("name=")[-1] or "")[:80]
-            nm = "".join(c for c in nm if c.isalnum() or c in "._-").lstrip(".") or "preview-capture"
+            nm = safe_tag(nm) or "preview-capture"
             out = OUT / f"preview-audio-{nm[:60]}.wav"
             out.write_bytes(raw)
             self._note(f"POST /wave bytes={len(raw)} -> {out.name}")
@@ -238,7 +244,7 @@ class Handler(BaseHTTPRequestHandler):
             obj = json.loads(raw.decode("utf-8", "replace"))
             tag = obj.get("tag")
             if tag:
-                name = f"report-{tag}.jsonl"
+                name = f"report-{safe_tag(tag)}.jsonl"
             # 把页内的时钟基准随这一行一起留下：`epoch_sent - 本行的 epoch` 就是两条墙钟的错位量
             # （同机应当只有几毫秒），S2 相交之前先看它，不然窗对不上时说不清是谁的锅。
             if obj.get("epoch_base") is not None:
