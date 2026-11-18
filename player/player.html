@@ -2149,40 +2149,45 @@ const AVCLK_ON = Q.get('avclk') === '1';   // 默认仍走墙钟：实测两臂�
                                            // 保留 &avclk=1 只是把这条否证留在仪器里，别下次又凭猜想改。
 let actxT0 = 0;
 let pos = 0, playing = false, measuring = false, lastWall = 0, frames = 0, winStart = 0, intervals = [], lastAt = 0, framesDecoded = 0, lastFiles = [];
+let ticking = false;   // tick 不许重入：看门狗与 &drive=timer 都会在 paint 还没返回时再敲一次
 
 async function tick(t) {
-  if (measuring) { requestAnimationFrame(rafTick); return; }
-  let gapMs = -1, gapPos = 0;
-  if (playing) {
-    scheduleAudio(pos);
-    // 播放头跟随**音频时钟**，不再跟墙钟。这个文件的第 150 行早就写着
-    // "AudioContext is the clock authority"，但 tick() 一直用 performance.now() 推进——
-    // 于是每次 `await paint()` 超预算（实测整条时间轴累计 942 ms、21 帧过线），
-    // 画面冻住而音频照播 ⇒ 音频一路领先画面，听起来就是"轨道没混合、有的该响没响"。
-    // 视频跟音频是播放器的标准做法：超预算时宁可少画一帧，也不让两条时钟分叉。
-    const clk = (AVCLK_ON && actx) ? (actx.currentTime - actxT0) * 1000 : t;
-    if (lastWall) {
-      const dt = (clk - lastWall) / 1000;
-      pos = Math.min(DUR, pos + Math.max(0, dt));
-      if (pos >= DUR) toggle(false);
+  if (ticking) return;
+  ticking = true;
+  try {
+    if (measuring) { requestAnimationFrame(rafTick); return; }
+    let gapMs = -1, gapPos = 0;
+    if (playing) {
+      scheduleAudio(pos);
+      // 播放头跟随**音频时钟**，不再跟墙钟。这个文件的第 150 行早就写着
+      // "AudioContext is the clock authority"，但 tick() 一直用 performance.now() 推进——
+      // 于是每次 `await paint()` 超预算（实测整条时间轴累计 942 ms、21 帧过线），
+      // 画面冻住而音频照播 ⇒ 音频一路领先画面，听起来就是"轨道没混合、有的该响没响"。
+      // 视频跟音频是播放器的标准做法：超预算时宁可少画一帧，也不让两条时钟分叉。
+      const clk = (AVCLK_ON && actx) ? (actx.currentTime - actxT0) * 1000 : t;
+      if (lastWall) {
+        const dt = (clk - lastWall) / 1000;
+        pos = Math.min(DUR, pos + Math.max(0, dt));
+        if (pos >= DUR) toggle(false);
+      }
+      lastWall = clk;
+      if (!winStart) winStart = t;
+      if (lastAt) { gapMs = Math.round(t - lastAt); gapPos = +pos.toFixed(2); }
+      lastAt = t; frames++;
     }
-    lastWall = clk;
-    if (!winStart) winStart = t;
-    if (lastAt) { gapMs = Math.round(t - lastAt); gapPos = +pos.toFixed(2); }
-    lastAt = t; frames++;
-  }
-  const paintT0 = now();
-  try { await paint(pos * 1e6); }
-  catch (e) { tickErrors.push(String(e && e.message || e).slice(0, 120)); }
-  // 当帧 paint 耗时和帧间隔一起记：gap≈paint 是我们画得慢，gap≫paint 是浏览器没给帧。
-  if (gapMs >= 0) intervals.push([gapMs, gapPos, Math.round(now() - paintT0)]);
-  hud('pos', `${pos.toFixed(2)} / ${DUR.toFixed(2)} s`);
-  hud('stat', `req ${stat.requests} / bytes ${(stat.bytes / 1e6).toFixed(1)} MB`);
-  hud('heap', performance.memory ? `heap ${(performance.memory.usedJSHeapSize / 1048576).toFixed(0)} MB` : 'heap -');
-  const el = (t - winStart) / 1000;
-  if (playing && el > 0.5) hud('fps', `fps ${(frames / el).toFixed(2)} 池 ${pool.map.size}`);
-  document.getElementById('play').style.left = `${(pos / DUR) * 100}%`;
-  requestAnimationFrame(rafTick);
+    const paintT0 = now();
+    try { await paint(pos * 1e6); }
+    catch (e) { tickErrors.push(String(e && e.message || e).slice(0, 120)); }
+    // 当帧 paint 耗时和帧间隔一起记：gap≈paint 是我们画得慢，gap≫paint 是浏览器没给帧。
+    if (gapMs >= 0) intervals.push([gapMs, gapPos, Math.round(now() - paintT0)]);
+    hud('pos', `${pos.toFixed(2)} / ${DUR.toFixed(2)} s`);
+    hud('stat', `req ${stat.requests} / bytes ${(stat.bytes / 1e6).toFixed(1)} MB`);
+    hud('heap', performance.memory ? `heap ${(performance.memory.usedJSHeapSize / 1048576).toFixed(0)} MB` : 'heap -');
+    const el = (t - winStart) / 1000;
+    if (playing && el > 0.5) hud('fps', `fps ${(frames / el).toFixed(2)} 池 ${pool.map.size}`);
+    document.getElementById('play').style.left = `${(pos / DUR) * 100}%`;
+    requestAnimationFrame(rafTick);
+  } finally { ticking = false; }
 }
 
 // ---- rAF 看门狗 ----------------------------------------------------------------------------
