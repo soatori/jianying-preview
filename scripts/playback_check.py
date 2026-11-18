@@ -72,6 +72,56 @@ CRITERIA = {
 }
 
 
+# 每一条判据的规范名。跳过或输入缺失时也必须留一行，否则末尾的 "N of N"
+# 会按缩小后的分母宣称全绿（审查 5）。新增判据必须同时登记在这里。
+EXPECTED_LAYERS = (
+    "L0 tracked player in place",
+    "L1 errors/warnings",
+    "L1 geometry channel",
+    "L1 carrier freshness",
+    "L2 pixel layer",
+    "L3 video band",
+    "L4 continuous playback",
+    "L4 seek",
+    "L4 first frame",
+    "L4 Range streaming",
+    "L4 frame budget (whole timeline, tail not mean)",
+    "L4 live pacing + A/V residual (drive=timer, not real rAF)",
+    "L6 no silent black frame",
+    "L5 mixer",
+    "L10 browser pixels (vs channel 2 and vs export, same frame)",
+    "L6 guard has teeth",
+    "L9 cross-channel curve parity (browser == channel 2)",
+    "L7 mixmode shipped GLSL",
+    "L7 mixmode wiring (constructed fixture)",
+    "L7 mixmode browser wiring (fixture + negative fixture)",
+    "L7 mixmode GPU three-way (vendor GLSL = oracle)",
+    "L8 curves table rebuilt from the model",
+    "L8 animation wiring (real draft, covered presets)",
+    "L8 typewriter wiring (prefix law live on channel 2 + carrier)",
+    "L11 flash in/out A/B (channel 2 vs export, same frame index)",
+)
+
+
+def summary_counts(checks) -> tuple[int, int, int]:
+    """(passed, skipped, failed)。SKIP 是**未测**，不许计入 passed——否则 24 层没跑
+    也照样印 "25 of 25 checks passed"（审查 5 的后半）。退出码只看 FAIL，调用约定不变。"""
+    failed = sum(1 for _, s, _ in checks if s == "FAIL")
+    skipped = sum(1 for _, s, _ in checks if s == "SKIP")
+    return len(checks) - failed - skipped, skipped, failed
+
+
+def fill_missing_checks(checks, expected=EXPECTED_LAYERS):
+    """没留下行的判据补一条 SKIP：未测不等于通过，分母不许悄悄缩小。"""
+    seen = {name for name, _, _ in checks}
+    out = list(checks)
+    for name in expected:
+        if name not in seen:
+            out.append((name, "SKIP",
+                        "本跑没执行到这一层（旗标跳过或输入缺失）⇒ 未测，不是通过"))
+    return out
+
+
 def run(cmd: list[str], cwd: Path = ROOT, timeout: int = 0) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=timeout or None)
@@ -299,7 +349,7 @@ def main() -> int:
     src = ROOT / "player" / "player.html"
     dst = OUT / Path(args.player).name
     if not src.is_file():
-        verdict("L0 tracked player present", False, f"{src} missing")
+        verdict("L0 tracked player in place", False, f"{src} missing")
     else:
         blob = src.read_bytes()
         tmp = dst.with_suffix(dst.suffix + ".sync.tmp")
@@ -967,8 +1017,10 @@ def main() -> int:
                        if (worse or blur_worse) else "")
                     + ("" if ok else f" | rc={fr.returncode} err={(fr.stderr or '')[-120:]}"))
         else:
-            checks.append(("L11 flash in/out A/B", "SKIP", "no --oracle-mp4 given"))
+            checks.append(("L11 flash in/out A/B (channel 2 vs export, same frame index)",
+                           "SKIP", "no --oracle-mp4 given"))
 
+    checks = fill_missing_checks(checks)
     width = max(len(name) for name, _, _ in checks) + 2
     # 控制台编码是 GBK：detail 里带中文（脚本 stdout 尾巴、预设名）时 print() 会在**最后一步**
     # 抛 UnicodeEncodeError，把已经跑完的 17 层结果全部吞掉。改成按字节写并替换不可编码字符。
@@ -979,9 +1031,10 @@ def main() -> int:
             sys.stdout.buffer.write((s + "\n").encode("utf-8", "replace"))
     for name, state, detail in checks:
         emit(f"{state:<5} {name:<{width}} {detail}")
-    failed = [c for c in checks if c[1] == "FAIL"]
-    print(f"\n{len(checks) - len(failed)} of {len(checks)} checks passed"
-          + (f", {len(failed)} FAILED" if failed else ""))
+    passed, skipped, failed = summary_counts(checks)
+    print(f"\n{passed} of {len(checks)} checks passed"
+          + (f", {skipped} SKIP (unmeasured)" if skipped else "")
+          + (f", {failed} FAILED" if failed else ""))
     return 1 if failed else 0
 
 
