@@ -829,7 +829,7 @@ Expected: well under one second for 200 calls (the old pure-Python version took 
 
 Switching BICUBIC → BOX changes every measured correlation. The `0.90` line was pre-registered against the old ruler. **Do not accept a new verdict silently.**
 
-The pixel artifacts are currently **absent** from `temp/` (verified: 0 oracle frames, 0 browser shots). So this checkpoint cannot run today. It must run before the change is accepted as a measurement:
+The pixel artifacts were **found present but stale** when this plan was executed (1108 oracle frames from 2026-11-04, 1105 browser shots from 2026-11-07 — both older than that day's fixes). The earlier claim of "0 oracle frames, 0 browser shots" was wrong. So this checkpoint cannot run today: judging those shots would measure the old page, and the ruler change would be confounded with page drift. It must run before the change is accepted as a measurement:
 
 1. Regenerate the oracle frames from the export and re-sweep the preview:
    `temp/venv/Scripts/python.exe scripts/frame_parity.py --sweep --stride 1 --model model-proxy-p157.json`
@@ -1030,6 +1030,8 @@ git commit -m "fix: 等页面自报时睡 0.25 s，不再满核自旋重读整�
 **Interfaces:**
 - Consumes: `tests/__init__.py` from Task 1.
 - Produces: `playback_check.EXPECTED_LAYERS: tuple[str, ...]` (25 criteria names) and `playback_check.fill_missing_checks(checks: list[tuple[str, str, str]], expected=EXPECTED_LAYERS) -> list[tuple[str, str, str]]`, which appends a `SKIP` row for every expected name not already present and never duplicates an existing row.
+
+> **Execution note (2026-11-18).** This task was completed **beyond** the steps below: the closing summary line was also fixed. `playback_check.summary_counts(checks) -> (passed, skipped, failed)` was added so `SKIP` is never counted as passed — before it, 1 PASS + 24 SKIP printed `"25 of 25 checks passed"` and exited 0, which is the second half of finding 5. Exit-code semantics are deliberately unchanged: a `SKIP` still does not fail the run, only `FAIL` does. Reverting this task needs both halves reverted together.
 
 - [x] **Step 1: Write the failing test**
 
@@ -1461,7 +1463,7 @@ Expected: fourteen modified source files plus ten new files under `tests/`. No c
 
 - [x] **Report the two open checkpoints honestly**
 
-1. **Task 6 Step 6** — the pixel re-baseline could not run (0 oracle frames, 0 browser shots in `temp/`). The ruler is now shared and unit-tested; the `0.90` / `0.96–1.04` lines have **not** been re-registered against it.
+1. **Task 6 Step 6** — the pixel re-baseline could not run: the artifacts exist (1108 oracle frames from 2026-11-04, 1105 browser shots from 2026-11-07) but are stale, and re-rendering needs Chrome plus an idle machine. The ruler is now shared and unit-tested; the `0.90` / `0.96–1.04` lines have **not** been re-registered against it. What was measured instead: a **ruler-only delta on identical stored bytes** (131 pairs = every 9th frame plus all 9 historical reds; the frozen old ruler reproduces `frame-parity-p187.json` exactly on all 131). corr p50 .9684 → .9579 (mean shift −0.0102); 0 pass→red, 1 red→pass (t=25.367, .8999→.9014); luma out-of-band 41 under both rulers but the sets differ. That is a delta on stale shots, not a verdict on the current page.
 2. **Task 9 Step 6** — the tick guard is unit-tested against the real source; the browser layers (L4 live pacing, L6, L10) have **not** been re-run.
 
 Neither is a pass. State both as open, and state that Task 2 Step 5 may have surfaced a genuine previously-hidden animation defect.
