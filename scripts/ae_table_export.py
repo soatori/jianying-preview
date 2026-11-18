@@ -41,19 +41,46 @@ def curve_for(pkg_dir: str, dur_us: int, step_us: int):
     if pkg[0] == "ERR":
         return None
     mod, tools, cons, expo = pkg
-    if rf.AE_VBLUR_ATTR not in tools.attrs:
+    # 老版这里硬要求 `AE_VBLUR_ATTR` 在场，否则整包不导——方言 A（`侧滑`）的模糊轨名不是那一个，
+    # 于是位移那条也跟着进不了表。改成：**有哪条导哪条**，一条都没有才算导不出（降级仍然数得出来）。
+    vattr = rf.AE_VBLUR_ATTR if rf.AE_VBLUR_ATTR in tools.attrs else None
+    # 这里**不能**用"任何 Gaussian Blur 轨道"来凑：方言 A 的包有两条模糊轨（`_12` 与 `_17`），
+    # 前缀扫到的那条是水平模糊（300→0）。上一版这样写，等于把 300 的水平强度当成垂直强度导给页面，
+    # 页面 flashApply 拿 max(v)×0.2398 做全画幅 BlurFilter——20.267 那一帧从此不再落帧（P-185）。
+    # 规矩不变：通道 2 用哪一条，表里就只能是那一条。
+    pattr = next((k for k in tools.attrs if k.startswith(("ADBE Position", "ADBE_Position"))), None)
+    if cons.get("dialect") != "A":
+        # 方言 B（`向上闪入`）的 yOffset 在包内是给 `SomePassMat` 的，不是主画面的位移（P-178②）——
+        # 导出它会被误当"这条已经判清"，所以这一路只对方言 A 出。
+        pattr = None
+    if not (expo or vattr or pattr):
         return None
     n = int(dur_us / step_us) + 1
-    e_arr, v_arr = [], []
+    e_arr, v_arr, x_arr = [], [], []
     for i in range(n):
         t = i * step_us / 1e6
         cf = mod.frame_of_clamped(t, dur_us / 1e6, cons, tools.all_frame)
         p = max(0.0, min(cf, tools.all_frame)) / tools.all_frame
-        e_arr.append(round(float(tools.get_val(expo, p)[0]), 5))
-        v_arr.append(round(float(tools.get_val(rf.AE_VBLUR_ATTR, p)[0]), 4))
-    return {"package": str(pkg_dir).replace("\\", "/"), "attrs": sorted(tools.attrs),
-            "constants": {k: cons[k] for k in ("ae_mul", "ae_div", "all_frame") if k in cons},
-            "duration_us": dur_us, "step_us": step_us, "exposure": e_arr, "vblur": v_arr}
+        if expo:
+            e_arr.append(round(float(tools.get_val(expo, p)[0]), 5))
+        if vattr:
+            v_arr.append(round(float(tools.get_val(vattr, p)[0]), 4))
+        if pattr:
+            pv = tools.get_val(pattr, p)
+            design = cons.get("design_size") or 1080.0
+            # 与通道 2 的 `ae_in_clip` 同一条口径：clip.x = (p − 半幅)/半幅（P-179① 对账对上的那个）
+            x_arr.append(round((float(pv[0] if isinstance(pv, list) else pv) - design / 2.0)
+                               / (design / 2.0), 6))
+    cur = {"package": str(pkg_dir).replace("\\", "/"), "attrs": sorted(tools.attrs),
+           "constants": {k: cons[k] for k in ("ae_mul", "ae_div", "all_frame") if k in cons},
+           "duration_us": dur_us, "step_us": step_us}
+    if expo:
+        cur["exposure"] = e_arr
+    if vattr:
+        cur["vblur"] = v_arr
+    if pattr:
+        cur["xoff"] = x_arr
+    return cur
 
 
 def main() -> int:

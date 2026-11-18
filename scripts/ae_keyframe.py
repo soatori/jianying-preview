@@ -81,8 +81,20 @@ def strip_lua_comments(src: str) -> str:
     return re.sub(r"--[^\n]*", "", src)
 
 
+def _inline_design_size(src: str) -> float:
+    """方言 A 包里的 `self.DESIGN_SIZE = 1080`——clip 口径要靠它，不写死。"""
+    m = re.search(r"self\.DESIGN_SIZE\s*=\s*([0-9.]+)", src)
+    return float(m.group(1)) if m else 1080.0
+
+
 def parse_ae_attribute(src: str) -> dict:
     src = strip_lua_comments(src)
+    if "local ae_attribute" not in src:
+        # 方言 A：包里没有 `local ae_attribute`，表是内联的 `["ADBE …"] = {d,k,s}`，
+        # 而且 `k` 的第一列是**秒**、`s` 里每通道一对切线（y 给绝对值）。
+        # 这里把它归一到下面 `AETools` 已经会吃的那种段形，好让 harvest/export/页面**共用同一条路**
+        # （P-181③：浏览器不该再有一份数学）。
+        return parse_inline_keys(src)
     i = src.index("local ae_attribute")
     j = src.index("{", i)
     tbl, _ = lua_table(src, j)
@@ -92,9 +104,69 @@ def parse_ae_attribute(src: str) -> dict:
     return out
 
 
+def _num_list(x) -> list[float]:
+    if isinstance(x, (int, float)):
+        return [float(x)]
+    if isinstance(x, list):
+        return [float(v) for v in x]
+    return []
+
+
+def parse_inline_keys(src: str) -> dict:
+    """内联 AE 表 → `AETools` 的段形：`[[bz,(start,end),[from,to]], …]`，帧号 = 秒 × 30。"""
+    import animation_ae as aae
+    out: dict = {}
+    for tr in aae.load_ae_from_text(src):
+        keys, eases = tr["keys"], tr["eases"]
+        segs = []
+        for j in range(len(keys) - 1):
+            v0, v1 = _num_list(keys[j][1:]), _num_list(keys[j + 1][1:])
+            n = min(len(v0), len(v1))
+            if n == 0:
+                continue
+            e = eases[j] if j < len(eases) else {}
+            o_rows, i_rows = e.get("o_rows") or [], e.get("i_rows") or []
+            bz = [0.0, 0.0, 1.0, 1.0]
+            if len(o_rows) > 1 and len(i_rows) > 1:            # 每通道一组 ⇒ 12 个数
+                gx = [o[0] for o in o_rows[:n]]
+                gy = []
+                for q in range(n):
+                    span = v1[q] - v0[q]
+                    gy.append(o_rows[q][1] if abs(span) < 1e-9
+                              else (o_rows[q][1] - v0[q]) / span)      # y 是绝对值 ⇒ 归一
+                ix = [1.0 - i[0] for i in i_rows[:n]]
+                iy = []
+                for q in range(n):
+                    span = v1[q] - v0[q]
+                    iy.append(1.0 - (i_rows[q][1] if abs(span) < 1e-9
+                                     else (i_rows[q][1] - v0[q]) / span))
+                bz = gx + gy + ix + iy
+            elif e.get("o") and e.get("i"):
+                bz = [e["o"][0], e["o"][1], 1.0 - e["i"][0], 1.0 - e["i"][1]]
+            segs.append([bz, [keys[j][0] * 30.0, keys[j + 1][0] * 30.0],
+                         [v0, v1[:n]]])
+        if segs:
+            out[tr["name"]] = segs
+    return out
+
+
 def extract_constants(src: str) -> dict:
     """seek() 里的时间映射常数——从源码取，不写死在本文件里。"""
     src = strip_lua_comments(src)
+    if "local ae_attribute" not in src:
+        # 方言 A：包内没有 `AEprogress = t*A/B` 那套（它自己在 update 里写 `elapsed = progress*DURATION`）。
+        # 归一化已经把帧轴做成 `秒 × 30`，所以 A/B 记 1/1、mod_eps 记 0，
+        # 而 `default_duration` 取包内 `self.DURATION = 18 / 30` 那一行——照样是抄，不是猜。
+        m = re.search(r"self\.DURATION\s*=\s*([0-9a-zA-Z./\- +()]+)", src)
+        dur = 1.0
+        if m:
+            try:
+                dur = float(eval(m.group(1).strip(), {"__builtins__": {}}, {}))
+            except Exception:
+                dur = 1.0
+        return {"ae_mul": 1.0, "ae_div": 1.0, "mod_eps": 0.0,
+                "default_duration": dur, "fps_ref": None, "noise_gain": None,
+                "design_size": _inline_design_size(src), "dialect": "A"}
     c: dict[str, object] = {}
     m = re.search(r"local\s+AEprogress\s*=\s*t\s*\*\s*([0-9.]+)\s*/\s*([0-9.]+)", src)
     assert m, "取不到 AEprogress = t * A / B"

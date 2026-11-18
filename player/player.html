@@ -26,7 +26,7 @@
 // Font law from F-035/F-036: em_px = size * canvasWidth * 0.00574 (band 0.00574-0.00578).
 // Draw order is NOT calibrated (U-15): larger render_index = on top is the working assumption.
 import { Application, Sprite, Texture, Text, Container, BlendModeFilter, ColorMatrixFilter, BlurFilter,
-         Filter, GlProgram }
+         Filter, GlProgram, Assets }
   from '/px-probe/node_modules/pixi.js/dist/pixi.min.mjs';
 import { Input, CustomSource, VideoSampleSink, AudioBufferSink, ALL_FORMATS }
   from '/px-probe/node_modules/mediabunny/dist/bundles/mediabunny.mjs';
@@ -64,6 +64,12 @@ const textTracks = model.tracks.filter((t) => t.type === 'text' && t.segments.le
 
 const app = new Application();
 await app.init({ width: W, height: H, background: '#000', antialias: false });
+// 呈现必须**确定性**：Pixi 自带 ticker 挂在 rAF 上，rAF 一停（Qoder 内置浏览器/页面隐藏/
+// 后台标签）场景图照常更新、HUD 照常走，可见画布却冻在上一帧——用户截图里的"幽灵字幕"
+// （上一刻的画面，黄字淡＝冻在入场动画中段）就是它，2026-11-05 第三次坐实同族根因。
+// 关掉自带 ticker，改由 paint() 末尾显式 app.render()：每次 paint 恰好呈现一次，与 rAF 无关。
+app.ticker.autoStart = false;
+app.ticker.stop();
 document.getElementById('stage').appendChild(app.canvas);
 const world = new Container();
 world.sortableChildren = true;
@@ -85,6 +91,11 @@ app.stage.addChild(badge);   // 挂在 stage 上而不是 world 上：入场动�
 // 所以用内建 ColorMatrixFilter 的对角阵即可——**不自建 sampler，避开 F-093 那条"自定义名不绑定"**。
 const AE = { loaded: false, n: 0, missing: [], applied: 0, lastE: 0, lastV: 0, eSum: 0, vSum: 0, blurPx: 0 };
 let AE_TABLE = {};
+const BS = String.fromCharCode(92);
+// 「侧滑」的 x 偏移开关。P-187 全量逐帧（1105 帧，corr≥0.90 那条线未动）判它错：
+// 表里 xoff[0]=−0.556 与 xoff[2..9]=+0.144→0 的平滑段**不同族**（轨迹解析还没修对），
+// 加上之后 20.267…20.500 全部变差，corr 红帧 9→13（4 帧由绿翻红）。曝光/垂直模糊那一腿不受本开关影响。
+const AE_XOFF_ON = false;
 try {
   const j = await (await fetch('/playback-test/ae-curves.json')).json();
   AE_TABLE = (j && j.curves) || {};
@@ -112,8 +123,12 @@ function aeAt(seg, posUs) {
     if (!c) { const nm = key.split('/').slice(-2).join('/'); if (!AE.missing.includes(nm)) AE.missing.push(nm); continue; }
     const t = posUs - seg.target.start_us;
     if (t < 0 || t > c.duration_us) continue;
-    const i = Math.max(0, Math.min(c.exposure.length - 1, Math.round(t / c.step_us)));
-    return { e: c.exposure[i], v: c.vblur[i] };
+    // 表里现在有两种条目：`向上闪入` 有 exposure+vblur，`侧滑` 只有 xoff（P-183）。
+    // 老写法直接吃 `c.exposure.length`/`c.exposure[i]`，遇到只有 xoff 的条目就在渲染循环里抛，
+    // 表现是**从那一刻起不再落帧、控制台也不报错**（P-185：20.267 起整批停住）。
+    const arr = c.exposure || c.vblur || c.xoff;
+    const i = Math.max(0, Math.min(arr.length - 1, Math.round(t / c.step_us)));
+    return { e: c.exposure ? c.exposure[i] : 0, v: c.vblur ? c.vblur[i] : 0 };
   }
   return null;
 }
@@ -306,6 +321,9 @@ async function streamFor(path, want = 'video', own = false) {
 let actx = null, master = null, analyser = null;
 const audioJobs = new Map();
 const silentPaths = new Set();
+// 被静音律挡掉的段（只数一次，否则每帧重复计）：没有这个名单，"预览没声"分不清
+// 是草稿要求静音还是我们把音轨丢了。
+const mutedSkipped = new Set();
 // 每个媒体文件的"音频已排到音频时钟何处"游标（见 scheduleAudio 里 ctxAt 的单调钳制）。
 const fileAudioEnd = new Map();
 // 视频腿的对应物：素材里根本没有视频轨（mp3 放上了视频轨 / 组合子时间线里的 BGM）。
@@ -313,7 +331,7 @@ const fileAudioEnd = new Map();
 const noVideoPaths = new Set();
 const audioRates = new Set();   // every rate that reached the mixer this run   // video files the demuxer says carry no audio track
 let audioGen = 0;
-const audioStats = { chunks: 0, nodes: 0, peak_rms: 0, peak_fs: 0, clipped_windows: 0, sample_rate: 0, audio_errors: 0, loudness_applied: 0, fades_applied: 0, rms_windows: [], clamps: 0, clamp_ms_total: 0, clamp_ms_max: 0, exp_s: 0, sched_s: 0, lost_s: 0, short_jobs: 0, interrupted_jobs: 0, jobs_started: 0, dropped_samples: 0, flushes: 0, flushes_quiet: 0, flush_rms_sum: 0, per_seg: [] };
+const audioStats = { chunks: 0, nodes: 0, peak_rms: 0, peak_fs: 0, clipped_windows: 0, sample_rate: 0, audio_errors: 0, loudness_applied: 0, fades_applied: 0, rms_windows: [], clamps: 0, clamp_ms_total: 0, clamp_ms_max: 0, exp_s: 0, sched_s: 0, lost_s: 0, short_jobs: 0, interrupted_jobs: 0, jobs_started: 0, dropped_samples: 0, flushes: 0, flushes_quiet: 0, flush_rms_sum: 0, muted_skipped: 0, video_jobs: 0, per_seg: [] };
 
 function ensureAudio() {
   if (!actx) {
@@ -523,7 +541,7 @@ async function pumpAudio(seg, st, ctxAt, mediaStart, mediaEnd, speed) {
       // （P-150：掉落 0.37 s 与 clamp 合计 392 ms 量级吻合，但只有时间戳能证明是同一次）。
       if ((audioStats.clamp_at = audioStats.clamp_at || []).length < 64)
         audioStats.clamp_at.push({ at: +at.toFixed(3), skipped_ms: +ms.toFixed(1),
-                                   seg: String(j.seg_id || sid || '').slice(0, 8) });
+                                   seg: String(j.seg?.id || '').slice(0, 8) });
     }
     g.gain.setValueAtTime(gainAt(localT), at);
     g.gain.linearRampToValueAtTime(gainAt(localT + d), at + d);
@@ -584,6 +602,9 @@ async function pumpAudio(seg, st, ctxAt, mediaStart, mediaEnd, speed) {
     if (audioStats.per_seg.length < 300) {
       audioStats.per_seg.push({ id: String(seg.id).slice(0, 24), base: +base.toFixed(4),
         exp_s: +expS.toFixed(2), sched_s: +gotS.toFixed(2),
+        // 段来自哪条轨的类型：视频携带音轨与音频轨的交付要能分开数，
+        // 不然"40 个作业全来自音频轨"这种形状看不出来。
+        kind: (seg.track && seg.track.type) || '?',
         // 判「重音」需要的两样东西：这段排的是**哪个文件**，以及它在**音频时钟**上占的时间窗。
         // 没有 file 就看不见"同一段录音由两条不同链路各放一遍"（作业表按 id 去重，拦不住它）；
         // 没有 ctx 窗就分不清"同时在放"与"回绕后依次重播"（后者不是缺陷）。
@@ -646,11 +667,25 @@ const CHILD_NORM = Q.get('childnorm') !== '0';
 const VIDEO_AUDIO_PRIV = Q.get('vidaudiopriv') === '1';
 async function scheduleAudio(posSec) {
   ensureAudio();
-  const one = async (trackType, seg, usePriv) => {
+  const one = async (trackType, seg, usePriv, trackOff) => {
     const t0 = seg.target.start_us / 1e6, t1 = t0 + seg.target.duration_us / 1e6;
     if (t1 < posSec || t0 > posSec + AUDIO_LEAD || audioJobs.has(seg.id)) return;
-    if (!seg.media?.path || !seg.media.exists || !seg.media.container?.readable) return;
+    if (!seg.media?.path || !seg.media.exists) return;
+    // 判据必须和影像腿**同一条**（`container?.readable === false`）。原来写成 `!container?.readable`
+    // = "容器键不存在就跳过"，而代理模型把可读性记在 `media.readable`、只在加密的组合缓存上放
+    // `container.readable:false` ⇒ 凡代理段一律被挡：实测一次电池 40 个音频作业全来自三条音频轨，
+    // 视频携带音轨的作业是 0，口播（组合子段的拍摄文件音轨）整个没进混音（用户 2026-11-05 报的就是这条）。
+    if (seg.media.container?.readable === false) return;
     if (trackType === 'video' && silentPaths.has(seg.media.path)) return;
+    // 静音律（与 scripts/playback_model.py 同源，判别式抄自厂商自己的模型层 JS）：
+    // 轨道 `attribute & MuteFlag(1)`；主视频轨的喇叭走草稿级 `config.video_mute`；
+    // 片段 volume≈0（剪映把静音前的值记在 last_nonzero_volume）；原声被提取到独立音频轨时
+    // `extra_type_option & 1` 置位，此时视频段自带声按 0 —— 不放这条就会把同一段人声放两遍。
+    if (trackOff || seg.separated_audio || (seg.volume ?? 1) <= 0.002) {
+      if (!mutedSkipped.has(seg.id)) { mutedSkipped.add(seg.id); audioStats.muted_skipped = mutedSkipped.size; }
+      return;
+    }
+    if (trackType === 'video') audioStats.video_jobs++;
     const speed = seg.speed || 1;
     const s0 = seg.source.start_us / 1e6;
     const from = s0 + Math.max(0, posSec - t0) * speed;
@@ -680,6 +715,7 @@ async function scheduleAudio(posSec) {
       // rather than a fault - remember the path and move on.
       if (trackType === 'video' && /no audio track/.test(String((e && e.message) || e))) {
         silentPaths.add(seg.media.path);
+        audioStats.silent_paths = silentPaths.size;   // 解流器说"这个文件没音轨"的计数，与 muted_skipped 分账
       } else {
         out(`  ! audio stream ${String(e.message || e).slice(0, 60)}`);
       }
@@ -692,8 +728,9 @@ async function scheduleAudio(posSec) {
     // Video segments carry their own sound and JianYing plays it unless muted, so the mixer has
     // to walk video tracks too - a speech-led draft previewing silently is not a preview.
     if (track.type !== 'audio' && track.type !== 'video') continue;
+    const trackOff = !!track.muted || (!!track.is_main_video && !!model.video_mute);
     for (const seg of track.segments) {
-      await one(track.type, seg);
+      await one(track.type, seg, false, trackOff);
       if (!CHILD_AUDIO || !seg.composite?.tracks) continue;
       // 组合子段的时间是**子时间线本地时间**，映射到父窗口是纯平移（组合律里时间恒等）。
       // 这里造一个把 `target` 平移到父时间、`volume` 乘上父段的合成段，于是原有排期/淡入淡出/
@@ -705,6 +742,7 @@ async function scheduleAudio(posSec) {
       if (pv <= 0.002) continue;              // 父段静音 ⇒ 子段一并跳过，这条本身就是反向对照
       for (const ct of seg.composite.tracks) {
         if (ct.type !== 'audio' && ct.type !== 'video') continue;
+        const childOff = !!ct.muted || (!!ct.is_main_video && !!(seg.composite.video_mute));
         for (const cs of ct.segments) {
           // 子时间线里也有 `material_type:"photo"` 指向 .png 的段（JianYing Presets/Combination/
           // Resources/76cff6f9….png）。它的容器能被探测到"readable"，但拿去当**音频源**时
@@ -720,7 +758,7 @@ async function scheduleAudio(posSec) {
             // 而子段拍摄文件正是它的内容来源，所以替换音源要吃同一份归一。
             // 不给这一层时实测 peak_fs 1.30→2.05、满刻度窗 33→458（P-88）。`&childnorm=0` 复现旧行为。
             audio: cs.audio || (CHILD_NORM ? seg.audio : undefined),
-          }, true);
+          }, true, childOff);
         }
       }
     }
@@ -1173,17 +1211,16 @@ async function mixFilterFor(md5) {
 // P-133 同批打开：半边是通道 2 的 numpy 律（P-130 对成片判过），半边是这里的 GLSL 律，
 // 同一张 8 步灰阶 ramp 上两边走到 153.25 / 154.22（差 <1/255）。`&color=0` 留作负样本开关。
 const COLOR = { on: Q.get('color') !== '0', byId: new Map(), filters: new Map(), applied: 0,
-                carry: new Set() };
+                carry: new Set(), lut: null, skippedLut: 0 };
 
-function colorP(b) { return b > 0 ? 1.0 + b * 5.0 : 1.0 / (1.0 - b * 2.5); }
+// ---- 调色链：律与 uniform 映射逐字取自装机包内明文（frag + SeekModeScript.lua，F-103）----
+// 与通道 2（`scripts/render_frame.apply_color_adjust`）是同一条律的两半，必须同批开关：
+// 只有一边调会让跨通道一致性变差（P-131/P-133 的教训）。第二个 sampler 先探针后写码
+// （P-132 的教训；P-167 实测：把 uLut 的中心纹素混进去，屏上像素确实变成该纹素 ⇒ 这条路真执行）。
+const PIVOT = 0.435, BW_EPS = 0.005;
 
-// P-132 实测：`new BlendModeFilter({gl:{functions,main}})` 这条槽在**渲染路径里不执行**——
-// 纯红 body 挂上去，截图与屏上画布两把尺子都不动，`finalColor = this is not glsl` 也不报错；
-// 同页 ColorMatrixFilter（Pixi 自带滤镜）在两把尺子下都显形 ⇒ 不是仪器瞎，是这条路不走程序。
-// 调色是一元曲线、不需要第二个 sampler，所以改走普通 `Filter` + `GlProgram`：探针里这条臂
-// 纯红出 [255,0,0]、B=0.1264 把灰阶均值 127.49 抬到 154.22（∫(1−(1−x)^1.632)dx·255 ≈ 158）。
-// ⚠ 混合模式（MIX）仍挂在这条空转的槽上，本时间线没有混合段（截图旁证 expected_segs 恒 0），
-//    所以 L10 从没暴露过它；那半件事记在 unresolved 里，不在这里顺手改。
+// 逐字取自本包 pixi.min.mjs 里 Pixi 自己的默认滤镜顶点，不自己造坐标映射（原 COLOR_VERTEX 定义，
+// 这次替换把它和 colorFilterFor 一起圈进来了，所以在这里原样放回）。
 const COLOR_VERTEX = `in vec2 aPosition;
 out vec2 vTextureCoord;
 
@@ -1211,42 +1248,183 @@ void main(void)
     gl_Position = filterVertexPosition();
     vTextureCoord = filterTextureCoord();
 }
-`;   // 逐字取自本包 pixi.min.mjs 里 Pixi 自己的默认滤镜顶点，不自己造坐标映射
+`;
+const sigXF = (a) => Math.exp(8.33 * a - 12.16) + 5.82 * a - 1.72;
+const sigYK = (x, a, pv) => {
+  const af = sigXF(a), s = 1 / (1 + Math.exp(-af * (x - pv)));
+  return [s + pv - 0.5, af * s * (1 - s)];
+};
+function contrastUniforms(i) {
+  const param = i <= 0 ? i * 0.4 + 1.0 : i * 0.6 + 1.0;
+  if (param <= 1.0) return { kind: 'linear', param };
+  const [lv, ls] = sigYK(0.0, param, PIVOT), [rv, rs] = sigYK(1.0, param, PIVOT);
+  const [pv, ps] = sigYK(PIVOT, param, PIVOT);
+  return { kind: 'sigmoid', xf: sigXF(param), ld: 0.0 - lv, rd: 1.0 - rv,
+           lsd: ps - ls, rsd: ps - rs, ps };
+}
+const shadowP = (i) => 1.0 - 0.503 * i + 0.183 * i ** 2 - 0.147 * i ** 3 + 0.067 * i ** 4;
+const highlightP = (i) => 1.0 + 0.503 * i + 0.183 * i ** 2 + 0.147 * i ** 3 + 0.067 * i ** 4;
+function blackWhite(black, white) {
+  let xw = white >= 0 ? 1.0 - white * 0.5 : 1.0;
+  let yw = white >= 0 ? 1.0 : 1.0 + white * 0.5;
+  let xb = black >= 0 ? 0.0 : -black * 0.5;
+  let yb = black >= 0 ? black * 0.5 : 0.0;
+  xw = Math.max(xw, BW_EPS); yw = Math.max(yw, BW_EPS);
+  xb = Math.min(xb, xw - BW_EPS); yb = Math.min(yb, yw - BW_EPS);
+  const slope = (yw - yb) / (xw - xb);
+  return [slope, yb - slope * xb];
+}
 
-function colorFilterFor(b) {
-  if (COLOR.filters.has(b)) return COLOR.filters.get(b);
-  const p = colorP(b).toFixed(6);
-  const off = (b < 0 ? -b * 0.01 : 0.0).toFixed(6);
-  const f = new Filter({ glProgram: GlProgram.from({ vertex: COLOR_VERTEX, fragment: `
-in vec2 vTextureCoord;
+// LUT 由建模时复制到网关服务目录（`playback_model.stage_adjust_lut`）；取不到就不施加这一支，
+// 并且把次数报出来（skipped_lut）——静默近似是 F-100 那一族的病。
+if (model.adjust_lut) {
+  // 用 Assets.load（P-167 探针实测这条路能取到 289×17 的 LUT 并绑进第二个 sampler）；
+  // Texture.fromAsync 在本包这条路径上取不到 ⇒ 之前是 lut_ready=false、lightSensation 整支被跳过。
+  try {
+    const load = async (u) => {
+      const t = await Assets.load(u);
+      if (t && t.source && t.source.scaleMode !== 'linear') t.source.scaleMode = 'linear';
+      return t && t.base ? t : (t && t.texture ? t.texture : t);
+    };
+    COLOR.lut = { max: await load(model.adjust_lut.max), min: await load(model.adjust_lut.min) };
+    COLOR.lutError = null;
+  } catch (e) {
+    COLOR.lut = null;
+    COLOR.lutError = String(e && e.message || e).slice(0, 120);
+  }
+}
+
+function colorParams(seg) {
+  const ev = ((seg.features || {}).effect_values) || {};
+  // 与通道 2 的 COLOR.branches 同一条闸（两边同批是硬约束，P-131/P-133）：
+  // P-175 通路闭合验把 light_sensation 放开了——不闭合从来不是律，是 resources 挂错了层
+  // （见 colorFilterFor 末段），这条腿现在五段全绿。
+  const keys = ['brightness', 'light_sensation'];   // P-176：shadow/black/white 试过又一起闸回（见通道 2 同段注释）
+  const nz = {};
+  for (const k of keys) if (typeof ev[k] === 'number' && Math.abs(ev[k]) > 1e-6) nz[k] = ev[k];
+  if (!Object.keys(nz).length) return null;
+  const out = { nz, sig: keys.map((k) => (nz[k] || 0).toFixed(6)).join(',') };
+  if (nz.brightness) {
+    const b = nz.brightness;              // 口径同通道 2：草稿原值直接进公式（这条差异记在 U-111）
+    out.br = { p: +(b > 0 ? 1 + b * 5 : 1 / (1 - b * 2.5)).toFixed(6),
+               off: +(b < 0 ? -b * 0.01 : 0).toFixed(6) };
+  }
+  if (nz.contrast) out.ct = contrastUniforms(nz.contrast);
+  if (nz.saturation) out.st = nz.saturation + 1.0;
+  if (nz.highlight) out.hp = +highlightP(nz.highlight).toFixed(6);
+  if (nz.shadow) out.sp = +shadowP(nz.shadow).toFixed(6);
+  if (nz.black || nz.white) {
+    const [sl, bi] = blackWhite(nz.black || 0, nz.white || 0);
+    out.bw = { s: +sl.toFixed(6), b: +bi.toFixed(6) };
+  }
+  if (nz.light_sensation) {
+    const which = nz.light_sensation > 0 ? 'max' : 'min';
+    if (COLOR.lut && COLOR.lut[which]) {
+      out.ls = { w: +Math.abs(nz.light_sensation).toFixed(6), which };
+    } else { out.ls = null; COLOR.skippedLut++; }
+  }
+  return out;
+}
+
+const LUT_GLSL = `
+vec4 lutGrid(float gi, vec3 col, float sx, float sy) {
+    float gs = 17.0; float lw = 289.0; float lh = 17.0;
+    float gy = floor(gi / gs); float gx = gi - gy * gs;
+    vec2 tp = vec2(gx / gs + 0.5 / lw + sx * col.r, gy + 0.5 / lh + sy * col.g);
+    return texture(uLut, tp);
+}
+vec4 lutApply(vec3 col) {
+    float gs = 17.0;
+    float sx = 1.0 / gs - 1.0 / 289.0;
+    float sy = 1.0 - 1.0 / 17.0;
+    float blue = col.b * (gs - 1.0);
+    return mix(lutGrid(floor(blue), col, sx, sy), lutGrid(ceil(blue), col, sx, sy), fract(blue));
+}
+`;
+
+function colorFilterFor(pr) {
+  const key = pr.sig + '|' + (pr.ls ? pr.ls.which : '-');
+  if (COLOR.filters.has(key)) return COLOR.filters.get(key);
+  let body = '    vec3 c = front.rgb;\n';
+  const q = (x) => Number(x).toFixed(6);
+  if (pr.br) {
+    body += `    c = max(c - vec3(${pr.br.off}), 0.0);\n`;
+    body += `    c = clamp(1.0 - pow(1.0 - c, vec3(${pr.br.p})), 0.0, 1.0);\n`;
+  }
+  if (pr.ct) {
+    if (pr.ct.kind === 'linear') {
+      body += `    c = clamp(${q(pr.ct.param)} * (c - vec3(${PIVOT})) + vec3(${PIVOT}), 0.0, 1.0);\n`;
+    } else {
+      body += '    { vec3 x = c; float xf = ' + q(pr.ct.xf) + ';'
+            + ` vec3 sg = 1.0 / (1.0 + exp(-xf * (x - vec3(${PIVOT}))));`
+            + ` vec3 y = sg + vec3(${PIVOT}) - 0.5;`
+            + ` vec3 k = xf * sg * (1.0 - sg);`
+            + ' vec3 lft = step(x, vec3(' + PIVOT + '));'
+            + ` vec3 sc = lft * pow(((${q(pr.ct.ps)} - k) / ${q(pr.ct.lsd)}), vec3(2.0))`
+            + `       + (1.0 - lft) * pow(((${q(pr.ct.ps)} - k) / ${q(pr.ct.rsd)}), vec3(2.0));`
+            + ` c = clamp(y + sc * (lft * vec3(${q(pr.ct.ld)}) + (1.0 - lft) * vec3(${q(pr.ct.rd)})), 0.0, 1.0); }\n`;
+    }
+  }
+  if (pr.st) {
+    const F = [0.208540, 0.702086, 0.089374], sp = pr.st, base = F.map((f) => f * (1 - sp));
+    for (let i = 0; i < 3; i++) {
+      const v = [0, 1, 2].map((j) => q(j === i ? base[j] + sp : base[j]));
+      body += `    float s${i} = dot(front.rgb, vec3(${v[0]}, ${v[1]}, ${v[2]}));\n`;
+    }
+    body += '    c = clamp(vec3(s0, s1, s2), 0.0, 1.0);\n';
+  }
+  if (pr.hp) {
+    body += '    { vec3 t = 1.0 - c;'
+          + ` c = clamp(1.0 - pow(t, vec3(${pr.hp})) - (${pr.hp} - 1.0) * (t * t - t * t * t), 0.0, 1.0); }\n`;
+  }
+  if (pr.sp) {
+    body += `    c = clamp(pow(c, vec3(${pr.sp})) + (${pr.sp} - 1.0) * (c * c - c * c * c), 0.0, 1.0);\n`;
+  }
+  if (pr.bw) body += `    c = clamp(${pr.bw.s} * c + vec3(${pr.bw.b}), 0.0, 1.0);\n`;
+  if (pr.ls) body += `    c = clamp(mix(c, lutApply(c).rgb, ${pr.ls.w}), 0.0, 1.0);\n`;
+  const needLut = !!pr.ls;
+  const frag = `in vec2 vTextureCoord;
 out vec4 finalColor;
 uniform sampler2D uTexture;
+${needLut ? 'uniform sampler2D uLut;\n' + LUT_GLSL : ''}
 void main() {
     vec4 front = texture(uTexture, vTextureCoord);
-    vec3 cb = max(front.rgb - vec3(${off}), 0.0);
-    finalColor = vec4(clamp(1.0 - pow(1.0 - cb, vec3(${p})), 0.0, 1.0), front.a);
+${body}    finalColor = vec4(c, front.a);
 }
-` }), resolution: 1 });
+`;
+  const opts = { vertex: COLOR_VERTEX, fragment: frag };
+  // resources 必须挂在 **Filter** 这一层，不是 GlProgram（P-175 五段腿实测）：
+  // GlProgram 的构造只解构 {fragment, vertex, layout, gpuLayout, name}，resources 挂上去会被静默丢掉，
+  // 于是 uLut 分不到纹理单元、取样落回 unit 0 = 输入本身，但按 **LUT 坐标**取——
+  // 不是"什么都不改"，而是把同一帧错一小格混回来，corr 因此低于基线（P-174 的 9.2：0.925→0.829）。
+  // 挂在 Filter 上时 v8 的 Shader 会把没在 layout 里出现的名字自动排到 group 99 并 uniform1i 绑上。
+  const filterOpts = { glProgram: GlProgram.from(opts), resolution: 1 };
+  if (needLut) filterOpts.resources = { uLut: COLOR.lut[pr.ls.which].source };
+  let f;
+  try {
+    f = new Filter(filterOpts);
+  } catch (e) {
+    // 建不出来就退回不加这一支，并且把原因报进仪表（静默空转是 F-100 那一族的病）
+    COLOR.buildErrors = (COLOR.buildErrors || 0) + 1;
+    return null;
+  }
   f.__isColor = true;
-  f.__b = b;
-  COLOR.filters.set(b, f);
+  f.__sig = key;
+  COLOR.filters.set(key, f);
   return f;
 }
 
 function colorRecord(seg) {
-  const b = ((seg.features || {}).effect_values || {}).brightness;
-  const has = typeof b === 'number' && b !== 0;
-  // carry 不看 `on`、且按段 id 去重：关掉时也要能分清「模型本来没得调」和「该调的一个没挂上」，
-  // 而 paint 每帧都重新登记，用计数会把同一个段数到几十次。
-  if (has) COLOR.carry.add(seg.id);
-  const want = (COLOR.on && has) ? b : null;
+  const pr = colorParams(seg);
+  if (pr) COLOR.carry.add(seg.id);
+  const want = (COLOR.on && pr) ? pr : null;
   COLOR.byId.set(seg.id, want);
-  if (want !== null) colorFilterFor(want);
+  if (want) colorFilterFor(want);
 }
 
 // 只追加自己那一段：mixApply 只有在"曾经挂过混合"时才清 filters，两条律才能共存。
 function colorApply() {
-  let n = 0;
+  let n = 0, wantFrame = 0;
   for (const [id, b] of COLOR.byId) {
     const node = sprites.get(id) || comps.get(id) || texts.get(id);
     if (!node) continue;
@@ -1260,12 +1438,21 @@ function colorApply() {
       node.__colorSig = sig;
     }
     if (f) n++;
+    if (b) wantFrame++;
   }
   COLOR.applied = n;
+  COLOR.appliedFrame = wantFrame;
 }
 
 const colorStats = () => ({ on: COLOR.on, expected: COLOR.carry.size, registered: COLOR.byId.size,
-                             distinct_values: COLOR.filters.size, applied_nodes: COLOR.applied });
+                             distinct_values: COLOR.filters.size, applied_nodes: COLOR.applied,
+                             // `expected` 是**整场累计**见过的带色调段数，`applied` 只数**这一帧**在场的节点，
+                             // 两者本来就对不上（P-171：25.3 那帧 3/8 不是漏挂 5 层，是当时只有 3 层在场）。
+                             // 分帧的对照量是 `want_frame`。
+                             want_frame: COLOR.appliedFrame || 0,
+                             skipped_lut: COLOR.skippedLut, lut_ready: !!COLOR.lut,
+                             lut_error: COLOR.lutError || null,
+                             build_errors: COLOR.buildErrors || 0 });
 
 function mixRecord(seg) {
   const mm = seg.mix_mode;
@@ -1385,6 +1572,64 @@ function applyAnim(node, seg, posUs, size, texH) {
   node.alpha = (node.alpha ?? 1) * v.alpha;
   if (v.s !== 1) node.scale.set(node.scale.x * v.s, node.scale.y * v.s);
   if (v.dy) node.y -= v.dy * size.h / 2;   // y 轴向上为正（F-035/U-08）
+}
+
+// ── 关键帧（common_keyframes）求值 ── 与 scripts/render_frame.py 的 kf_clip/kf_eval 同一条律：
+// 单位与 clip.* 同族（骨架帧 values==clip 标量，F-027）；多点轨道取**绝对值**覆盖 clip 标量，
+// Alpha 与 clip.alpha 相乘；端点外钳到端点值（U-35 未实测首末钳制，取端点与骨架律一致）；
+// 控制柄曲线 v1 不插值——按线性走，宁要"缓动形状错"也不要发明错缓动（手柄数在模型 stats 里）。
+function kfEval(track, localUs) {
+  const p = track.points;
+  if (localUs <= p[0].t_us) return p[0].v;
+  if (localUs >= p[p.length - 1].t_us) return p[p.length - 1].v;
+  for (let i = 0; i < p.length - 1; i++) {
+    if (localUs <= p[i + 1].t_us) {
+      const span = (p[i + 1].t_us - p[i].t_us) || 1;
+      return p[i].v + (p[i + 1].v - p[i].v) * ((localUs - p[i].t_us) / span);
+    }
+  }
+  return p[p.length - 1].v;
+}
+// ---- 入场动画（`侧滑` 这一族）→ clip 位移：**只查表插值**，不再解析第二遍 lua、也不自己求值。
+// 表由 `ae_table_export.py` 用**通道 2 同一个解析器**（`ae_keyframe`）按 1/30 s 采样成 `xoff[]`，
+// 口径与 `render_frame.ae_in_clip` 逐字相同：clip.x = (p − 半幅)/半幅（P-179① 与成片对账对上的就是这条）。
+// 这里曾写过一份贝塞尔求值（aeEase01/aeValue）——那是"第二份数学"，P-181③ 判它不该存在，已删。
+function aeInClip(seg, posUs) {
+  if (!AE_XOFF_ON) return null;      // P-187：全量逐帧把这条闸回（数字见 evidence P-187），代码留着等轨迹修对
+  for (const a of seg.animations || []) {
+    if (!a || a.kind !== 'in' || !a.path) continue;
+    const c = AE_TABLE[String(a.path).split(BS).join('/')];   // BS = 反斜杠，免得正则里再套一层转义
+    if (!c || !c.xoff || !c.xoff.length) continue;      // 方言 B 不出 xoff（SomePass 未判，#14）
+    const step = c.step_us || AE.step_us || 33333;
+    const t = posUs - (seg.target ? seg.target.start_us : 0);
+    if (t < 0) return { x: c.xoff[0] };
+    if (t > c.duration_us) return { x: 0 };             // 落位后不留小数（P-179 实测就是 0）
+    const i = Math.max(0, Math.min(c.xoff.length - 1, Math.round(t / step)));
+    return { x: c.xoff[i] };
+  }
+  return null;
+}
+function kfClip(seg, posUs) {
+  const kfs = seg.keyframes;
+  const base = seg.clip || {};
+  const anim = aeInClip(seg, posUs);
+  if (!kfs || !kfs.length) return anim ? { ...base, x: (base.x || 0) + anim.x } : base;
+  const c = { ...base };
+  const local = posUs - (seg.target ? seg.target.start_us : 0);
+  for (const t of kfs) {
+    const v = kfEval(t, local);
+    switch (t.property) {
+      case 'PositionX': c.x = v; break;
+      case 'PositionY': c.y = v; break;
+      case 'ScaleX': c.scale_x = v; break;
+      case 'ScaleY': c.scale_y = v; break;
+      case 'Rotation': c.rotation = v; break;
+      case 'Alpha': case 'GlobalAlpha':
+        c.alpha = (c.alpha ?? 1) * Math.max(0, Math.min(1, v)); break;
+    }
+  }
+  if (anim) c.x = (c.x || 0) + anim.x;   // 关键帧与入场动画是**叠加**，不是谁覆盖谁
+  return c;
 }
 
 function placeImage(node, clip, natural, size) {
@@ -1541,7 +1786,7 @@ function drawText(seg, zz, container, size, posUs) {
     group._sig = sig;
     layoutGroup(group, t, size);
   }
-  const c = seg.clip || {};
+  const c = kfClip(seg, posUs || 0);
   // F-031: alignment is one mutually exclusive enum and both "居中" buttons write nothing, so
   // absent and 1 are the same centred state; 0 left / 2 right / 3 top / 4 bottom.
   const al = (t.alignment === undefined || t.alignment === null) ? 1 : t.alignment;
@@ -1563,6 +1808,12 @@ function drawText(seg, zz, container, size, posUs) {
   // 1x upright while channel 2 scaled them - a divergence between the two chains.
   group.scale.set(c.scale_x ?? 1, c.scale_y ?? 1);
   group.rotation = -(c.rotation || 0) * Math.PI / 180;
+  // alpha 必须每帧**重置**再让 applyAnim 乘：Container.alpha 建组时是 1，之后除了 applyAnim
+  // 的 `node.alpha = (node.alpha ?? 1) * v.alpha` 没有任何地方写它 ⇒ 入场动画那几十帧把 alpha
+  // 连乘衰减到近 0，动画结束后 v.alpha=1 也回不来，字幕**永久半透明**——用户三张截图的
+  // "淡字幕"就是它（2026-11-05 定案；连续播放穿过动画窗口必中，seek 进场则组是新建的所以复现不出）。
+  // 影像路径没这个洞：place/placeImage 每帧先 `node.alpha = c.alpha ?? 1`。
+  group.alpha = (c.alpha ?? 1) * (t.global_alpha ?? 1);
   applyAnim(group, seg, posUs || 0, size, h);
   group.zIndex = zz + (seg.render_index || 0);
   group.visible = true;
@@ -1604,7 +1855,7 @@ async function paintTracks(container, tracks, posUs, size, depth) {
         comp.visible = true;
         visibleThisFrame.add(seg.id);
         const cs = childSize(seg, size);
-        placeGroup(comp, seg.clip, cs, size);
+        placeGroup(comp, kfClip(seg, posUs), cs, size);
         applyAnim(comp, seg, posUs, cs, null);
         const sub = await paintTracks(comp, seg.composite.tracks,
                                       (posUs - seg.target.start_us) * (seg.speed || 1), cs, depth + 1);
@@ -1622,7 +1873,7 @@ async function paintTracks(container, tracks, posUs, size, depth) {
           return n;
         });
         sp.texture = tex;              // shared and cached: never destroyed by the frame loop
-        placeImage(sp, seg.clip, { width: tex.width, height: tex.height }, size);
+        placeImage(sp, kfClip(seg, posUs), { width: tex.width, height: tex.height }, size);
         applyAnim(sp, seg, posUs, size, tex.height);
         sp.zIndex = zz + (seg.render_index || 0);
         sp.visible = true;
@@ -1643,7 +1894,7 @@ async function paintTracks(container, tracks, posUs, size, depth) {
       comp.visible = true;
       visibleThisFrame.add(seg.id);
       const cs = childSize(seg, size);
-      placeGroup(comp, seg.clip, cs, size);
+      placeGroup(comp, kfClip(seg, posUs), cs, size);
         applyAnim(comp, seg, posUs, cs, null);
       const childPos = (posUs - seg.target.start_us) * (seg.speed || 1);
       const sub = await paintTracks(comp, seg.composite.tracks, childPos, cs, depth + 1);
@@ -1723,7 +1974,7 @@ async function paintTracks(container, tracks, posUs, size, depth) {
       const stale = sp._bmp;
       sp._bmp = f.bmp;
       if (stale && stale !== f.bmp) stale.close?.();
-      place(sp, seg.clip, { width: f.dw, height: f.dh }, f.rot, size);
+      place(sp, kfClip(seg, posUs), { width: f.dw, height: f.dh }, f.rot, size);
       sp.zIndex = zz + (seg.render_index || 0);
       sp.visible = true;
       visibleThisFrame.add(seg.id);
@@ -1865,6 +2116,9 @@ async function paint(posUs) {
     badge.visible = true;
     badge.text = `\u26a0 \u8fde\u7eed ${BLACK_STREAK} \u5e27\u6ca1\u51fa\u56fe\uff1a${blacked.join(' ')}`;
   }
+  // 确定性呈现（见 app.init 处的注释）：paint 即 present——seek/暂停/兜底定时器驱动的帧
+  // 全部立刻上屏，不再依赖 Pixi ticker 的 rAF。
+  app.render();
 }
 
 async function loadFonts() {
@@ -1897,7 +2151,7 @@ let actxT0 = 0;
 let pos = 0, playing = false, measuring = false, lastWall = 0, frames = 0, winStart = 0, intervals = [], lastAt = 0, framesDecoded = 0, lastFiles = [];
 
 async function tick(t) {
-  if (measuring) { requestAnimationFrame(tick); return; }
+  if (measuring) { requestAnimationFrame(rafTick); return; }
   let gapMs = -1, gapPos = 0;
   if (playing) {
     scheduleAudio(pos);
@@ -1928,8 +2182,28 @@ async function tick(t) {
   const el = (t - winStart) / 1000;
   if (playing && el > 0.5) hud('fps', `fps ${(frames / el).toFixed(2)} 池 ${pool.map.size}`);
   document.getElementById('play').style.left = `${(pos / DUR) * 100}%`;
-  requestAnimationFrame(tick);
+  requestAnimationFrame(rafTick);
 }
+
+// ---- rAF 看门狗 ----------------------------------------------------------------------------
+// Qoder 内置浏览器（页面隐藏）与 headless 的 rAF **一帧都不来**（本文件前面注记：三次独立实测
+// 都是 0 帧），于是 tick 永远不被调：space 翻了 playing，pos/HUD/画面纹丝不动——用户看到的
+// 「space 播放没反应」就是它，2026-11-05 第二次坐实（第一次误判成 autostart 卡 measuring）。
+// 起播后 250 ms 没见到 rAF 帧，就改用 30 fps 定时器敲同一个 tick（&drive=timer 那条门里验过的
+// 通路）；真实浏览器 rAF 正常时这段完全静默。走了几帧兜底要报出来（raf_fallback_frames）。
+let lastRafAt = 0, rafFallbackId = 0;
+function rafTick(t) { lastRafAt = now(); tick(t); }
+function tickPumpStart() {
+  if (rafFallbackId) return;
+  lastRafAt = now();
+  rafFallbackId = setInterval(() => {
+    if (!playing) return;
+    if (lastRafAt && now() - lastRafAt < 250) return;
+    stat.raf_fallback = (stat.raf_fallback || 0) + 1;
+    try { tick(now()); } catch (e) { tickErrors.push(String((e && e.message) || e).slice(0, 120)); }
+  }, 33);
+}
+function tickPumpStop() { if (rafFallbackId) { clearInterval(rafFallbackId); rafFallbackId = 0; } }
 
 function toggle(on) {
   playing = on ?? !playing;
@@ -1937,8 +2211,9 @@ function toggle(on) {
     ensureAudio();
     actxT0 = (AVCLK_ON && actx) ? actx.currentTime : 0;   // 播放起点绑定到音频时钟
     winStart = 0; frames = 0; lastWall = 0; lastAt = 0;
+    tickPumpStart();    // rAF 不来的浏览器（Qoder 内置/headless）靠它出帧，见看门狗注释
   }
-  else { killPumps(); stopAudio(); }
+  else { tickPumpStop(); killPumps(); stopAudio(); }
   hud('mode', `mode ${playing ? 'PLAY' : 'PAUSE'}`);
 }
 
@@ -1956,7 +2231,11 @@ for (const track of [...videoTracks, ...textTracks]) {
 }
 bar.onclick = (e) => seekTo(((e.clientX - bar.getBoundingClientRect().left) / bar.clientWidth) * DUR);
 addEventListener('keydown', (e) => {
-  if (e.code === 'Space') { e.preventDefault(); toggle(); }
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (measuring) { hud('mode', 'mode 仪表运行中（URL 带 &autostart）——space 被忽略'); return; }
+    toggle();
+  }
   if (e.code === 'ArrowLeft') seekTo(pos - 1);
   if (e.code === 'ArrowRight') seekTo(pos + 1);
 });
@@ -2117,7 +2396,7 @@ async function battery() {
              switches: { split: SPLIT_ON, qmax: QMAX, warm: WARM_ON, warm_lead_s: VIDEO_LEAD,
                          warm_predecode: WARM_PREDECODE, hold: HOLD_ON, slowleg_ms: SLOW_LEG_MS,
                          probe: [...PROBE_IDS], search: location.search },
-             raf_frames_observed: frames };
+             raf_frames_observed: frames, raf_fallback_frames: stat.raf_fallback || 0 };
   toggle(false);
   const n = Q.has('seeks') ? +Q.get('seeks') : 8;
   const list = [], per = [], noop = [], cold = [], warm = [];
@@ -2182,7 +2461,7 @@ window.__player = { seekTo, toggle, paint, model, stat, pool, sprites, texts, co
                     get playing() { return playing; }, get lastPaintUs() { return window.__lastPaintUs; } };
 out(`模型就绪：${DUR.toFixed(2)} s  ${W}x${H}  ${model.stats.track_count} 轨 / ${model.stats.segment_count} 段  `
    + `素材 ${model.stats.media_count}（缺 ${model.stats.media_missing}，不可解封装 ${model.stats.media_unreadable}）`);
-requestAnimationFrame(tick);
+requestAnimationFrame(rafTick);
 if (Q.get('shots')) {
   // 浏览器自己把画出来的帧回传给网关 /shot：门的 L2/L3 一直用通道 2 出图，
   // 交互预览内核（产品本体）的画面从没被像素判过。降采样到 540 宽再发，
@@ -2206,21 +2485,33 @@ if (Q.get('shots')) {
       };
       requestAnimationFrame(tick);
     });
-    let png = null, w = w2, h = 0, why = '';
+    let png = null, w = w2, h = Math.max(1, Math.round(w2 * H / W)), why = '', src_kind = 'canvas';
+    // 取**画布**，不取 `extract.pixels(app.stage)`：后者返回的是 stage 的**内容包围盒**，
+    // 于是"整幅被缩放/平移了多少"在截图里被归一化掉了 —— 逐帧对照实测（P-166）：
+    // 13.8 s 那条位移段，画布截图 vs 成片 0.968，包围盒截图 vs 成片 0.499。
+    // 也就是说旧截图腿既会**造假红**（把对的判成 0.44），也会**漏判真错**（全局缩放/位移错看不见）。
+    // 同任务内 `app.render()` 之后立刻 `toDataURL`，缓冲还没被合成器清掉（P-160 的确定性呈现）。
     try {
+      app.render();
+      const url = app.canvas.toDataURL('image/png');
+      png = url.split(',')[1];
+      if (!png || png.length < 1024) { why = 'canvas 回读为空'; src_kind = 'canvas-empty'; }
+    } catch (e) {
+      why = String(e && e.message || e).slice(0, 90);
+      src_kind = 'fallback-extract';
       const px = app.renderer.extract.pixels(app.stage);
       const buf = px.pixels instanceof Uint8ClampedArray ? px.pixels : new Uint8ClampedArray(px.pixels);
-      const src = document.createElement('canvas');
-      src.width = px.width; src.height = px.height;
-      src.getContext('2d').putImageData(new ImageData(buf, px.width, px.height), 0, 0);
+      const sc = document.createElement('canvas');
+      sc.width = px.width; sc.height = px.height;
+      sc.getContext('2d').putImageData(new ImageData(buf, px.width, px.height), 0, 0);
       h = Math.max(1, Math.round(px.height * w2 / px.width));
       const c2 = document.createElement('canvas'); c2.width = w2; c2.height = h;
       const ctx = c2.getContext('2d');
-      ctx.imageSmoothingEnabled = true; ctx.drawImage(src, 0, 0, w2, h);
+      ctx.imageSmoothingEnabled = true; ctx.drawImage(sc, 0, 0, w2, h);
       png = c2.toDataURL('image/png').split(',')[1];
-    } catch (e) { why = String(e && e.message || e).slice(0, 90); }
+    }
     await fetch('/shot', { method: 'POST',
-      body: JSON.stringify({ tag: 'shot', t, png, w, h, why,
+      body: JSON.stringify({ tag: 'shot', t, png, w, h, why, shot_source: src_kind,
                           t_paint_us: window.__lastPaintUs || 0,
                           // 截图这一路也带上混合模式读数：L10 只看像素的话，
                           // "这模型本来没混合段"和"混合段一个没挂"是同一个数
@@ -2231,7 +2522,12 @@ if (Q.get('shots')) {
   }
 }
 if (Q.get('seek')) await seekTo(+Q.get('seek'));
-if (Q.get('autostart') === '1') battery();
+if (Q.get('autostart') === '1') battery().catch((e) => {
+  // 电池半路抛异常时 measuring 永远停在 true ⇒ tick 每帧早退、space 成哑键且无任何提示
+  // （2026-11-05 手播无反应的第一嫌疑）。人用的页面不允许被仪表参数卡死。
+  measuring = false;
+  out('! battery aborted: ' + String((e && e.message) || e).slice(0, 120));
+});
 if (+Q.get('liveplay')) await liveplay(+Q.get('liveplay'));
 
 // 交互播放的**卡顿**判据。门的 L4 用 battery() 那条定时器补帧循环，它把 gap 亲手修平成
@@ -2276,6 +2572,7 @@ async function liveplay(ms) {
   const paints = intervals.map((x) => x[2]).sort((a, b) => a - b);
   const r = { tag: Q.get('tag') || 'playback', model_url: MODEL_URL.split('/').pop(),
     canvas: `${W}x${H}`, visibility: document.visibilityState, raf: frames > 0,
+    raf_fallback_frames: stat.raf_fallback || 0,
     live: { window_ms: ms, frames: intervals.length,
       gap_p50_ms: pct(gaps, 0.5), gap_p90_ms: pct(gaps, 0.9), gap_p95_ms: pct(gaps, 0.95),
       gap_max_ms: gaps.length ? gaps[gaps.length - 1] : 0,

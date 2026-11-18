@@ -206,6 +206,107 @@ def blend_over(canvas: Image.Image, layer: Image.Image, pos: tuple[int, int],
     canvas.paste(Image.fromarray((px * 255.0 + 0.5).astype("uint8"), "RGB"), (x0, y0))
 
 
+def kf_eval(track: dict, local_us: float) -> float:
+    """关键帧求值：线性插值，端点外钳到端点值（U-35 未实测首末钳制；骨架同步律下与
+    「用 clip 标量」一致）。控制柄（curveType/左右手柄）v1 **不**插值——没有 y 手柄的
+    单位语义前按线性走，宁要缓动形状错也不要发明错缓动（手柄数由模型 stats.kf_curve_handles 报）。"""
+    pts = track["points"]
+    if local_us <= pts[0]["t_us"]:
+        return pts[0]["v"]
+    if local_us >= pts[-1]["t_us"]:
+        return pts[-1]["v"]
+    for a, b in zip(pts, pts[1:]):
+        if local_us <= b["t_us"]:
+            span = (b["t_us"] - a["t_us"]) or 1
+            return a["v"] + (b["v"] - a["v"]) * ((local_us - a["t_us"]) / span)
+    return pts[-1]["v"]
+
+
+def kf_clip(seg: dict, pos_us: int) -> dict:
+    """关键帧覆盖量并进 clip 副本（无关键帧段原样返回，零开销）。
+
+    多点轨道取**绝对值**覆盖 clip 标量：首点通常等于原值（骨架同步律 F-027），所以覆盖
+    与"从当前值开始动画"两种解释在首点重合，歧义只出现在中段——那是动画语义本身。
+    Alpha 是 0..1 不透明度，与 clip.alpha 相乘；单位与 clip.* 同族（F-027）。
+    """
+    kfs = seg.get("keyframes")
+    anim = ae_in_clip(seg, pos_us)
+    if not kfs:
+        base = dict(seg.get("clip") or {})
+        if anim is not None:
+            base["x"] = (base.get("x") or 0.0) + anim["x"]
+        return base
+    c = dict(seg.get("clip") or {})
+    local = pos_us - ((seg.get("target") or {}).get("start_us") or 0)
+    for t in kfs:
+        v = kf_eval(t, local)
+        p = t["property"]
+        if p == "PositionX":
+            c["x"] = v
+        elif p == "PositionY":
+            c["y"] = v
+        elif p == "ScaleX":
+            c["scale_x"] = v
+        elif p == "ScaleY":
+            c["scale_y"] = v
+        elif p == "Rotation":
+            c["rotation"] = v
+        elif p in ("Alpha", "GlobalAlpha"):
+            base = c.get("alpha") if c.get("alpha") is not None else 1.0
+            c["alpha"] = base * max(0.0, min(1.0, v))
+    if anim is not None:
+        c["x"] = (c.get("x") or 0.0) + anim["x"]
+    return c
+
+
+AE_XOFF_ON = False
+"""「侧滑」x 偏移开关（P-187 全量逐帧判错，与页面 `AE_XOFF_ON` 同批闸回）。
+
+1105 帧、corr≥0.90 这条预登记线未动：加上后 20.267…20.500 全变差，红帧 9→13（4 帧绿翻红）；
+表里 xoff[0]=−0.556 与 +0.144→0 的平滑段不同族 ⇒ 轨迹解析还没修对，先不许当修复用。
+"""
+
+
+def ae_in_clip(seg: dict, pos_us: int) -> dict | None:
+    if not AE_XOFF_ON:
+        return None
+    """入场动画（`侧滑` 这一族）→ clip 的 x 偏移增量。
+
+    走的是**既有那条路**（`_ae_pkg` = `ae_keyframe`，与 L8/L11、页面 `ae-curves.json` 同一个解析器），
+    不再引第二份实现——P-181③ 立的规矩：两通道要读同一份导出/同一个解析器，
+    不是"两份代码今天算出同样数字"。
+    只动 x；缩放/曝光/模糊这一轮不进（不许一次上四支再回头找是谁坏的，P-179）。
+    """
+    for a in seg.get("animations") or []:
+        if not isinstance(a, dict) or a.get("kind") != "in" or not a.get("path"):
+            continue
+        lua = Path(a["path"]) / "AmazingFeature" / "lua" / "SeekModeScript.lua"
+        if not lua.exists():
+            continue
+        pkg = _ae_pkg(str(lua))
+        if pkg[0] == "ERR":
+            AE_LOG.append(("degraded-clip", str(seg.get("id")), pkg[1]))
+            continue
+        aek, tools, cons, _expo = pkg
+        name = "ADBE Position_23"
+        if name not in tools.attrs:
+            continue                                   # 这包没有位移轨道（或只有别的通道）⇒ 不加偏移
+        dur = (a.get("duration_us") or 0) / 1e6
+        if dur <= 0:
+            continue
+        start = (seg.get("target") or {}).get("start_us") or 0
+        el = max(0.0, (pos_us - start) / 1e6)
+        if el >= dur:
+            return {"x": 0.0}                          # 落位后不留小数（P-179 实测就是 0）
+        cf = aek.frame_of_clamped(el, dur, cons, tools.all_frame)
+        v = tools.get_val(name, max(0.0, min(cf, tools.all_frame)) / tools.all_frame)
+        x = float(v[0] if isinstance(v, list) else v)
+        design = cons.get("design_size") or 1080.0
+        AE_LOG.append(("ae-x", str(seg.get("id")), round(el, 4), round(x, 2)))
+        return {"x": (x - design / 2.0) / (design / 2.0)}
+    return None
+
+
 def place(layer: Image.Image, canvas_size, clip, material_kind: str = "video") -> tuple[int, int, Image.Image]:
     cw, ch = canvas_size
     lw, lh = layer.size
@@ -280,7 +381,7 @@ def draw_text(canvas: Image.Image, seg, fonts_dir_cache, pos_us: int = 0) -> Non
     cw, ch = canvas.size
     # segments[].clip is the geometry channel (P-13): normalised offsets where ±1 is half the
     # canvas and y points up. Without it every caption was drawn dead-centre.
-    c = seg.get("clip") or {}
+    c = kf_clip(seg, pos_us)
     ox = (c.get("x") or 0.0) * cw / 2
     oy = -(c.get("y") or 0.0) * ch / 2
     sc_x = c.get("scale_x") or 1.0
@@ -312,13 +413,21 @@ def draw_text(canvas: Image.Image, seg, fonts_dir_cache, pos_us: int = 0) -> Non
     if av["dy_norm"]:
         oy = oy - int(round(av["dy_norm"] * ch / 2))
     alpha = av["alpha"]
+    # clip.alpha（与关键帧 Alpha，经 kf_clip 并进同一字段）原来对文字**不生效**——
+    # alpha 只来自素材动画（anim_value），片段自己的不透明度被整个丢掉（A2 抓到的真缺陷）。
+    calpha = c.get("alpha")
+    if calpha is not None:
+        alpha *= max(0.0, min(1.0, calpha))
+    ga = t.get("global_alpha")
+    if ga is not None:
+        alpha *= max(0.0, min(1.0, ga))
     x = (cw - total) / 2 + ox
     rot = c.get("rotation") or 0.0
     for (piece, px, st), f, w, h, top in zip(pieces, fonts, widths, heights, tops):
-        col = rgb(st.get("color")) + ((int(round(255 * alpha)),) if alpha < 1.0 else ())
+        col = rgb(st.get("color"))
         sh = st.get("shadow")
 
-        def paint(dst, x=x, h=h, top=top, piece=piece, f=f, col=col, sh=sh):
+        def paint(dst, x=x, h=h, top=top, piece=piece, f=f, col=col, sh=sh, alpha=alpha):
             if sh:
                 import math
                 blur = max(0.0, (sh.get("diffuse") or 0) * 600 * cw / 1080)
@@ -337,9 +446,18 @@ def draw_text(canvas: Image.Image, seg, fonts_dir_cache, pos_us: int = 0) -> Non
                     scratch = scratch.filter(ImageFilter.GaussianBlur(blur))
                     dst.alpha_composite(scratch)
                 else:
-                    ImageDraw.Draw(dst).text((x + shx, sy), piece,
+                    ImageDraw.Draw(dst, "RGBA").text((x + shx, sy), piece,
                                              fill=rgb(sh.get("color"), (0, 0, 0)), font=f)
-            ImageDraw.Draw(dst).text((x, (ch - h) / 2 + oy - top), piece, fill=col, font=f)
+            if alpha < 1.0:
+                # PIL 的 ImageDraw.text **忽略填充的 alpha 字节**（RGBA 模式也一样，实测
+                # 两种模式 max 都是 255）——半透明墨必须画到透明草稿层再 alpha_composite。
+                scratch = Image.new("RGBA", dst.size, (0, 0, 0, 0))
+                ImageDraw.Draw(scratch).text((x, (ch - h) / 2 + oy - top), piece,
+                                             fill=col + (255,), font=f)
+                scratch.putalpha(scratch.getchannel("A").point(lambda v: int(v * alpha)))
+                dst.alpha_composite(scratch)
+            else:
+                ImageDraw.Draw(dst).text((x, (ch - h) / 2 + oy - top), piece, fill=col, font=f)
 
         if abs(rot) > 1e-6:
             # Rotate the layer about the piece's own ink centre, in canvas coordinates, so the
@@ -399,24 +517,188 @@ def load_font(path, px, _cache=None):
 # **两张贴图**用的（F-094），一元律挂上去**没生效**（同一时刻比值仍是改前的 0.66/0.83/1.12，
 # 而通道 2 已是 0.965/0.996/1.025），于是跨通道从 0.97 档掉到 0.908 ⇒ 只开一边是倒退。
 # 律与参数映射都留着（成片验过，P-130），等浏览器侧形状修对再同批打开。
-COLOR = {"on": True, "applied": 0}   # P-133 同批打开：浏览器半边已由普通 Filter 验通（P-132/133）
+COLOR = {"on": True, "applied": 0, "skipped_lut": 0,
+         # P-175 通路闭合验做出来了，不闭合的根因**不在律**：浏览器把 `resources` 挂在 `GlProgram.from`
+         # 上，而 GlProgram 只解构 {fragment,vertex,layout,gpuLayout,name} ⇒ 被静默丢掉 ⇒ uLut 没有纹理
+         # 单元，取样落回 unit 0——即拿查表坐标去采**画面自己**（不是"什么都不改"，是错一小格混回来，
+         # 所以 corr 会掉到基线以下）。挂到 Filter 这一层后
+         # 五段腿全绿（上传 0.0 / 公式 ±0.6 纹素 / W=1 max 2.0 / mix max 1.4 / 身份 max 0.5），
+         # 线性空间的两条假设被否掉（max 84~183）⇒ 查表就在 sRGB 里，与通道 2 同一条。
+         # P-176 重测过 black/white/shadow（P-167 那次「更差」是在 ls 还是空转时测的，值得重来）。
+         # 结果：**方向对、带数不退**——被这三支改到的 157 帧 |ln 亮度比| 均值 0.0667→0.0620，
+         # 但越带 318→325：14.633–14.8 六帧进带，13.6–13.7 四帧被推过顶（1.034→1.05，U-109 那块），
+         # 15.0–15.433 九帧被推下沿（0.974→0.957）。⇒ 仍按预登记的带数口径一起闸回，
+         # 记账：不是律错，是量与范围还差一点，15.x 那段（black+shadow+ls）是下一个落点。
+         "branches": ("brightness", "light_sensation")}
+
+# ---- 调色链：律与 uniform 映射**逐字**取自装机包内明文（F-103） -----------------------------
+# frag：`AmazingFeature_adjustColor/xshader/colorAdjust.frag`（main() 的支顺序）
+# 映射：同包 `lua/SeekModeScript.lua`（ContrastPivot=0.435、MinIntensity=-1、MaxIntensity=1、Eps=1e-5）
+# brightness 保持 P-130/P-133 的**成片判过**口径：草稿原值直接进 shader 公式（不过 getBrightnessParam），
+# 这条与 Lua 的差异记在 U-111，改哪一边都要成片重新判一次，不许在这里顺手换。
+PIVOT = 0.435
+BW_EPS = 0.005
+_LUT_CACHE: dict[str, object] = {}
+
+
+def _sig_xfactor(a: float) -> float:
+    import math
+    return math.exp(8.33 * a - 12.16) + 5.82 * a - 1.72
+
+
+def _sig_yk(x: float, a: float, pivot: float) -> tuple[float, float]:
+    import math
+    af = _sig_xfactor(a)
+    s = 1.0 / (1.0 + math.exp(-af * (x - pivot)))
+    return s + pivot - 0.5, af * s * (1.0 - s)
+
+
+def _contrast_uniforms(i: float):
+    """getContrastParam 的逐字翻译：param≤1 走线性，否则走带边界校正的 sigmoid。"""
+    param = i * 0.4 + 1.0 if i <= 0 else i * 0.6 + 1.0
+    if param <= 1.0:
+        return ("linear", param)
+    lv, ls = _sig_yk(0.0, param, PIVOT)
+    rv, rs = _sig_yk(1.0, param, PIVOT)
+    pv, ps = _sig_yk(PIVOT, param, PIVOT)
+    return ("sigmoid", {"xf": _sig_xfactor(param), "ld": 0.0 - lv, "rd": 1.0 - rv,
+                        "lsd": ps - ls, "rsd": ps - rs, "ps": ps})
+
+
+def _shadow_p(i: float) -> float:
+    return 1.0 - 0.503 * i + 0.183 * i ** 2 - 0.147 * i ** 3 + 0.067 * i ** 4
+
+
+def _highlight_p(i: float) -> float:
+    return 1.0 + 0.503 * i + 0.183 * i ** 2 + 0.147 * i ** 3 + 0.067 * i ** 4
+
+
+def _black_white(black: float, white: float) -> tuple[float, float]:
+    xw = 1.0 - white * 0.5 if white >= 0 else 1.0
+    yw = 1.0 if white >= 0 else 1.0 + white * 0.5
+    xb = 0.0 if black >= 0 else -black * 0.5
+    yb = black * 0.5 if black >= 0 else 0.0
+    xw, yw = max(xw, BW_EPS), max(yw, BW_EPS)
+    xb, yb = min(xb, xw - BW_EPS), min(yb, yw - BW_EPS)
+    slope = (yw - yb) / (xw - xb)
+    return slope, yb - slope * xb
+
+
+def _lut(seg: dict, which: str):
+    import pathlib
+    name = f"lightSensation_{which}.png"
+    # 首选建模时复制过来的那份（与浏览器读的是同一个文件，两边同批的同源性才算得清）
+    staged = pathlib.Path(__file__).resolve().parents[1] / "temp/playback-test/lut" / name
+    if not staged.is_file():
+        paths = ((seg.get("features") or {}).get("effect_paths")) or {}
+        pkg = paths.get("light_sensation") or paths.get("fade") or paths.get("contrast")
+        if not pkg:
+            return None
+        root = pathlib.Path(pkg)
+        cand = [root / "image" / name, *sorted(root.glob(f"*/image/{name}"))]
+        staged = next((c for c in cand if c.is_file()), None)
+        if staged is None:
+            return None
+    f = staged
+    key = str(f)
+    if key not in _LUT_CACHE:
+        _LUT_CACHE[key] = np.asarray(Image.open(f).convert("RGB"), dtype=np.float32) / 255.0
+    return _LUT_CACHE[key]
+
+
+def _apply_lut(a, tex):
+    """frag 的 applyLut3D（gridSample=17、gridNum=17×1）+ GL 的 LINEAR/CLAMP 取样。"""
+    h, w = tex.shape[:2]
+    gs = 17.0
+    sx, sy = 1.0 / gs - 1.0 / w, 1.0 / 1.0 - 1.0 / h
+    blue = a[..., 2] * (gs - 1.0)
+    parts = []
+    for fn in (np.floor, np.ceil):
+        gi = fn(blue)
+        gpy = np.floor(gi / gs)
+        gpx = gi - gpy * gs
+        u = gpx / gs + 0.5 / w + sx * a[..., 0]
+        v = gpy * 1.0 + 0.5 / h + sy * a[..., 1]
+        # GL 的 LINEAR 取样在纹素中心 `u*w − 0.5`（不是 `u*(w−1)`）：厂商 frag 的 uv
+        # （gx/17 + 0.5/289 + (1/17−1/289)·r）正是按这个约定设计的，r=0/1 恰好落在整数纹素上。
+        # 旧写法把整张 17³ 表挤了 0.35% ⇒ 大坐标处偏 0.5~1.5 格（P-173 往返验抓到）。
+        x = np.clip(u * w - 0.5, 0, w - 1)
+        y = np.clip(v * h - 0.5, 0, h - 1)
+        x0 = np.floor(x).astype(int)
+        y0 = np.floor(y).astype(int)
+        x1 = np.minimum(x0 + 1, w - 1)
+        y1 = np.minimum(y0 + 1, h - 1)
+        fx = (x - x0)[..., None]
+        fy = (y - y0)[..., None]
+        parts.append(tex[y0, x0] * (1 - fx) * (1 - fy) + tex[y0, x1] * fx * (1 - fy)
+                     + tex[y1, x0] * (1 - fx) * fy + tex[y1, x1] * fx * fy)
+    wm = (blue - np.floor(blue))[..., None]
+    return np.clip(parts[0] * (1 - wm) + parts[1] * wm, 0, 1)
 
 
 def apply_color_adjust(img, seg):
-    """目前只作用已验的 brightness 一支。"""
+    """按厂商 frag 的支顺序作用**已验的**调色支；无调色的段逐位不变。"""
     if not COLOR["on"] or img is None:
         return img
-    b = ((seg.get("features") or {}).get("effect_values") or {}).get("brightness")
-    if not b:
+    ev = ((seg.get("features") or {}).get("effect_values")) or {}
+    nz = {k: float(v) for k, v in ev.items()
+          if isinstance(v, (int, float)) and abs(v) > 1e-6 and k in COLOR["branches"]}
+    if not nz:
         return img
     a = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-    if b > 0:
-        p = 1.0 + b * 5.0
-    else:
-        p = 1.0 / (1.0 - b * 2.5)
-        a -= -b * 0.01
-    a = np.clip(1.0 - np.power(1.0 - a, p), 0.0, 1.0)
     COLOR["applied"] += 1
+    b = nz.get("brightness")
+    if b:
+        if b > 0:
+            pw = 1.0 + b * 5.0
+        else:
+            pw = 1.0 / (1.0 - b * 2.5)
+            a = np.maximum(a - (-b * 0.01), 0.0)
+        a = np.clip(1.0 - np.power(1.0 - a, np.float32(pw)), 0.0, 1.0)
+    c = nz.get("contrast")
+    if c:
+        kind, prm = _contrast_uniforms(c)
+        if kind == "linear":
+            a = np.clip(prm * (a - PIVOT) + PIVOT, 0.0, 1.0)
+        else:
+            xf, ld, rd, lsd, rsd, ps = (prm["xf"], prm["ld"], prm["rd"],
+                                        prm["lsd"], prm["rsd"], prm["ps"])
+            s = 1.0 / (1.0 + np.exp(-xf * (a - PIVOT)))
+            y = s + PIVOT - 0.5
+            k = xf * s * (1.0 - s)
+            left = a <= PIVOT
+            scale = np.where(left, ((ps - k) / lsd) ** 2, ((ps - k) / rsd) ** 2)
+            a = np.clip(y + scale * np.where(left, ld, rd), 0.0, 1.0)
+    st = nz.get("saturation")
+    if st:
+        sp = st + 1.0
+        F = np.array([0.208540, 0.702086, 0.089374], dtype=np.float32)
+        base = F * (1.0 - sp)
+        out = np.empty_like(a)
+        for i in range(3):
+            vec = base.copy()
+            vec[i] = vec[i] + sp
+            out[..., i] = a @ vec
+        a = np.clip(out, 0.0, 1.0)
+    hb = nz.get("highlight")
+    if hb:
+        ph = np.float32(_highlight_p(hb))
+        t = 1.0 - a
+        a = np.clip(1.0 - np.power(t, ph) - (ph - 1.0) * (t * t - t * t * t), 0.0, 1.0)
+    sh = nz.get("shadow")
+    if sh:
+        ps = np.float32(_shadow_p(sh))
+        a = np.clip(np.power(a, ps) + (ps - 1.0) * (a * a - a * a * a), 0.0, 1.0)
+    if nz.get("black") or nz.get("white"):
+        slope, bias = _black_white(nz.get("black", 0.0), nz.get("white", 0.0))
+        a = np.clip(slope * a + bias, 0.0, 1.0)
+    ls = nz.get("light_sensation")
+    if ls:
+        tex = _lut(seg, "max" if ls > 0 else "min")
+        if tex is None:
+            COLOR["skipped_lut"] += 1     # 取不到 LUT 就不施加这一支，并且要能在读数里看见
+        else:
+            a = np.clip(a + (np.asarray(_apply_lut(a, tex), dtype=np.float32) - a) * abs(ls), 0.0, 1.0)
     return Image.fromarray((a * 255).astype(np.uint8)).convert("RGBA")
 
 
@@ -529,9 +811,11 @@ def _ae_pkg(lua_path: str):
         src = Path(lua_path).read_text(encoding="utf-8", errors="replace")
         attrs = aek.parse_ae_attribute(src)
         expo = next((k for k in attrs if k.startswith("ADBE_Exposure")), None)
-        if not expo:
-            val = ("ERR", "no-exposure-attr")
+        if not attrs:
+            val = ("ERR", "no-ae-table")
         else:
+            # 没有曝光轨道不算"降级"：`侧滑` 这一族就是只有位移/缩放/旋转/模糊（P-176 解出来的 7 条里没曝光）。
+            # 老版本在这里直接 ERR no-exposure-attr，把整包判死，连带让位移那条也进不来。
             val = (aek, aek.AETools(attrs), aek.extract_constants(src), expo)
     except Exception as e:                         # noqa: BLE001
         val = ("ERR", f"{type(e).__name__}: {e}")
@@ -610,7 +894,8 @@ def collect(canvas, model, pos_us, fonts_dir_cache, depth=0):
         if kind == "text":
             draw_text(canvas, seg, fonts_dir_cache, pos_us)
         else:
-            x, y, img = place(payload, canvas.size, seg.get("clip"),
+            c = kf_clip(seg, pos_us)
+            x, y, img = place(payload, canvas.size, c,
                                 ((seg.get("material") or {}).get("type")) or "video")
             av = anim_value(seg, pos_us, canvas.size[1], img.height)
             if av != {"alpha": 1.0, "scale_x": 1.0, "scale_y": 1.0, "dy_norm": 0.0}:
@@ -622,9 +907,7 @@ def collect(canvas, model, pos_us, fonts_dir_cache, depth=0):
                 MIX_DEGRADED.append((str(seg.get("id")), (mm or {}).get("package_md5")))
             if mode:
                 blend_over(canvas, img, (x, y), mode,
-                           opacity=float((seg.get("clip") or {}).get("alpha")
-                                         if (seg.get("clip") or {}).get("alpha") is not None
-                                         else 1.0))
+                           opacity=float(c.get("alpha") if c.get("alpha") is not None else 1.0))
             else:
                 canvas.alpha_composite(img, (x, y))
     if depth == 0 and actives:

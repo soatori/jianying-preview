@@ -79,6 +79,56 @@ def resolve_path(raw: str | None, draft_root: Path) -> str | None:
     return p
 
 
+# ── 静音律（轨道级）─────────────────────────────────────────────────────────────
+# 判别式直接抄厂商自己的模型层，不是我猜的位含义：
+#   Resources/canvas_agent/app/static/js/async/…  tB={DefaultFlags:0n,MuteFlag:1n<<0n,
+#   HideFlag:1n<<1n,LockFlag:1n<<2n}；
+#   读的一侧 `(BigInt(trackAttribute)&MuteFlag)&&(volume=0)`（video/audio 两条 updateVolume 支都是这个式子）；
+#   写的一侧 `api.track.mute({muted,attribute}) → attribute |= MuteFlag / &= ~MuteFlag`。
+# 而**主视频轨**的喇叭按钮不走 attribute，走草稿级 `config.video_mute`（同一份 JS：
+#   `"main"===kind ? !!draftProperty.videoMute : (track.attribute&MuteFlag)===MuteFlag`，
+#   配套 native `Config::get/set_video_mute`、`DraftUpdate::update_main_track_video_mute_value`）。
+# `materials.videos[].extra_type_option` 的 bit0=HasSeparatedAudio：音频被"提取"到独立轨之后，
+# 视频段自带声按 0 处理（厂商式：`(extraTypeOption&HasSeparatedAudio||attribute&MuteFlag)&&(m=0)`）。
+MUTE_FLAG = 1
+HIDE_FLAG = 2
+HAS_SEPARATED_AUDIO = 1
+
+
+def track_muted(track: dict) -> bool:
+    return bool(int(track.get("attribute") or 0) & MUTE_FLAG)
+
+
+# ── 关键帧（common_keyframes）───────────────────────────────────────────────────
+# 律在 spec/keyframes.yaml（U-14 结案）：记录挂 segment.common_keyframes[]，
+# time_offset 是相对片段起点的微秒，values 与 clip.* 同一族单位 —— 依据是骨架帧实测
+# `values[0] == clip 标量`（F-027 同步律）。只带**多点**的画面类轨道：
+# 单点骨架帧的值与 clip 标量同步写 ⇒ 它不改变显示（U-45 的"哪侧优先"悬案只关乎骨架帧，
+# 对动画轨道无歧义），落成计数即可；调色/蒙版/文字颜色/特效参数类按 phase 划分不渲染。
+KF_PICTURE = ("KFTypePositionX", "KFTypePositionY", "KFTypeScaleX", "KFTypeScaleY",
+              "KFTypeRotation", "KFTypeGlobalAlpha", "KFTypeAlpha")
+
+
+def keyframe_tracks(seg: dict) -> list[dict]:
+    out = []
+    for rec in seg.get("common_keyframes") or []:
+        pt = rec.get("property_type") or ""
+        if pt not in KF_PICTURE:
+            continue
+        pts = []
+        for k in rec.get("keyframe_list") or []:
+            vals = k.get("values") or []
+            if not vals:
+                continue
+            pts.append({"t_us": k.get("time_offset") or 0, "v": vals[0],
+                        "lc": k.get("left_control") or {}, "rc": k.get("right_control") or {},
+                        "curve": k.get("curveType")})
+        if len(pts) >= 2:
+            pts.sort(key=lambda p: p["t_us"])
+            out.append({"property": pt.split("KFType", 1)[-1], "points": pts})
+    return out
+
+
 def load_json_string(blob: str):
     """texts.content is a JSON string that carries its own styles[] (spec/text.yaml)."""
     try:
@@ -189,7 +239,8 @@ class Model:
         clip = seg.get("clip") or (mat.get("clip") if mat else None)
         out = {
             "id": sid,
-            "track": {"type": track.get("type"), "flag": track.get("flag"), "attribute": track.get("attribute")},
+            "track": {"type": track.get("type"), "flag": track.get("flag"),
+                      "attribute": track.get("attribute"), "muted": track_muted(track)},
             "material": {"bucket": bucket, "id": seg.get("material_id"), "type": (mat or {}).get("type")},
             "target": {"start_us": t_start, "duration_us": t_dur},
             "source": {"start_us": s_start, "duration_us": s_dur},
@@ -230,6 +281,15 @@ class Model:
         an = self.animations_for(refs)
         if an:
             out["animations"] = an
+        if keyframe_tracks(seg):
+            out["keyframes"] = keyframe_tracks(seg)
+        _sk = [k.get("property_type", "").split("KFType", 1)[-1]
+               for k in (seg.get("common_keyframes") or [])
+               if (k.get("property_type") or "") in KF_PICTURE
+               and len(k.get("keyframe_list") or []) == 1]
+        if _sk:
+            # 骨架帧：单点、值与 clip 标量同步（F-027）⇒ 不参与渲染，落名单供核对。
+            out["keyframes_static"] = _sk
 
         for r in refs:
             if r["bucket"] != "effects":
@@ -278,6 +338,11 @@ class Model:
                     "loudness": loud,
                     "fade": fade,
                 }
+            # 视频段自带声的两条归零判据必须落到模型里：轨道静音页面能从 track.muted 读到，
+            # 而"原声已被提取到独立音频轨"只写在 materials.videos[].extra_type_option 上，
+            # 不落模型就只能靠"这段文件到底有没有音轨"这一半信息猜（猜的结果是重复播放）。
+            out["separated_audio"] = bool(int(mat.get("extra_type_option") or 0) & HAS_SEPARATED_AUDIO)
+            out["last_nonzero_volume"] = seg.get("last_nonzero_volume")
         if bucket == "texts" and mat:
             content = load_json_string(mat.get("content") or "")
             styles = (content or {}).get("styles") or []
@@ -292,6 +357,9 @@ class Model:
                 "shadows": sum(len(s.get("shadows") or []) for s in styles),
                 "effect_style": sorted({s.get("effect_style_id") for s in styles if s.get("effect_style_id")}),
                 "check_flag": mat.get("check_flag"),
+                # 材料级整段透明度（UI 里"不透明度"滑杆写在材料上，实测本草稿唯一非 1 值是
+                # texts[29]=0.5 的「？」强调字幕，2026-11-05 成片核对：它就是半透明灰）。
+                "global_alpha": mat.get("global_alpha"),
             }
         # A composite is identified by its drafts[] reference, not by an unreadable file:
         # this draft's track 6 segment carries a combination ref and **no media at all**, so a
@@ -354,6 +422,50 @@ class Model:
                 cache[path] = None
         return cache[path]
 
+    def _ae_tables(self, path: str):
+        """把入场动画的**关键帧表**随模型带走（同 F-087 的道理：浏览器读不了包内 lua）。
+
+        只带包内明文：轨道来自 `animation_ae.load_ae`，`duration_s` 取包内
+        `self.DURATION = 18 / 30` 那一行，`design_size` 取 `DESIGN_SIZE`。
+        方言 B（`AETools`，向上闪入）先不带——它的位移进的是 `SomePassMat`，
+        那条 pass 画的是什么还没判（P-179），拿没判清的表去渲染就是猜。
+        """
+        if not path or not os.path.isdir(path):
+            return None
+        cache = self.__dict__.setdefault("_ae_cache_map", {})
+        if path in cache:
+            return cache[path]
+        out = None
+        try:
+            import pathlib
+            import animation_ae as aae
+            tracks = aae.load_ae(path)
+            if tracks:
+                dur = size = None
+                for q in sorted(pathlib.Path(path).glob("**/lua/*.lua")):
+                    text = q.read_text(encoding="utf-8", errors="replace")
+                    for m in ("DURATION", "DESIGN_SIZE"):
+                        g = re.search(r"self\." + m + r"\s*=\s*([0-9a-zA-Z./\- +()]+)", text)
+                        if not g:
+                            continue
+                        try:
+                            val = float(eval(g.group(1).strip(), {"__builtins__": {}}, {}))
+                        except Exception:
+                            continue
+                        if m == "DURATION" and dur is None:
+                            dur = val
+                        elif m == "DESIGN_SIZE" and size is None:
+                            size = val
+                    if dur and size:
+                        break
+                out = {"dialect": "A", "duration_s": dur, "design_size": size,
+                       "tracks": {t["name"]: {"d": t["d"], "keys": t["keys"], "eases": t["eases"]}
+                                  for t in tracks}}
+        except Exception:
+            out = None
+        cache[path] = out
+        return out
+
     def animations_for(self, refs: list[dict]) -> list[dict]:
         """把 extra_material_refs -> materials.material_animations[] 解成渲染可用的条目。
 
@@ -385,6 +497,7 @@ class Model:
                     "path": path or None,
                     "package_exists": bool(path) and os.path.isdir(path),
                     "tw": self._tw_tables(path, a.get("name")),
+                    "ae": self._ae_tables(path),
                     "anim_material_id": item.get("id"),
                 })
             for k in ("in", "out", "loop"):
@@ -418,6 +531,7 @@ class Model:
         # 实测最坏一段比成片暗 36 %（P-129）。同类型多条时取**第一条非空值**：
         # `figure`（美颜）有 528 条、类型内多值，但那些不是颜色滑杆，本字段先只被 brightness 消费。
         effect_values = {}
+        effect_paths: dict[str, str] = {}
         for r in refs:
             if r["bucket"] == "effects":
                 b, item = self.buckets[r["id"]]
@@ -426,10 +540,15 @@ class Model:
                     v = item.get("value")
                     if isinstance(v, (int, float)) and effect_values.get(item["type"]) is None:
                         effect_values[item["type"]] = float(v)
+                    if item.get("path") and not effect_paths.get(item["type"]):
+                        # 调色支的 LUT/参数表都在这个包里（F-103）：渲染端要知道去哪个目录取
+                        effect_paths[item["type"]] = item["path"]
         if effect_types:
             fx["effects"] = sorted(effect_types)
         if effect_values:
             fx["effect_values"] = effect_values
+        if effect_paths:
+            fx["effect_paths"] = effect_paths
         crop = (mat or {}).get("crop") or {}
         if crop and not (
             crop.get("upper_left_x", 0) == 0 and crop.get("upper_left_y", 0) == 0
@@ -446,6 +565,11 @@ class Model:
         tracks_out = []
         seg_count = 0
         max_end = 0
+        # 主视频轨 = 第一条 video 轨（F-050：语料 1533/1533 的主轨 flag 只会是 0 或整键缺席，
+        # 其余 video 轨 100% 是 2）。它决定"喇叭按钮走哪条通道"：主轨走草稿级 config.video_mute，
+        # 其它轨走 tracks[].attribute 的 MuteFlag。
+        main_video = next((ti for ti, t in enumerate(draft.get("tracks") or [])
+                           if t.get("type") == "video"), None)
         for ti, track in enumerate(draft.get("tracks") or []):
             segs = []
             spans = []
@@ -463,6 +587,7 @@ class Model:
             tracks_out.append({
                 "index": ti, "type": track.get("type"), "flag": track.get("flag"),
                 "attribute": track.get("attribute"), "is_master": track.get("is_master"),
+                "muted": track_muted(track), "is_main_video": ti == main_video,
                 "name": track.get("name"), "segments": segs,
             })
 
@@ -564,6 +689,8 @@ class Model:
         return {
             "timeline_id": draft.get("id"),
             "duration_us": declared,
+            # 草稿级「关闭视频原声」：主视频轨的喇叭按钮写的就是这个键（缺省 false＝原声开）。
+            "video_mute": bool((draft.get("config") or {}).get("video_mute")),
             "last_segment_end_us": max_end,
             "canvas": canvas,
             "render_index_track_mode_on": draft.get("render_index_track_mode_on"),
@@ -585,6 +712,21 @@ class Model:
                 "unrouted_track_segments": unrouted,
                 "mix_mode_segments": sum(1 for tr in tracks_out for s in tr["segments"]
                                          if s.get("mix_mode")),
+                # 静音面的读数：轨道静音的条数、原声被提取走的段数、被归零的段数。
+                # 没有这三个数，"预览没声"就分不清是草稿要求静音还是我们把音轨丢了。
+                "muted_tracks": sum(1 for tr in tracks_out if tr["muted"]),
+                "separated_audio_segments": sum(1 for tr in tracks_out for s in tr["segments"]
+                                                if s.get("separated_audio")),
+                "zero_volume_segments": sum(1 for tr in tracks_out for s in tr["segments"]
+                                            if (s.get("volume") or 1.0) <= 0.002),
+                # 关键帧读数：多点轨道的段数（会动）与骨架轨道段数（=clip 标量，不动，F-027）。
+                "keyframe_segments": sum(1 for tr in tracks_out for s in tr["segments"]
+                                         if s.get("keyframes")),
+                "skeleton_keyframe_segments": sum(
+                    1 for tr in tracks_out for s in tr["segments"] if s.get("keyframes_static")),
+                "kf_curve_handles": sum(
+                    1 for tr in tracks_out for s in tr["segments"] for t in (s.get("keyframes") or [])
+                    for p in t["points"] if (p.get("lc") or {}).get("x") or (p.get("rc") or {}).get("x")),
                 "animation_segments": sum(1 for tr in tracks_out for s in tr["segments"]
                                           if s.get("animations")),
                 "feature_counts": dict(sorted(feats.items(), key=lambda kv: -kv[1])),
@@ -595,6 +737,50 @@ class Model:
             "errors": self.errors,
             "warnings": self.warnings,
         }
+
+
+def stage_adjust_lut(model: dict, out_dir: Path) -> None:
+    """把调色包的 17³ LUT 复制进 `temp/playback-test/lut/` 并登记成网页可达路径。
+
+    为什么在建模时做：浏览器侧要按**厂商自己的 frag** 走 lightSensation 这支，
+    而 LUT 只在装机缓存目录里（网关只服务 `temp/`）。复制是幂等的，源缺失就整个跳过
+    ——跳过会在模型里留下 `adjust_lut=None`，渲染端据此**不施加这一支**（不许静默近似）。
+    """
+    import shutil
+    names = ("lightSensation_max.png", "lightSensation_min.png")
+    src_dir = None
+    for tr in model["tracks"]:
+        for seg in tr.get("segments", []):
+            paths = ((seg.get("features") or {}).get("effect_paths")) or {}
+            for t in ("light_sensation", "fade", "contrast", "shadow"):
+                if paths.get(t):
+                    # effect.path 指到哈希目录，包本体在它下面一层（AmazingFeature_adjustColor/image/）
+                    root = Path(paths[t])
+                    for cand in [root / "image", *sorted(root.glob("*/image"))]:
+                        if (cand / names[0]).is_file():
+                            src_dir = cand
+                            break
+                    if src_dir:
+                        break
+            if src_dir:
+                break
+        if src_dir:
+            break
+    if not src_dir:
+        model["adjust_lut"] = None
+        return
+    dst = out_dir / "lut"     # 与模型同目录 ⇒ 网关 --serve-dir temp 下网页可达
+    dst.mkdir(parents=True, exist_ok=True)
+    got = {}
+    for n in names:
+        src = src_dir / n
+        if not src.is_file():
+            continue
+        out = dst / n
+        if not out.is_file() or out.stat().st_size != src.stat().st_size:
+            shutil.copyfile(src, out)
+        got[n.replace("lightSensation_", "").split(".")[0]] = "/playback-test/lut/" + n
+    model["adjust_lut"] = got if len(got) == 2 else None
 
 
 def main() -> int:
@@ -617,6 +803,7 @@ def main() -> int:
     model = Model(draft, Path(args.draft_root)).build()
     out = scratch_out(Path(args.out))
     out.parent.mkdir(parents=True, exist_ok=True)
+    stage_adjust_lut(model, out.parent)
     out.write_text(json.dumps(model, ensure_ascii=False, indent=1), encoding="utf-8")
 
     s = model["stats"]
