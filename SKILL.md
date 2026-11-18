@@ -123,11 +123,11 @@ python scripts/playback_check.py --plain "<plain.json>" --draft-root "<草稿根
 | `LOCALAPPDATA` | 剪映机器资产（效果包、字体）根，即 `%LOCALAPPDATA%\JianyingPro\User Data\...`（脚本用 `Path.home()`，不写死用户名） |
 | `JY_INSTALL_DIR` | 钉死剪映安装版本目录（如 `D:\Program Files\JianyingPro\11.6.0.14552`）。不设时由 `scripts/jy_paths.py` 查 C:/D: 的 `Program Files`、`Program Files (x86)` 与 user 的 `%LOCALAPPDATA%\JianyingPro\Apps`，取「完整安装」（有 `Resources/` 且带 `ffmpeg.exe`/`videoeditor.dll`）里版本号最大的那个，并写回 `config.local.json` |
 | `config.local.json` | 本机安装记录（skill 根目录，已 gitignore）。记录里的目录还在就沿用，不再走盘；被升级/删除后自动重扫。`python scripts/jy_paths.py --rescan` 强制重扫 |
-| `JIANYING_VIDEOEDITOR_DLL` | 钉死**解密用**的 `videoeditor.dll` 绝对路径（`dll.py:discover_dll` 首选项，不设则取版本最大的完整安装）。剪映升级后必设：11.7.0.14652 的内存 `decrypt` 在冷进程里对任何输入都返 `ok=true / 0 字节`（含它自己 `encrypt` 的产物），详见 `evidence/crypto-probe-log.md` 探测 3。恢复办法：升级器把旧文件改名留在旧版本目录（`11.6.0.14552/*_d_*`，实测 65/66 个文件都改了名），
+| `JIANYING_VIDEOEDITOR_DLL` | **2026-11-18 起解密默认走纯实现（`jy_crypto/pure.py`：AES-256-GCM，key/nonce 随密文自带，零 DLL、零 worker）**；本变量只作用于**备用/审计**路径——纯解密抛错时兜底进 worker，或显式 `dll=`/`--dll` 的钉住跑（**跳过纯实现**、只测点名的 DLL，探测 6 那类错位不再可能）。`payload["backend"]`/`client.last_backend` 记录本次是 `pure` 还是 `dll`。钉死**解密用**的 `videoeditor.dll` 绝对路径（`dll.py:discover_dll` 首选项，不设则取版本最大的完整安装）。剪映升级后必设：11.7.0.14652 的内存 `decrypt` 在冷进程里对任何输入都返 `ok=true / 0 字节`（含它自己 `encrypt` 的产物），详见 `evidence/crypto-probe-log.md` 探测 3。恢复办法：升级器把旧文件改名留在旧版本目录（`11.6.0.14552/*_d_*`，实测 65/66 个文件都改了名），
 `python scripts/rebuild_dll_sandbox.py --version-dir <旧版本目录> --out temp/dll-11.6 --sha256 <基线>`
 整批还原到 `temp/` 下的沙箱（安装目录只读；落点由 `cache.assert_scratch_target` 兜死；sha256 对不上就非零退出，
 **必须绝对路径**加载，`add_dll_directory` 收相对路径抛 WinError 87）。已知良好基线 sha256 `8cfcbb612ccd946df974428977b1902736c1de0ae561e20c26cbd4ea86099cb1` |
-| `gate.py` 的门禁读数（不是环境变量，是**口径**） | 引用前先确认这一跑真的钉住了 DLL：**要么 export `JIANYING_VIDEOEDITOR_DLL`、要么带 `--dll`**，二者其一。2026-11-03 之前 `--dll` 只喂给 identity 的 `report`，样本那三次 `call` 一律走 `discover_dll()` ⇒ 报告里写 11.6、真正干活的是 11.7（`evidence/crypto-probe-log.md` 探测 6）。同一探测还修掉第二条：scratch 产物按**源 sha** 命名且改前跑时**不清空** ⇒ 上一轮留下的旧明文被当成本轮结果，把"全失败"读成 1 条 PASS。改后对照：带 `--dll` 3/3 PASS(RC=0) / 不带 0/3(RC=1) |
+| `gate.py` 的门禁读数（不是环境变量，是**口径**） | 引用前先确认这一跑真的钉住了 DLL：**要么 export `JIANYING_VIDEOEDITOR_DLL`、要么带 `--dll`**，二者其一（2026-11-18 起显式钉住的跑必走该 DLL——纯实现只接管**未钉住**的解密默认路径，钉住跑被 `client.decrypt_bytes(dll=…)` 明确旁路）。2026-11-03 之前 `--dll` 只喂给 identity 的 `report`，样本那三次 `call` 一律走 `discover_dll()` ⇒ 报告里写 11.6、真正干活的是 11.7（`evidence/crypto-probe-log.md` 探测 6）。同一探测还修掉第二条：scratch 产物按**源 sha** 命名且改前跑时**不清空** ⇒ 上一轮留下的旧明文被当成本轮结果，把"全失败"读成 1 条 PASS。改后对照：带 `--dll` 3/3 PASS(RC=0) / 不带 0/3(RC=1) |
 
 ## 门能判什么（编号即层名）
 
