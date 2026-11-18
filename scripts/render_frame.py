@@ -645,6 +645,7 @@ def apply_color_adjust(img, seg):
           if isinstance(v, (int, float)) and abs(v) > 1e-6 and k in COLOR["branches"]}
     if not nz:
         return img
+    src_alpha = img.getchannel("A") if img.mode in ("RGBA", "LA") else None
     a = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
     COLOR["applied"] += 1
     b = nz.get("brightness")
@@ -699,7 +700,10 @@ def apply_color_adjust(img, seg):
             COLOR["skipped_lut"] += 1     # 取不到 LUT 就不施加这一支，并且要能在读数里看见
         else:
             a = np.clip(a + (np.asarray(_apply_lut(a, tex), dtype=np.float32) - a) * abs(ls), 0.0, 1.0)
-    return Image.fromarray((a * 255).astype(np.uint8)).convert("RGBA")
+    out = Image.fromarray((a * 255).astype(np.uint8)).convert("RGBA")
+    if src_alpha is not None:
+        out.putalpha(src_alpha)
+    return out
 
 
 def active_segment(track, pos_us):
