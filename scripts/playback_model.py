@@ -212,7 +212,7 @@ class Model:
 
     def segment(self, seg: dict, track: dict) -> dict:
         sid = seg.get("id")
-        bucket, mat = self.material_of(seg.get("material_id"))
+        bucket, mat = self.material_of(seg.get("material_id")) or (None, None)
         if mat is None:
             self.errors.append(f"dangling material_id {seg.get('material_id')} in segment {sid}")
         refs, missing = [], []
