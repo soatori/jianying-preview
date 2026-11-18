@@ -3067,3 +3067,161 @@ gradV、选让比值吻合的 sigma，不必先看懂 frag（frag **仍未读**�
 
 
 
+
+## F-098 轨道级静音律的判别式来自厂商自己的模型层代码，不是位含义猜测（2026-11-05，P-157①）
+
+- `tracks[].attribute` 是位场：**bit0=MuteFlag、bit1=HideFlag、bit2=LockFlag**。
+  出处：`Resources/canvas_agent/app/static/js/async/*.js`（当前安装 11.7.0.14652）
+  `tB={DefaultFlags:0n<<0n, MuteFlag:1n<<0n, HideFlag:1n<<1n, LockFlag:1n<<2n}`；
+  消费侧 `(BigInt(trackAttribute)&MuteFlag)&&(m=0)`（视频段与音频段两条 updateVolume 支同式，
+  音频段还把 volume 关键帧整体置 [0]）；写入侧 `api.track.mute({trackId,muted,attribute}) →
+  attribute|=u / &=~u`，UI 文案「轨道静音/取消轨道静音」。
+- **主视频轨例外**：它的喇叭按钮读写草稿级 `config.video_mute`
+  （`"main"===kind ? !!draftProperty.videoMute : (track.attribute&MuteFlag)===MuteFlag`；
+  native 符号 `Config::get_video_mute/set_video_mute`、`DraftUpdate::update_main_track_video_mute_value`）。
+  主视频轨按 F-050 的位置律取（第一条 video 轨）。
+- **第三条归零判据**：`materials.videos[].extra_type_option` bit0=HasSeparatedAudio（提取音频后
+  原声按 0，防同一段人声放两遍）。语料位表：OptionNone=0, HasSeparatedAudio=1,
+  IsCombinationVideo=2, IsDraftTemplateVideo=4, IsSceneEditCutVideo=8。
+- 静音前的值记在 `segments[].last_nonzero_volume`（`SegmentVideo` 成员，DLL 符号可查）——
+  本草稿 track5 的段 `volume=0.001` 且 `last_nonzero_volume=0.001`。
+- 验证（P-157③，波形相关尺带正负对照）：attribute=1 的 track1 在**成片里就没有声**
+  （HIT 0.100 ≈ NULL 0.086，8/21 段过线=乱数水平）；三条音频轨 11/11 全过（HIT 0.19–0.38）。
+  改后我方预览同一形状：track1 五段 HIT≈NULL，口播子段 HIT 0.73–0.97。
+
+## F-099 两条成片侧的坐标/载体事实：导出音频相对草稿时间轴 +0.100 s；组合缓存是单字节 XOR 头 + 仍加密的 mdat（2026-11-05，P-157）
+
+1. **+0.100 s**：以段自身解码音对成片做 ±1 s 互相关，音频轨 15 个 ≥0.8 s 的段峰值滞后
+   一致落在 **+0.100 s**（BGM 两段 +0.100/+0.147）。这是**成片对象的属性**（量出来的），
+   不是拟合出来的对齐参数——L29 的固定对齐保持 0 不动，判据线不挪；记在这里是因为
+   以后任何"逐样本/逐包络"的判据都必须先声明用哪把原点。
+2. **组合缓存混淆**：`Resources/combination/*_video.mp4` 的头部是**单字节 XOR**（key=文件
+   首字节；`00 00 00 20 66 74 79 70…` 逐字节还原可验），moov 可完整解析出 h264+aac(44.1k/2ch)
+   流表；但 **mdat 仍是密文**（XOR 后 h264 报 Invalid NAL unit size、aac 报 channel element
+   not allocated）⇒ 不经 DLL 解不出内容。这不改变交付路线：模型早已用 `expand_composite`
+   从 `materials.drafts[]` 重建子时间线，口播的声来自子段的**拍摄文件代理**（有 AAC），
+   不读缓存。cache 里的 aac 流表与子段拍摄文件一一对应，是这个判断的旁证。
+3. 顺带把一段旧注记纠偏：player.html 曾写「本草稿的视频素材不带 has_audio 字段」——顶层
+   `materials.videos[26]` 其实带一个 `has_audio:false`（其余 26 条缺席）；判"文件有没有音轨"
+   的权威仍是解流器（`silentPaths`），不是这个字段。
+
+## F-100 页内 JS 的语义错误只能在**被走到那一帧**才暴露：判据必须自带覆盖证明，否则"绿"只说明没碰上（2026-11-06，P-163）
+
+- 同一族已经出过三次，形状都一样：**语法合法、语义被吞**，`node --check` 与 `py_compile` 一类都抓不到。
+  1. P-131：`const COLOR` 的行尾注释吞掉 `byId/filters/applied` 三个字段 ⇒ `colorRecord` 每帧抛 TypeError，
+     而当时的结论写成"浏览器形状不适用"（假判决）。
+  2. P-163：`flush()` 的 clamp 诊断行 `String(j.seg_id || sid || '')`——`j.seg_id` 从没被赋过值，
+     求值落到 `sid`，而 `sid` 是**从未声明的自由标识符**（读它必抛 ReferenceError，写它才在严格模式下报错）。
+     这一行自 970175d（P-152）就在册，只有在**真的发生"被夹"**时才执行。
+  3. 更早的同类是 `lastPaintUs` 竞态那批：隐藏页里 rAF 不来，代码路径整段静默。
+- 为什么危险：抛出点在被调函数的**中部**，异常被上层 `catch` 吞成一个计数（`audio_errors`），
+  于是"一个计数器 +1"取代了"整个作业剩下的批次不再排"——**故障形态是内容缺失，不是报错**。
+- 律（写死，落成判据）：任何**只在罕见分支里求值**的诊断/记账表达式，都要有一条判据同时满足两件事——
+  **(a) 覆盖证明**：那一跑里分支确实被走到（`clamps > 0`；为 0 就报"未覆盖，不判绿"，不许报绿）；
+  **(b) 反例腿**：把缺陷装回一份 fixture 并**强制走该分支**，必须转红且红在同一个报文上。
+  实例：`scripts/audio_clamp_check.py` 的 C1/C2/C3。
+- 配套口径：`L5 mixer` / `L6 no silent black frame` 这两层之所以值钱，是因为它们把"页面自报的
+  `audio_errors`/`errors`"当判据而不是当旁证——P-163 就是它们抓到的，不是靠肉眼读代码。
+
+## F-101 说"间歇性"之前，先把读数时刻与被测文件的改动时刻对表（2026-11-06，P-163⑤ 对 P-153/P-154 的更正）
+
+- p149（11-05 09:19）与 p150（09:23）同一条时间线、同样 `clamps=4`，但 `lost_s 0.174 s` vs `10.95 s`、
+  零排期 0/40 vs 4/40。当时记成"间歇性未交付"，并据此排了计划第 1 项"修饿死的泵"。
+- 真相：这两次跑**跨了一次代码变更**——`audioStats.clamp_at` 那行由 970175d（09:25 提交）引入，
+  而 09:19 那一版还不会抛（4 次夹 0 条异常），09:23 那一版 4 次夹 4 条异常。
+  ⇒ 差的是代码，不是机器；"间歇性"是编辑窗口造出来的假象。
+- 律：把两个读数当同一分布的两次采样之前，必须先证 **被测文件在两次跑之间没变**
+  （`git log -S<新引入的语句>` 指到哪个提交、那个提交时刻在两次跑之间吗？；
+  在册件与工作副本的 md5、以及 `temp/` 下服务副本的 mtime 也要对表）。
+  做不到就把两次跑写成"两次不同状态的读数"，不许写成分布。
+- 与 [[temp-derived-gate-inputs-fail-silently]] 同族：那说的是**输入**漂了读数会静默变，
+  这说的是**代码**漂了会被读成随机性。
+
+
+## F-102 截图腿取**内容包围盒**会把全局缩放/位移判没（2026-11-06，P-166）——像素判据必须取画幅
+
+- 现象：`&shots=` 用 `app.renderer.extract.pixels(app.stage)`，Pixi 返回的是 **stage 内容的 bbox**
+  （实测某帧 bbox = (−5,−119) 1165×2056，而画幅是 1080×1920），再等比缩到 540 宽。
+  于是"这一帧相对画幅被放大/平移了多少"在截图里**被自己归一化掉**。
+- 代价是双向的：①**假红**——位移段 13.6–14.8 的 43 帧被判成 0.44–0.51（"内容层不对"），
+  而画布回读同一帧是 0.93–0.97；②**漏判**——真正的全局缩放/位移错（信箱、fit 因子、锚点错）
+  在这条腿下**永远看不见**，因为归一化正好把它除掉。
+- 律：**像素对照必须在画幅坐标系里取图**——`app.render()` 之后同任务内 `app.canvas.toDataURL()`
+  （确定性呈现 P-160 保证缓冲就是这一帧），或渲染进画幅尺寸的 `RenderTexture`。
+  包围盒只许用来查几何异常（`browser_shot_check` 那句"540×953 vs 540×960"就是它报出来的）。
+- 配套教训（与 [[temp-derived-gate-inputs-fail-silently]]、F-100 同族）：**仪器也要被成片判一次**。
+  这次是"画布 vs 包围盒"两条腿对同一帧差 0.47，才把 43 帧的假缺陷识破。
+
+## F-103 调色的律**不必拟合**——装机包里就是明文（2026-11-05 P-130 / 2026-11-06 P-167）
+
+- `%LOCALAPPDATA%/JianyingPro/User Data/Cache/effect/<id>/<hash>/AmazingFeature_adjustColor/`
+  里 `xshader/colorAdjust.frag`（316 行）给出**支顺序**（brightness→contrast→saturation→vibrance→
+  highlight→shadow→blackWhite→temperatureTint→fade→lightSensation）与每支的算式，
+  `lua/SeekModeScript.lua` 给出**参数映射**（ContrastPivot=0.435、getBrightnessParam、
+  getContrastParam+sigmoid、getShadowParam/getHighlightParam 四次多项式、getBlackWhiteParam、
+  `u_lightSensationParam = lightSensationIntensity` 原值）。
+- 于是"拟合出一个系数"这条路从一开始就是多余的：草稿字段 → uniform 是**抄**出来的，
+  剩下要判的只有**取哪张 17³ 表**（`image/lightSensation_{max,min}.png`）与生效范围。
+- 反面教训（P-167）：照抄明文之后其余五支实测仍更差 ⇒ "更差"不等于"抄错了"，
+  更可能是**这些段本来就没这几支**或分母被别的错占着；这条只在律的来源可信度上算数。
+
+## F-104 Pixi v8 的额外 sampler 只认 **Filter/Shader 这一层**的 `resources`；没绑上的 sampler 取的是 unit 0 = 滤镜输入本身（不是白）（2026-11-07 P-175）
+
+- `GlProgram` 的构造只解构 `{fragment, vertex, layout, gpuLayout, name}` —— 把 `resources`
+  挂进 `GlProgram.from(...)` 会被**静默丢掉**，不报错、不警告。
+- 挂到 `new Filter({glProgram, resources:{uLut: src}})` 时，`Shader` 才把 layout 里没有的名字
+  自动排到 **group 99**、按序 `uniform1i` 绑单元（包内原文：`u[c]||(i[99]=new Ee(...),
+  u[c]={group:99,binding:h,name:c},a[99][h]=c,h++)`）。
+- **未绑上的后果不是黑也不是白**：GL 的 sampler 默认就是 0 号单元，而滤镜框架把**输入纹理**放在 0
+  ⇒ `texture(uLut, uv)` 读到的还是这一帧自己，但**读的是 LUT 坐标那一处**（tp 落在 [0,1]² 里，
+  于是变成拿查表坐标去采画面）。所以它不是"什么都不改"，而是**把同一帧错一小格混回来**：
+  页面 corr 因此**低于**基线（P-174 实测 9.2 从 0.925 → 0.829），症状像"数值不闭合"，
+  其实是"这一支查的根本不是表"。
+- 认出它的是**上传验那一段**：期望 `texture(uLut, 纹素中心)` = 表的那个纹素，实测拿到的是
+  **网格在那一行的颜色**（obs 沿 u 列不变、沿 v 行按 17/85/153 走 = ramp 的行值）——错位当场现形。
+- 仪器含义：纹素级往返验（查五个点）**盖不住**这种错，因为错的不是公式而是绑定。
+  判"通路闭合"必须分段：输入通路 / 上传 / 公式 uv / 纯查表 / 实际权重，每段只测一件事；
+  混在一起时 max 239 里 200 是仪器自己的（转置索引 + 放大 4× 的 12.5% 邻格混入 = 正好 32.0/255）。
+
+## F-105 逐帧腿判的是 `temp/` 里的**运行副本**，不是 `player/player.html`；不物化就会拿旧页的行为当新页的读数，而且读数看着完全正常（2026-11-07，P-175）
+
+- 网关静态根是 `temp/`，页面 URL 是 `/playback-test/player.html` ⇒ 浏览器跑的是**副本**；
+  副本在 `.gitignore` 里，改真身不会自动追上它。
+- 现场：`player/player.html` 已改成 `keys = ['brightness','light_sensation']` 且 `resources` 挂到 Filter，
+  而 `temp/playback-test/player.html` 仍是 `keys = ['brightness']` + `opts.resources`（md5 `de9a1d5c` vs 真身 `ada2ee6e`）。
+  那一轮 1105 帧跑出来的越带数与基线一寸没动——**这正是它该被认出来的样子**：改动生效的话这个数必然要动。
+- 更隐蔽的一层：清单里那句 `调色 ['brightness','light_sensation']` 是**从草稿模型算出来的“应该施加”**，
+  不是页面自报的“实际施加”。把它当成“浏览器已经走了这一支”的证据，就是我在这条腿上犯的 F-100 同族错。
+- 修法（已落进 `scripts/frame_parity.py`，与门的 L0 同一条律）：`--sweep` 起跑前把真身**物化**成副本并断言写回逐字节相同，
+  同时把真身 md5 落在 `frame-parity-player.md5`；`--judge` 只核对不自写——
+  对不上或没有自证文件就**拒判**（负样本两种都验过：假 md5 ⇒“不是同一版，不判”；删文件 ⇒“没有 L0 自证文件”）。
+- 一般形式：**任何走“先复制再运行”的判据，都要把“复制发生了”当成一层来判**；
+  否则改动的效果与副本的陈旧会在读数里互相抵消，留下一个假的“没变化”。
+
+## F-106 负判要用**整句**，不能用子串：`opts.resources` 也是 `filterOpts.resources` 的子串，闸会把自己关死（2026-11-07，P-176 门脚本）
+
+- 现场：`gate_P175.sh` 的页面半边自检写了
+  `assert "filterOpts.resources" in a and "opts.resources" not in a`，
+  想挡的是"resources 又挂回 `GlProgram.from(opts)`"。第二句对**修好之后的页面也永远为假**——
+  `filterOpts.resources` 里就含着 `opts.resources` 这十四个字符。
+- 这类错的形状：**用"新写法里出现的字符串"去反证"旧写法不存在"**。新写法必然包含旧写法的一部分（重命名、加前缀、
+  挪参数都这样），于是断言恒假；表现是"分支明明修好了，门一直 ABORT"，很容易被误读成"还没修"。
+- 律：负判要写**可区分的完整语句**（这里用 `new Filter({ glProgram: GlProgram.from(opts)` 整句），
+  或者干脆判结构（`new Filter(filterOpts)` 在不在）；命名有包含关系时，永远不要拿子串当反证。
+- 同一族的另一条已经在 F-105：判据的输入（副本、子串、命名）与被判对象之间只要有包含/别名关系，
+  就要先问"这个断言在**修好的代码**上会不会为假"。本会话的门脚本还同时中了 L0 预检的坑
+  （拿旧副本对 md5 ⇒ 自己 ABORT），一并改成"先物化再对眼"。
+
+## F-107 渲染循环里被吞掉的异常只会让**帧停止落下**，不留控制台痕迹；"没有报错"不能当"没出事"的证据（2026-11-07，P-185）
+
+- 现象：逐帧批跑到某一时刻后不再 POST，`list_console_messages` 只有两条正常的启动日志。
+  真因是 `flashApply`→`aeAt()` 里 `c.exposure[i]` 对**没有 exposure 的表条目**抛 TypeError，
+  而这段在 rAF/取帧循环里被吞掉——于是**症状是"静止"，不是"报错"**。
+- 触发条件是**派生数据的形状变了**（表从 1 个包扩到 2 个包），不是代码逻辑改了；
+  这类"数据扩形状 ⇒ 老读者崩"是派生件（不进 git 的 temp 件）最常见的失效方式，与 F-105、[[temp-derived-gate-inputs-fail-silently]] 同族。
+- 三条硬规矩：
+  1. 读导出表的地方要**逐字段判存在**（缺就按 0/不参与），不许假设"每条都有全部通道"；
+  2. 判据腿要能区分"**没跑到**"与"跑到但不是这一帧"——落帧计数器与请求时刻清单要对账，
+     缺一帧就指名道姓报出来（`frame_parity` 的"未取到"就是这条，本轮靠它把断点钉在 20.233→20.267）；
+  3. 做对照要**复刻出问题的调用形态**：这轮"只给窗口内的几个时刻"根本不落帧，
+     据此得出的任何结论都是错的（我从这里退回来才做了对的对照）。
