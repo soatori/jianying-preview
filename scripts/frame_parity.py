@@ -31,10 +31,9 @@ import sys
 import time
 from pathlib import Path
 
-from PIL import Image
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from browser_soak import CHROME, OUT, ROOT  # noqa: E402  复用 Chrome 路径与 temp 目录口径
+from browser_shot_check import corr, luma_at, mean_lum  # noqa: E402  同一把尺，不另抄一份
 
 DRAFT = Path("D:/JianyingPro/JianyingPro Drafts/李金昌 10月15日 (4)")
 
@@ -160,27 +159,14 @@ def luma(png: Path, w: int, h: int):
     key = (str(png), w, h)
     v = _LUMA.get(key)
     if v is None:
-        v = Image.open(png).convert("L").resize((w, h)).tobytes()
+        v = luma_at(png, w, h)
         _LUMA[key] = v
-        if len(_LUMA) > 2600:
-            for k in list(_LUMA)[: 600]:
+        # 存的是 float32 归一化数组（518400 B/帧，旧 bytes 的 4 倍），上限跟着从 2600 降到 600
+        # （≈297 MB，与改前同量级）；±3 对齐只碰 7 张连续成片帧，600 远够用。
+        if len(_LUMA) > 600:
+            for k in list(_LUMA)[: 150]:
                 _LUMA.pop(k, None)
     return v
-
-
-def corr(a: bytes, b: bytes) -> float:
-    n = len(a)
-    ma, mb = sum(a) / n, sum(b) / n
-    va = math.sqrt(sum((x - ma) ** 2 for x in a))
-    vb = math.sqrt(sum((x - mb) ** 2 for x in b))
-    if va < 1e-6 or vb < 1e-6:
-        return 1.0 if va < 1e-6 and vb < 1e-6 else 0.0
-    return sum((x - ma) * (y - mb) for x, y in zip(a, b)) / (va * vb)
-
-
-def mean_lum(png: Path, w: int, h: int) -> float:
-    b = luma(png, w, h)
-    return sum(b) / len(b)
 
 
 def active_at(model: dict, t: float) -> dict:
