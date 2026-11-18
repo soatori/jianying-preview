@@ -62,21 +62,77 @@ def window(x: np.ndarray, rate: int, t0: float, t1: float) -> np.ndarray:
     return x[a:b] if b > a else np.array([], dtype=np.float64)
 
 
+def _seg_audible(seg: dict, track_off: bool) -> bool:
+    """静音律（判别式抄自厂商模型层，落点与 scripts/playback_model.py、player.html 三处同一条）：
+    轨道 `attribute & MuteFlag(1)`；主视频轨的喇叭写的是草稿级 `config.video_mute`；
+    片段 volume≈0（剪映把静音前的值留在 last_nonzero_volume）；原声被提取走时
+    `extra_type_option & 1` 置位。判据方向反过来用：这里给分母，页面向同一条件让路。"""
+    if track_off or seg.get("separated_audio"):
+        return False
+    return (seg.get("volume") if seg.get("volume") is not None else 1.0) > 0.002
+
+
+def _media_playable(media: dict | None) -> bool:
+    """和影像腿同一条可读性判据：只有**明确读不出容器**（加密的组合缓存）才算不能播。
+    写成 `not container.get('readable')` 会把代理模型（readable 记在 media 上）全挡掉——
+    那正是 2026-11-05 用户报「视频内的音频又漏了」的那条：一次电池 40 个音频作业 0 个来自视频段。"""
+    if not media or not media.get("path") or not media.get("exists"):
+        return False
+    c = media.get("container")
+    if isinstance(c, dict) and c.get("readable") is False:
+        return False
+    return True
+
+
 def audio_segments(model_path: Path, min_len: float) -> list[tuple[str, float, float]]:
-    """模型里带音频的段时间窗（秒）。音频轨 + 自带声的段都算。"""
-    m = json.loads(model_path.read_text(encoding="utf-8"))
+    """模型里**应当出声**的段时间窗（秒）：音频轨 + 视频段自带声（含组合子段，平移到父窗口）。
+
+    原来只收「音频轨或有 `audio` 对象的段」，而视频自带声在模型里既没有 `audio` 对象也没有
+    has_audio 字段 ⇒ 22 条素材段与 5 条组合子段从没进过分母，"成片有声段 19/19，我方缺 0 段"
+    这句话当时并不覆盖口播（P-157）。
+    """
+    m = json.loads(model_path.read_text(encoding="utf-8-sig"))
+    vmute = bool(m.get("video_mute"))
     out: list[tuple[str, float, float]] = []
     for tr in m.get("tracks") or []:
+        kind = tr.get("type") or ""
+        if kind not in ("audio", "video"):
+            continue
+        track_off = bool(tr.get("muted")) or (kind == "video" and bool(tr.get("is_main_video")) and vmute)
         for s in tr.get("segments") or []:
             tgt = s.get("target") or {}
             t0 = float(tgt.get("start_us", 0)) / 1e6
             t1 = t0 + float(tgt.get("duration_us", 0)) / 1e6
-            if t1 - t0 < min_len:
+            sid = str(s.get("id") or "?")[:8]
+            if not _seg_audible(s, track_off):
                 continue
-            kind = tr.get("type") or ""
-            # 模型里没有 has_audio 这个字段；段带不带声看 `audio` 对象（视频段自带声）或轨型。
-            if (kind == "audio" or s.get("audio")) and not s.get("muted"):
-                out.append((str(s.get("id") or "?")[:8], t0, t1))
+            if t1 - t0 >= min_len and (kind == "audio" or _media_playable(s.get("media"))):
+                out.append((f"{'a' if kind == 'audio' else 'v'}:{sid}", t0, t1))
+            comp = s.get("composite")
+            if not comp or kind != "video":
+                continue
+            # 组合缓存自己读不出容器，声音来自子时间线的拍摄段——页面也是这么排的，
+            # 所以分母必须一起收，否则口播缺了没人报（就是 P-157 的形状）。
+            pv = s.get("volume") if s.get("volume") is not None else 1.0
+            if pv <= 0.002:
+                continue
+            cvm = bool(comp.get("video_mute"))
+            for ct in comp.get("tracks") or []:
+                ckind = ct.get("type") or ""
+                if ckind not in ("audio", "video"):
+                    continue
+                coff = bool(ct.get("muted")) or (ckind == "video" and bool(ct.get("is_main_video")) and cvm)
+                for cs in ct.get("segments") or []:
+                    if ckind == "video" and (cs.get("media") or {}).get("material_type") != "video":
+                        continue          # 子时间线里的 .png 段不是音源
+                    st = cs.get("target") or {}
+                    c0 = float(st.get("start_us", 0)) / 1e6 + t0
+                    c1 = c0 + float(st.get("duration_us", 0)) / 1e6
+                    cv = cs.get("volume") if cs.get("volume") is not None else 1.0
+                    if cv * pv <= 0.002:
+                        continue
+                    if c1 - c0 >= min_len and _seg_audible(cs, coff):
+                        out.append((f"c:{str(cs.get('id') or '?')[:8]}@{sid}", c0, c1))
     return out
 
 
