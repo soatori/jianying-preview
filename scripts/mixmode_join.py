@@ -3,9 +3,9 @@
 Reads only content keys listed in temp/corpus-scan/manifest.json (so the stale plain/ leftovers
 cannot enter a count), joins each materials.effects[type=="mix_mode"] entry on resource_id /
 effect_id / path-md5 against <install>/Resources/MixMode/MixMode.json, and attaches the GLSL
-blend function from docs/evidence/tables/mixmode_glsl.csv.
+blend function from evidence/tables/mixmode_glsl.csv.
 
-Writes docs/evidence/tables/{mixmode_packages,mixmode_draft_paths}.csv.
+Writes evidence/tables/{mixmode_packages,mixmode_draft_paths}.csv.
 
 Usage: python scripts/mixmode_join.py [--install "<剪映安装目录>"]   # 缺省自动检测
 """
@@ -23,7 +23,7 @@ import jy_paths
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / 'temp' / 'corpus-scan' / 'manifest.json'
 PLAIN = ROOT / 'temp' / 'corpus-scan' / 'plain'
-OUT = ROOT / 'docs' / 'evidence' / 'tables'
+OUT = ROOT / 'evidence' / 'tables'
 MD5_RE = re.compile(r'[0-9a-f]{32}$')
 
 

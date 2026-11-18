@@ -6,7 +6,7 @@ FlagAudioSubtitle=5, FlagAiScriptSubtitle=6), and the corpus says the desktop wr
 "first video track never gets 2" plus "flag 1 on a text track means it carries subtitle material".
 
 Reads only content keys listed in temp/corpus-scan/manifest.json.
-Writes docs/evidence/tables/track_flag_semantics.csv.
+Writes evidence/tables/track_flag_semantics.csv.
 
 Usage: python scripts/track_flag_census.py
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / 'temp' / 'corpus-scan' / 'manifest.json'
 PLAIN = ROOT / 'temp' / 'corpus-scan' / 'plain'
-OUT = ROOT / 'docs' / 'evidence' / 'tables'
+OUT = ROOT / 'evidence' / 'tables'
 
 BUCKETS = ['texts', 'videos', 'audios', 'effects', 'stickers', 'video_effects', 'placeholders',
             'text_templates', 'audio_effects', 'captions', 'video_trackings']

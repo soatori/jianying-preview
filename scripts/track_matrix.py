@@ -1,7 +1,7 @@
 """Rebuild the track / segment / material-type matrices from the frozen r3 scan.
 
 Reads only the content keys listed in temp/corpus-scan/manifest.json, so the stale plain/ leftovers
-(F-030) cannot enter any count. Writes docs/evidence/tables/{track_types,segment_shapes,
+(F-030) cannot enter any count. Writes evidence/tables/{track_types,segment_shapes,
 track_material_map,material_type_enums,render_index_bands_by_type}.csv and prints a short report.
 
 Usage: python scripts/track_matrix.py [--json-out temp/track-probe/matrix.json]
@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / 'temp' / 'corpus-scan' / 'manifest.json'
 PLAIN = ROOT / 'temp' / 'corpus-scan' / 'plain'
-OUT = ROOT / 'docs' / 'evidence' / 'tables'
+OUT = ROOT / 'evidence' / 'tables'
 
 BANDS = [(0, 999, '0-999'), (1000, 9999, '1000-9999'), (10000, 10999, '10000-10999'),
          (11000, 13999, '11000-13999'), (14000, 14999, '14000-14999'),

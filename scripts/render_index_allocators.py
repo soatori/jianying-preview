@@ -11,7 +11,7 @@ Two separate questions answered by one pass:
    or "adjust" at all.
 
 Read-only over the install dir; reads the corpus only through temp/corpus-scan/manifest.json keys.
-Writes docs/evidence/tables/{render_index_allocators,track_type_by_app_version}.csv.
+Writes evidence/tables/{render_index_allocators,track_type_by_app_version}.csv.
 
 Usage: python scripts/render_index_allocators.py
 """
@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 APP_JS = jy_paths.app_js_dir()
 MANIFEST = ROOT / 'temp' / 'corpus-scan' / 'manifest.json'
 PLAIN = ROOT / 'temp' / 'corpus-scan' / 'plain'
-OUT = ROOT / 'docs' / 'evidence' / 'tables'
+OUT = ROOT / 'evidence' / 'tables'
 ALLOC_CHUNK = 'ai-creation~15.f6ca3ef2.js'
 ENUM_CHUNKS = None  # None = scan every chunk
 

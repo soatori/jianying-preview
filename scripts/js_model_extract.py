@@ -6,7 +6,7 @@ per-class field table `{common:[...], bigint:{...}, array:{...}, object:{...}}` 
 that assigns a default to every key. That is the vendor's own field inventory and default set.
 
 Read-only over the install dir; reads the corpus only through temp/corpus-scan/manifest.json keys.
-Writes docs/evidence/tables/js_model_keys.csv and temp/rea/js_model_diff.json.
+Writes evidence/tables/js_model_keys.csv and temp/rea/js_model_diff.json.
 
 Usage: python temp/rea/js_schema.py [--corpus]
 """
@@ -21,12 +21,12 @@ from pathlib import Path
 
 import jy_paths
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 JS = ROOT / 'temp' / '_js'          # placeholder, replaced below
 APP_JS = jy_paths.app_js_dir()
 MANIFEST = ROOT / 'temp' / 'corpus-scan' / 'manifest.json'
 PLAIN = ROOT / 'temp' / 'corpus-scan' / 'plain'
-OUT = ROOT / 'docs' / 'evidence' / 'tables'
+OUT = ROOT / 'evidence' / 'tables'
 TEMP = ROOT / 'temp' / 'rea'
 
 TARGETS = ['ai-creation~10.0176e5c4.js', 'ai-creation~11.aa2812ea.js']

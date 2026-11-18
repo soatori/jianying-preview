@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / 'temp' / 'corpus-scan' / 'manifest.json'
 PLAIN = ROOT / 'temp' / 'corpus-scan' / 'plain'
-OUT = ROOT / 'docs' / 'evidence' / 'tables'
+OUT = ROOT / 'evidence' / 'tables'
 
 CORNER_KEYS = ['upper_left_x', 'upper_left_y', 'upper_right_x', 'upper_right_y',
                'lower_left_x', 'lower_left_y', 'lower_right_x', 'lower_right_y']
