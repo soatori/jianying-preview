@@ -69,6 +69,25 @@ def tree_rss_mb(proc: psutil.Process) -> tuple[float, int, dict]:
     return total / 2**20, len(procs), by_role
 
 
+def wait_for_report(proc, report, before, seconds, timeout, *, sleep=time.sleep, now=time.time) -> None:
+    """等页面自报。**必须睡**：不睡就是满核自旋＋每轮重读整个 jsonl，
+    而门正在同一台机器上判 33.4 ms 的帧预算——仪器自己把读数搅了。"""
+    t0 = now()
+    deadline = t0 + (timeout or seconds + 30)
+    while now() - t0 < seconds:
+        if proc.poll() is not None:
+            return
+        if report:
+            try:
+                if len(report.read_text(encoding="utf-8").splitlines()) > before:
+                    return
+            except OSError:
+                pass
+        if now() > deadline:
+            return
+        sleep(0.25)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--url", required=True)
@@ -106,18 +125,7 @@ def main() -> int:
     t0 = time.time()
     th = threading.Thread(target=sampler, daemon=True)
     th.start()
-    deadline = t0 + (args.timeout or args.seconds + 30)
-    while time.time() - t0 < args.seconds:
-        if proc.poll() is not None:
-            break
-        if report:
-            try:
-                if len(report.read_text(encoding="utf-8").splitlines()) > before:
-                    break
-            except OSError:
-                pass
-        if time.time() > deadline:
-            break
+    wait_for_report(proc, report, before, args.seconds, args.timeout)
     stop.set()
     th.join(timeout=3)
     wall = time.time() - t0
