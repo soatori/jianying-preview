@@ -55,6 +55,22 @@ def render(model: dict, t: float) -> np.ndarray:
     return np.asarray(canvas.convert("RGB"), dtype=np.int16)
 
 
+def ab_measure(model: dict, inside: float, outside: float) -> dict:
+    """开/关各画一次。off 臂必须真的关掉动画，否则窗外那条判据恒过。"""
+    rf.APPLY_ANIMATIONS = True
+    on_in = render(model, inside)
+    rf.APPLY_ANIMATIONS = False
+    off_in = render(model, inside)
+    rf.APPLY_ANIMATIONS = True
+    on_out = render(model, outside)
+    rf.APPLY_ANIMATIONS = False
+    off_out = render(model, outside)
+    return {"on_in": on_in, "off_in": off_in,
+            "max_abs_inside": int(np.abs(on_in - off_in).max()),
+            "cells_changed_inside": int((np.abs(on_in - off_in) > 2).sum()),
+            "max_abs_outside": int(np.abs(on_out - off_out).max())}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", default="temp/playback-test/model-check.json")
@@ -83,16 +99,11 @@ def main() -> int:
         outside = t0 + tween * 2.5
         if outside >= t0 + seg["target"]["duration_us"] / 1e6:
             outside = t0 + tween * 1.6
-        rf.APPLY_ANIMATIONS = True
-        on_in = render(model, inside)
-        rf.APPLY_ANIMATIONS = False
-        off_in = render(model, inside)
-        rf.APPLY_ANIMATIONS = True
-        on_out = render(model, outside)
-        off_out = render(model, outside)
-        d_in = int(np.abs(on_in - off_in).max())
-        cells_in = int((np.abs(on_in - off_in) > 2).sum())
-        d_out = int(np.abs(on_out - off_out).max())
+        ab = ab_measure(model, inside, outside)
+        on_in, off_in = ab["on_in"], ab["off_in"]
+        d_in = ab["max_abs_inside"]
+        cells_in = ab["cells_changed_inside"]
+        d_out = ab["max_abs_outside"]
         Image.fromarray(on_in.astype("uint8")).save(out / f"inside-{inside:.3f}-on.png")
         Image.fromarray(off_in.astype("uint8")).save(out / f"inside-{inside:.3f}-off.png")
         rows.append({"t0": round(t0, 3), "tween_s": tween, "inside": round(inside, 4),
