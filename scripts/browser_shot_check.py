@@ -43,16 +43,44 @@ except Exception:                                 # noqa: BLE001
     pass
 
 ROOT = Path(__file__).resolve().parents[1]
+_MEAN_LUM_CACHE: dict[tuple[str, int, int, int, int], float] = {}
+_MEAN_LUM_CACHE_CAP = 256
+
+
+def _mean_lum_key(path_or_arr, w: int, h: int):
+    if not isinstance(path_or_arr, (str, Path)):
+        return None
+    path = Path(path_or_arr)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path), w, h, stat.st_mtime_ns, stat.st_size)
+
+
+def _remember_mean_lum(key, value: float) -> None:
+    if key is None:
+        return
+    _MEAN_LUM_CACHE.pop(key, None)
+    _MEAN_LUM_CACHE[key] = value
+    if len(_MEAN_LUM_CACHE) > _MEAN_LUM_CACHE_CAP:
+        _MEAN_LUM_CACHE.pop(next(iter(_MEAN_LUM_CACHE)))
 
 
 def luma_at(path_or_arr, w: int, h: int) -> np.ndarray:
+    cache_key = _mean_lum_key(path_or_arr, w, h)
     if isinstance(path_or_arr, (str, Path)):
-        im = Image.open(path_or_arr).convert("RGB")
+        with Image.open(path_or_arr) as src:
+            im = src.convert("RGB")
     else:
         im = path_or_arr.convert("RGB")
-    im = im.resize((w, h), Image.BOX)
-    a = np.asarray(im, dtype=np.float32)
+    small = im.resize((w, h), Image.BOX)
+    im.close()          # 全分辨率图确定性释放（句柄+像素），不依赖 GC 时机
+    a = np.array(small, dtype=np.float32)
+    small.close()
     v = a @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    del a
+    _remember_mean_lum(cache_key, float(v.mean()))
     v = v.ravel()
     v = v - v.mean()
     return v / (np.linalg.norm(v) + 1e-9)
@@ -65,14 +93,27 @@ def mean_lum(path_or_arr, w: int, h: int) -> float:
     一段比成片暗 36 % 的画面在 corr 上照样能到 0.94（P-129 就是这么被门放过去的）。
     所以相关度之外必须同时报一个**带的量**。这里只报数，容差等用户定（U-105）。
     """
+    cache_key = _mean_lum_key(path_or_arr, w, h)
+    if cache_key is not None:
+        cached = _MEAN_LUM_CACHE.pop(cache_key, None)
+        if cached is not None:
+            _MEAN_LUM_CACHE[cache_key] = cached
+            return cached
     if isinstance(path_or_arr, (str, Path)):
-        im = Image.open(path_or_arr).convert("RGB")
+        with Image.open(path_or_arr) as src:
+            im = src.convert("RGB")
     else:
         im = path_or_arr.convert("RGB")
     if im.size != (w, h):
-        im = im.resize((w, h), Image.BOX)
-    a = np.asarray(im, dtype=np.float32)
-    return float((a @ np.array([0.299, 0.587, 0.114], dtype=np.float32)).mean())
+        small = im.resize((w, h), Image.BOX)
+        im.close()
+    else:
+        small = im
+    a = np.array(small, dtype=np.float32)
+    small.close()
+    value = float((a @ np.array([0.299, 0.587, 0.114], dtype=np.float32)).mean())
+    _remember_mean_lum(cache_key, value)
+    return value
 
 
 def corr(a: np.ndarray, b: np.ndarray) -> float:

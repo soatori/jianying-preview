@@ -32,7 +32,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_soak import CHROME, OUT, ROOT  # noqa: E402  复用 Chrome 路径与 temp 目录口径
+import psutil  # noqa: E402
+from browser_soak import (BROWSER_RSS_LIMIT_MB, CHROME, OUT, ROOT, stop_process_tree,
+                          tree_rss_mb)  # noqa: E402  复用 Chrome 进程树口径
 from browser_shot_check import corr, luma_at, mean_lum  # noqa: E402  同一把尺，不另抄一份
 
 DRAFT = Path("D:/JianyingPro/JianyingPro Drafts/李金昌 10月15日 (4)")
@@ -81,7 +83,7 @@ def sync_player() -> str:
     return hashlib.md5(blob).hexdigest()[:12]
 
 
-def sweep(args, model: dict) -> list[float]:
+def sweep(args, model: dict, guard) -> list[float]:
     md5 = sync_player()
     (OUT / "frame-parity-player.md5").write_text(md5, encoding="utf-8")
     print(f"[sweep] L0 在册件已物化：player/player.html -> temp/playback-test/player.html md5 {md5}")
@@ -123,19 +125,30 @@ def sweep(args, model: dict) -> list[float]:
                                      f"--user-data-dir={prof.resolve().as_posix()}",
                                      "--window-size=1280,900", "--remote-debugging-port=0", url],
                                     cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            chrome = psutil.Process(proc.pid)
             want = [t for t in chunk.split(",") if t not in done]
             deadline = time.time() + args.per_shot * len(want) + 60
-            while want and time.time() < deadline and proc.poll() is None:
-                have = {p.stem.replace("browser-shot-", "").replace("-", ".")
-                        for p in OUT.glob("browser-shot-*.png")}
-                want = [t for t in want if t not in have]
-                if want:
-                    time.sleep(2.0)
-            proc.terminate()
             try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                while want and time.time() < deadline and proc.poll() is None:
+                    guard.check()
+                    rss_mb, _, _ = tree_rss_mb(chrome)
+                    if rss_mb > BROWSER_RSS_LIMIT_MB:
+                        print(f"[memory] Chrome 进程树 RSS {rss_mb:.0f} MB > "
+                              f"{BROWSER_RSS_LIMIT_MB:.0f} MB，停止本段", flush=True)
+                        stop_process_tree(chrome)
+                        break
+                    have = {p.stem.replace("browser-shot-", "").replace("-", ".")
+                            for p in OUT.glob("browser-shot-*.png")}
+                    want = [t for t in want if t not in have]
+                    if want:
+                        time.sleep(1.0)
+            finally:
+                stop_process_tree(chrome)
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
             if want:
                 print(f"[sweep] 段 {ci + 1} 缺 {len(want)} 帧，先停：{want[:6]}", flush=True)
                 return []
@@ -152,6 +165,8 @@ def sweep(args, model: dict) -> list[float]:
 # ---------------- ② 判定腿 ----------------
 
 _LUMA: dict = {}
+# ±3 帧搜索只需少量邻近帧常驻；128 个 float32 luma 面约 63 MB，避免缓存占去近 300 MB。
+LUMA_CAP = 128
 
 
 def luma(png: Path, w: int, h: int):
@@ -161,10 +176,9 @@ def luma(png: Path, w: int, h: int):
     if v is None:
         v = luma_at(png, w, h)
         _LUMA[key] = v
-        # 存的是 float32 归一化数组（518400 B/帧，旧 bytes 的 4 倍），上限跟着从 2600 降到 600
-        # （≈297 MB，与改前同量级）；±3 对齐只碰 7 张连续成片帧，600 远够用。
-        if len(_LUMA) > 600:
-            for k in list(_LUMA)[: 150]:
+        # 存的是 float32 归一化数组（518400 B/帧）；±3 对齐只碰邻近帧，128 项足够复用。
+        if len(_LUMA) > LUMA_CAP:
+            for k in list(_LUMA)[: max(1, LUMA_CAP // 4)]:
                 _LUMA.pop(k, None)
     return v
 
@@ -227,7 +241,7 @@ def active_at(model: dict, t: float) -> dict:
     return out
 
 
-def judge(args, model: dict) -> int:
+def judge(args, model: dict, guard) -> int:
     # L0 自证：这批截图必须能追回当前在册件（sweep 落一枚 md5，这里只核对不改写——
     # 判的是已经取到的图，物化只会把"截图来自哪版页"这件事彻底抹掉）。
     side = OUT / "frame-parity-player.md5"
@@ -246,7 +260,9 @@ def judge(args, model: dict) -> int:
     h = int(round(args.width * 1920 / 1080))
     times = pick_times(model, args)
     rows, skip_reasons = [], {}
-    for t in times:
+    for i, t in enumerate(times):
+        if i % 16 == 0:
+            guard.check()
         tag = f"{t:g}".replace(".", "-")   # 与页面/网关的命名同一个口径：10.0 → "10"
         png = OUT / f"browser-shot-{tag}.png"
         if not png.is_file():
@@ -289,6 +305,7 @@ def judge(args, model: dict) -> int:
               f"| 字幕 {row['why_text']} 影像 {row['why_video']} 子段 {row['why_child']} "
               f"切点邻帧 {row['why_near_cut']} 调色 {row['why_colour']} "
               f"paintΔ {row['paint_dt_s']} 滤镜 {row['color_applied']}/{row['color_expected']}")
+    guard.check()
     lum_bad = [r for r in rows if r.get("lum_ok") is False]
     bad = [r for r in rows if r.get("ok") is False]
     skipped = [r for r in rows if "skipped" in r]
@@ -349,14 +366,22 @@ def main() -> int:
     if not (args.sweep or args.judge):
         ap.error("要 --sweep（取图）或 --judge（判定），或两者都要")
     model = json.loads((OUT / args.model).read_text(encoding="utf-8-sig"))
-    if args.sweep:
-        got = sweep(args, model)
-        if not got:
-            print("取图没跑齐，判定不启动（缺帧判绿是没意义的）")
-            return 1
-    if args.judge:
-        return judge(args, model)
-    return 0
+    import mem_gate as mg
+    mg.require_free()
+    guard = mg.PeakGuard(label="frame_parity")
+    with mg.heavy_lock():
+        try:
+            guard.check()
+            if args.sweep:
+                got = sweep(args, model, guard)
+                if not got:
+                    print("取图没跑齐，判定不启动（缺帧判绿是没意义的）")
+                    return 1
+            if args.judge:
+                return judge(args, model, guard)
+            return 0
+        finally:
+            print(f"[memory] {guard.summary()}")
 
 
 if __name__ == "__main__":

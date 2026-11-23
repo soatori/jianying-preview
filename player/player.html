@@ -184,7 +184,8 @@ function makeSource(url) {
 // WebCodecs queue of 1080x1920 frames, so a 12-entry pool cost ~3 GB of peaks
 // (median 1394 MB, peak 4216 MB, 131 of 614 s over the 2 GB threshold). The pool is now sized
 // to what can be on screen at once, and eviction disposes the stream.
-const pool = { max: +(Q.get('pool') || 4), map: new Map() };
+// Conservative manual-preview defaults; stress tools can still override them in the URL.
+const pool = { max: +(Q.get('pool') || 1), map: new Map() };
 // 页面起点的单调时钟：驱逐账本原本记 `now() - winStart`，而测量那条路把 winStart 归零，
 // 于是每一条 evict 都写成 at=0——"驱逐发生在我失败之前多久"这个最关键的问题答不了。
 const T0_PAGE = now();
@@ -770,7 +771,7 @@ async function scheduleAudio(posSec) {
 // A generation counter merges seeks/pauses into "kill all pumps" (opencut-classic's pattern).
 const pumps = new Map();
 let playGen = 0;
-const QMAX = +(Q.get('qmax') || 4);
+const QMAX = +(Q.get('qmax') || 1);
 const AUDIO_SLOT_S = +(Q.get('audio_slot') || 0.5);   // 实测 2 s/4 s 更坏（占空比 35%→10%/8%），默认留在 0.5
 const COPY_FIX = Q.get('copyfix') !== '0';            // &copyfix=0 = 改前写法（把 filled 当目的偏移传），单变量对照
 // 每一腿（一个片段取一帧）的**墙钟耗时**。上一版的错在于：`waits_ms` 是把同一帧里
@@ -970,7 +971,7 @@ function killPumps() {
 // 预解码量由 QMAX 封顶（泵跑到队列满就 park），并发量由 WARM_MAX 封顶——池上限是 2 GB 那条
 // 设计约束（见 streamFor 上方 F-038 的实测），预热不能把它绕过去。单变量对照 &warm=0。
 const VIDEO_LEAD = +(Q.get('warm_lead') || 0.3);
-const WARM_MAX = +(Q.get('warm_max') || 2);
+const WARM_MAX = +(Q.get('warm_max') || 1);
 const WARM_ON = Q.get('warm') !== '0';
 // 第三条臂，用来把"预热带来的好处"拆成两半：`&warm_predecode=0` 只**提前开流**（HEAD+解封装+取轨），
 // 不建泵、不预解码。对照 `&warm=0`（两者都不做）与默认（都做）：
@@ -1128,11 +1129,23 @@ async function imageTexture(path) {
   if (!id) throw new Error(`image ${path} not served`);
   // Pixi 8 dropped the string overload of Texture.from - it threw "reading 'width'" and the
   // whole image branch died. Same route as video: fetch by id, hand the decoded bitmap over.
-  const resp = await fetch(`/media/${id}`);
-  if (!resp.ok) throw new Error(`image ${id} -> HTTP ${resp.status}`);
-  const tex = Texture.from(await createImageBitmap(await resp.blob()));
-  imageTex.set(path, tex);
-  return tex;
+  // Store the in-flight promise too: two visible segments using one still must not decode it twice.
+  const pending = (async () => {
+    const resp = await fetch(`/media/${id}`);
+    if (!resp.ok) throw new Error(`image ${id} -> HTTP ${resp.status}`);
+    const bmp = await createImageBitmap(await resp.blob());
+    try { return Texture.from(bmp); }
+    catch (e) { bmp.close?.(); throw e; }
+  })();
+  imageTex.set(path, pending);
+  try {
+    const tex = await pending;
+    imageTex.set(path, tex);
+    return tex;
+  } catch (e) {
+    if (imageTex.get(path) === pending) imageTex.delete(path);
+    throw e;
+  }
 }
 
 // ---- 入场/出场动画（F-078/P-33）----
@@ -1872,6 +1885,7 @@ async function paintTracks(container, tracks, posUs, size, depth) {
           container.addChild(n);
           return n;
         });
+        sp._imagePath = seg.media.path;
         sp.texture = tex;              // shared and cached: never destroyed by the frame loop
         placeImage(sp, kfClip(seg, posUs), { width: tex.width, height: tex.height }, size);
         applyAnim(sp, seg, posUs, size, tex.height);
@@ -2068,8 +2082,13 @@ async function paint(posUs) {
     const stale = [...sprites.entries()].sort((a, b) => (a[1]._last || 0) - (b[1]._last || 0));
     for (const [id, node] of stale.slice(0, sprites.size - SPRITE_CACHE)) {
       if (visibleThisFrame.has(id)) continue;
+      const imagePath = node._imagePath;
+      const sharedImage = imagePath && [...sprites].some(([otherId, other]) =>
+        otherId !== id && other._imagePath === imagePath);
       sprites.delete(id);
-      node.destroy({ children: true, texture: true, textureSource: true });
+      node.destroy({ children: true, texture: !sharedImage, textureSource: !sharedImage });
+      if (node._bmp) { node._bmp.close?.(); node._bmp = null; }
+      if (imagePath && !sharedImage) imageTex.delete(imagePath);
     }
   }
   world.sortChildren();
